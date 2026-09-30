@@ -6,6 +6,7 @@ import { LAPSE_RATE } from '../core/constants';
 import type { ClimateInput, ClimateParams } from '../core/types';
 import { makeBilinearStencil, makeGrid, makeOverlapRegrid, overlapAverage, applyBilinear, type LatLonGrid } from './dynGrid';
 import { syncOceanAirT, type EbmModel, type EbmState } from './energy';
+import { applySurfaceInversion } from './surfaceInversion';
 import { ebmTuning } from './tuning';
 
 /** Climate input on the output grid. */
@@ -107,6 +108,39 @@ export interface WarmFields {
   land: Uint8Array;
   elev: Float32Array;
   params: ClimateParams;
+  /**
+   * Optional w·h ice-sheet surface raise above `elev` (m) that the land temperatures of a result
+   * from computeDynamics / computeClimate refer to (not part of the contract).
+   */
+  iceRaise?: Float32Array;
+  /**
+   * Optional (a ClimateResult of computeClimate, marked by its non-contract `landIce`): 12·w·h
+   * snow and cloud cover and w·h glacier cover, from which the diagnostic snow-surface inversion
+   * that computeClimate applied to `temp` after the dynamics is recomputed and undone.
+   */
+  snow?: Float32Array;
+  cloud?: Float32Array;
+  landIce?: Float32Array;
+}
+
+/**
+ * The snow-surface inversion (≤ 0, 12·w·h) that computeClimate subtracted from the land temperatures
+ * of `warm` (surfaceInversion.ts: a diagnostic of the reported near-surface air that the energy
+ * balance never sees), or null when `warm` does not come from computeClimate.
+ */
+function reportedInversion(warm: WarmFields, raise: Float32Array | null): Float32Array | null {
+  const N = warm.w * warm.h;
+  const { snow, cloud, landIce } = warm;
+  if (!snow || !cloud || !landIce || snow.length < 12 * N || cloud.length < 12 * N || landIce.length < N) return null;
+  const surface = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    if (!warm.land[i]) continue;
+    const r = raise && raise[i] > 0 ? raise[i] : 0;
+    surface[i] = Math.max(0, warm.elev[i] - warm.params.seaLevel) + r;
+  }
+  const d = new Float32Array(12 * N);
+  applySurfaceInversion(d, snow, warm.land, warm.w, warm.h, warm.params, surface, cloud, landIce);
+  return d;
 }
 
 /** Build a Jan 1 core state from a previous result's Dec/Jan means. Returns false if unusable. */
@@ -120,9 +154,18 @@ export function warmState(M: EbmModel, core: CoreSurface, warm: WarmFields, S: E
   const isLand = new Float64Array(N);
   const isSea = new Float64Array(N);
   const off = warm.params.globalTempOffset || 0;
+  // Land temperatures of an ice sheet refer to its raised surface (energyIce.ts): reduce them to sea
+  // level from there, or a warm start seeds the ice sheet colder by Γ·raise (up to ~20 K).
+  const raise = warm.iceRaise && warm.iceRaise.length >= N ? warm.iceRaise : null;
+  // The air mass of the energy balance is above the reported snow-surface inversion: add it back,
+  // or every warm start seeds snow-covered land in the dark season colder (by up to ~14 K on flat
+  // ice sheets) and repeated fast warm restarts drift colder.
+  const inv = reportedInversion(warm, raise);
+  const temp = (k: number): number => (inv ? warm.temp[k] - inv[k] : warm.temp[k]);
   for (let i = 0; i < N; i++) {
-    const hgt = warm.land[i] ? Math.max(0, warm.elev[i] - warm.params.seaLevel) : 0;
-    const t = 0.5 * (warm.temp[i] + warm.temp[11 * N + i]) - off;
+    const r = raise && raise[i] > 0 ? raise[i] : 0;
+    const hgt = warm.land[i] ? Math.max(0, warm.elev[i] - warm.params.seaLevel) + r : 0;
+    const t = 0.5 * (temp(i) + temp(11 * N + i)) - off;
     tSl[i] = Number.isFinite(t) ? t + LAPSE_RATE * hgt : 0;
     // The result's SST is the surface (stratified-layer) temperature; the mixed layer beneath is no
     // warmer than the annual mean (summer stratification), so seed the enthalpy from the colder one.
@@ -150,7 +193,7 @@ export function warmState(M: EbmModel, core: CoreSurface, warm: WarmFields, S: E
     let sum = 0;
     let sumIce = 0;
     for (let m = 0; m < 12; m++) {
-      sum += warm.temp[m * N + i];
+      sum += temp(m * N + i);
       sumIce += warm.seaIce[m * N + i];
     }
     annT[i] = Number.isFinite(sum) ? sum / 12 - off : 0;
@@ -178,6 +221,7 @@ export function warmState(M: EbmModel, core: CoreSurface, warm: WarmFields, S: E
         // overstated the cover). Full cover: 1–1.5 m, thicker for perennial ice.
         const aAnn = Number.isFinite(iceAnnC[i]) ? Math.min(1, iceAnnC[i]) : a;
         S.E[i] = -M.eFull * (a < 0.98 ? a : 1 + 0.5 * aAnn);
+        S.Ai[i] = a;
         // Ice-surface temperature from the air over the ice part, bounded (the inversion of the
         // blend amplifies noise when the fraction is small).
         const ti = (ta - (1 - a) * t.freezeT) / a;
@@ -185,12 +229,14 @@ export function warmState(M: EbmModel, core: CoreSurface, warm: WarmFields, S: E
       } else {
         S.E[i] = Co * Math.max(0, s - t.freezeT);
         S.Ti[i] = t.freezeT;
+        S.Ai[i] = 0;
       }
     }
   }
   syncOceanAirT(M, S);
-  // Annual-mean surface temperature memory; land cells take the land part only (it decides ice
-  // sheet vs seasonal snow at the coasts).
+  // Annual-mean surface temperature memory; land cells take the land part only.
   for (let i = 0; i < g.n; i++) S.Tann[i] = core.land[i] && Number.isFinite(annLand[i]) ? annLand[i] : annC[i];
+  // The land snow / ice mass (S.M) is not taken from the previous result: glacier margins are
+  // hysteretic, so the caller hands pass 2 the mass of its own cold pass 1 (dyn.ts).
   return true;
 }

@@ -48,3 +48,22 @@ export function markHintDone(st: HintState, step: HintStep): HintState {
 export function hintComplete(st: HintState): boolean {
   return st.dismissed || HINT_STEPS.every((s) => st.done.includes(s));
 }
+
+/** A drag counts as "rotating the planet" once the view centre moved this far (degrees of arc). */
+export const ROTATE_TICK_DEG = 3;
+
+/** Great-circle distance between two geo points (radians in), in degrees. */
+export function arcDegrees(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
+  const s = Math.sin((b.lat - a.lat) / 2) ** 2 + Math.cos(a.lat) * Math.cos(b.lat) * Math.sin((b.lon - a.lon) / 2) ** 2;
+  return (2 * Math.asin(Math.min(1, Math.sqrt(Math.max(0, s)))) * 180) / Math.PI;
+}
+
+/**
+ * The "rotate" tip is done when a drag (a button held since a pointerdown on the view) actually moved
+ * the camera: its view centre travelled ≥ ROTATE_TICK_DEG. Clicks, wheel zooms, plate painting (the
+ * editor's paint mode does not move the camera) and drags that do not move the view do not count.
+ */
+export function dragRotated(start: { lat: number; lon: number } | null, now: { lat: number; lon: number } | null): boolean {
+  if (!start || !now) return false;
+  return arcDegrees(start, now) >= ROTATE_TICK_DEG;
+}

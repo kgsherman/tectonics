@@ -28,7 +28,12 @@ export const A_DESERT = 14; // desert (bare sand/rock) weight 0..1
 export const A_HOT = 15; // hot (vs cold) desert 0..1
 export const A_WET = 16; // humidity 0..1 (rock tint, lushness)
 export const A_PANN = 17; // annual precipitation, m/yr (glacier nourishment)
-export const LAND_K = 18;
+export const A_EVER = 18; // evergreen share of the canopy 0..1 (winter: dark conifer vs bare deciduous stands)
+export const A_HIDED = 19; // fraction of the ground snow a closed DECIDUOUS canopy hides this month
+export const A_WINDE = 20; // prevailing (annual-mean) surface wind, eastward unit component (dune alignment)
+export const A_WINDN = 21; // … northward unit component
+export const A_SHEET = 22; // ice-sheet context 0..1: the cell (and, after the blur, its neighbours) glaciated (EF-like summers)
+export const LAND_K = 23;
 // Ocean attribute channels.
 export const O_ICE = 0;
 export const O_SST = 1;
@@ -101,6 +106,9 @@ const ENDMEMBERS: Array<ClassEndmember & { soilLin: [number, number, number] }> 
 });
 
 const FALLBACK_CLASS = koppenIdFromCode('Cfb');
+
+/** Fraction of the ground snow hidden by a closed evergreen canopy. */
+export const EVERGREEN_SNOW_HIDE = 0.93;
 
 const L = (c: RGB) => toLinear(c);
 /** Vegetation palette (sRGB tuned against Blue Marble / Sentinel-2 mosaics), linear light. */
@@ -228,6 +236,10 @@ function cellAttributes(
   // Tropical wet climates are evergreen whatever the class blend says.
   const everFrac = Math.max(em.evergreen, smoothstep(14, 20, st.tCold) * smoothstep(1.3, 2.2, a));
   mixInto(out, o + A_TREE, DEC, EVER, everFrac);
+  // Snow under a closed canopy: dark evergreen conifers hide most of it (EVERGREEN_SNOW_HIDE: winter
+  // taiga stays dark), bare larches / birches let most of it through (light-grey larch taiga).
+  out[o + A_EVER] = everFrac;
+  out[o + A_HIDED] = 0.45 + 0.4 * lo;
   out[o + A_COVER] = cover;
   out[o + A_TREES] = trees;
   const lapse = LAPSE_RATE * hRef;
@@ -253,6 +265,9 @@ function cellAttributes(
   out[o + A_HOT] = hot;
   out[o + A_WET] = wet;
   out[o + A_PANN] = st.pAnn / 1000;
+  // Ice-sheet context: summers at or below freezing at the cell's own surface (EF); spread over the
+  // neighbourhood by the grid blur so ice sheets can flow down to warmer margins and the coast.
+  out[o + A_SHEET] = smoothstep(3, -2, st.tWarm) * Math.max(smoothstep(0.02, 0.15, st.pAnn / 1000), smoothstep(-2, -8, st.tWarm));
 }
 
 /** Nearest-land dilation: ocean cells within `rings` 8-neighbour rings of land take the mean of their assigned neighbours. */
@@ -314,13 +329,38 @@ export function blurGrid(grid: Float32Array, cw: number, ch: number, k: number, 
 /** The climate fields the satellite attributes need (a ClimateResult, or a synthetic stand-in). */
 export type SatelliteClimate = Pick<ClimateResult, 'w' | 'h' | 'land' | 'elev' | 'temp' | 'precip' | 'seaIce' | 'sst' | 'koppenAll'> & {
   seaLevel: number;
+  /** Optional monthly surface winds (m/s) for dune alignment; trade easterlies / westerlies by latitude when absent. */
+  windU?: Float32Array;
+  windV?: Float32Array;
 };
 
 export function satelliteClimateOf(c: ClimateResult): SatelliteClimate {
   return {
     w: c.w, h: c.h, land: c.land, elev: c.elev, temp: c.temp, precip: c.precip, seaIce: c.seaIce, sst: c.sst,
-    koppenAll: c.koppenAll, seaLevel: c.params.seaLevel,
+    koppenAll: c.koppenAll, seaLevel: c.params.seaLevel, windU: c.windU, windV: c.windV,
   };
+}
+
+/**
+ * Annual-mean surface wind direction of cell i (unit east / north components; the dune grain is
+ * perpendicular to it). Without winds: zonal trade easterlies below 30°, westerlies above.
+ */
+function prevailingWind(c: SatelliteClimate, i: number, N: number, r: number, ch: number, out: Float32Array, o: number): void {
+  let u = 0, v = 0;
+  if (c.windU && c.windV && c.windU.length === 12 * N && c.windV.length === 12 * N) {
+    for (let m = 0; m < 12; m++) {
+      u += c.windU[m * N + i];
+      v += c.windV[m * N + i];
+    }
+  }
+  if (!(u * u + v * v > 1e-6)) {
+    const lat = Math.abs(gridLat(ch, r));
+    u = lat < Math.PI / 6 ? -1 : 1;
+    v = 0;
+  }
+  const l = 1 / Math.sqrt(u * u + v * v);
+  out[o + A_WINDE] = u * l;
+  out[o + A_WINDN] = v * l;
 }
 
 /** Satellite attribute grids for one month (0..11) or the annual representative (-1). */
@@ -346,6 +386,7 @@ export function buildSatelliteGrid(climate: SatelliteClimate, month: number): Sa
       const kid = climate.koppenAll[i];
       const em = ENDMEMBERS[kid > 0 && kid < ENDMEMBERS.length ? kid : FALLBACK_CLASS];
       cellAttributes(T, P, st, em, hRef, month, land, i * LAND_K);
+      prevailingWind(climate, i, N, r, ch, land, i * LAND_K);
       if (month >= 0) {
         ocean[i * OCEAN_K + O_ICE] = climate.seaIce[month * N + i];
         ocean[i * OCEAN_K + O_SST] = climate.sst[month * N + i];

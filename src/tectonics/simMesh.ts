@@ -56,6 +56,20 @@ export interface SimMesh {
    * nearest lattice point (early exit of the nearest-cell walk, no neighbour scan needed).
    */
   readonly cosIn: Float64Array;
+  /**
+   * Halo of every block of 64 consecutive cells (block b = cells b·64 .., the PlateSlot.blockOwned
+   * granularity OWNED_BLOCK): the cells outside the block
+   * adjacent to one inside, CSR (haloOff has one entry per block + 1). A block whose cells and halo
+   * agree on something (one top plate; all owned by a plate) settles every cell's ring at once.
+   */
+  readonly haloOff: Int32Array;
+  readonly halo: Int32Array;
+  /**
+   * 1 when the adjacency of cell j is a proper CCW cycle (createSphereMesh chains each cell's triangles
+   * into one), so the Delaunay triangles around j are the sectors (j, adj[q], adj[q+1]): the display
+   * interpolation locates points in them directly. Other cells use an exact triangle search.
+   */
+  readonly fanOk: Uint8Array;
 }
 
 const cache = new WeakMap<SphereMesh, SimMesh>();
@@ -171,7 +185,30 @@ function buildSimMesh(ext: SphereMesh): SimMesh {
     vtOff: vt.off,
     vtTri: vt.tri,
     cosIn: buildInscribed(mesh),
+    ...buildHalos(mesh),
+    fanOk: buildFanOk(mesh),
   };
+}
+
+function buildHalos(mesh: SphereMesh): Pick<SimMesh, 'haloOff' | 'halo'> {
+  const { n, adjOffset, adj } = mesh;
+  const nb = Math.ceil(n / 64);
+  const haloOff = new Int32Array(nb + 1);
+  const stamp = new Int32Array(n).fill(-1);
+  const list: number[] = [];
+  for (let b = 0; b < nb; b++) {
+    haloOff[b] = list.length;
+    for (let i = b << 6, e = Math.min(n, (b + 1) << 6); i < e; i++) {
+      for (let q = adjOffset[i], qe = adjOffset[i + 1]; q < qe; q++) {
+        const a = adj[q];
+        if (a >> 6 === b || stamp[a] === b) continue;
+        stamp[a] = b;
+        list.push(a);
+      }
+    }
+  }
+  haloOff[nb] = list.length;
+  return { haloOff, halo: Int32Array.from(list) };
 }
 
 /**
@@ -269,6 +306,25 @@ function buildEdgeLengths(mesh: SphereMesh): Float32Array {
     }
   }
   return edgeKm;
+}
+
+function buildFanOk(mesh: SphereMesh): Uint8Array {
+  const { n, xyz, adjOffset, adj } = mesh;
+  const fanOk = new Uint8Array(n);
+  for (let j = 0; j < n; j++) {
+    const x = xyz[3 * j], y = xyz[3 * j + 1], z = xyz[3 * j + 2];
+    const q0 = adjOffset[j], q1 = adjOffset[j + 1];
+    let ok = q1 - q0 >= 3;
+    for (let q = q0; q < q1 && ok; q++) {
+      // Consecutive neighbours must turn counter-clockwise around j: (s_a × s_b)·s_j > 0.
+      const a = adj[q], b = adj[q + 1 < q1 ? q + 1 : q0];
+      const ax = xyz[3 * a], ay = xyz[3 * a + 1], az = xyz[3 * a + 2];
+      const bx = xyz[3 * b], by = xyz[3 * b + 1], bz = xyz[3 * b + 2];
+      ok = (ay * bz - az * by) * x + (az * bx - ax * bz) * y + (ax * by - ay * bx) * z > 0;
+    }
+    fanOk[j] = ok ? 1 : 0;
+  }
+  return fanOk;
 }
 
 /**

@@ -36,27 +36,32 @@ export class RegionDijkstra {
    */
   run(sm: SimMesh, top: Int16Array, sources: Int32Array, count: number, maxKm: number): void {
     this.reset();
-    const { dist, srcOf } = this;
+    const { dist, srcOf, reached } = this;
     const { adjOffset, adj, edgeKm } = sm;
     const width = this.bucketWidth(sm);
-    const nb = Math.floor(maxKm / width) + 2;
+    // Bucket index = floor(d / width), evaluated as d · (1 / width) (the same product everywhere; a
+    // relaxation still always lands ≥ 1 bucket later since edges exceed the width by a 1e-6 margin).
+    const inv = 1 / width;
+    const nb = Math.floor(maxKm * inv) + 2;
     this.prepareBuckets(nb);
-    const bHead = this.bHead, bLen = this.bLen;
+    const buckets = this.buckets, lens = this.lens;
+    let rc = 0;
     for (let q = 0; q < count; q++) {
       const s = sources[q];
       if (dist[s] === 0) continue;
-      if (dist[s] === Infinity) this.reached[this.reachedCount++] = s;
+      if (dist[s] === Infinity) reached[rc++] = s;
       dist[s] = 0;
       srcOf[s] = s;
       this.bucketPush(0, s);
     }
     for (let b = 0; b < nb; b++) {
-      // The bucket may grow while it is processed (never: relaxations land in later buckets), but
-      // later buckets grow, so re-read their lengths each time.
-      for (let r = 0; r < bLen[b]; r++) {
-        const c = this.bucketVal[bHead[b] + r];
+      // Relaxations always land in later buckets (width ≤ shortest edge), so this bucket is final;
+      // later buckets may be reallocated by pushes, so they are re-read per entry.
+      const cur = buckets[b];
+      for (let r = 0; r < lens[b]; r++) {
+        const c = cur[r];
         const d = dist[c];
-        if (Math.floor(d / width) !== b) continue; // stale entry: settled from an earlier bucket
+        if (Math.floor(d * inv) !== b) continue; // stale entry: settled from an earlier bucket
         const t = top[c];
         const s = srcOf[c];
         for (let q = adjOffset[c], e = adjOffset[c + 1]; q < e; q++) {
@@ -64,23 +69,27 @@ export class RegionDijkstra {
           if (top[a] !== t) continue;
           const nd = d + edgeKm[q];
           if (nd > maxKm || nd >= dist[a]) continue;
-          if (dist[a] === Infinity) this.reached[this.reachedCount++] = a;
+          if (dist[a] === Infinity) reached[rc++] = a;
           dist[a] = nd;
           srcOf[a] = s;
-          this.bucketPush(Math.floor(nd / width), a);
+          const bb = Math.floor(nd * inv);
+          const len = lens[bb];
+          const arr = buckets[bb];
+          if (len < arr.length) {
+            arr[len] = a;
+            lens[bb] = len + 1;
+          } else this.bucketPush(bb, a);
         }
       }
     }
+    this.reachedCount = rc;
   }
 
   private width = 0;
   private widthMesh: SimMesh | null = null;
-  /** Bucket storage: bucket b holds bucketVal[bHead[b] .. bHead[b] + bLen[b]) (chunked, see bucketPush). */
-  private bucketVal = new Int32Array(0);
-  private bHead = new Int32Array(0);
-  private bLen = new Int32Array(0);
-  private bCap = new Int32Array(0);
-  private used = 0;
+  /** Bucket b holds buckets[b][0 .. lens[b]) (FIFO; arrays grow by doubling and are kept across runs). */
+  private buckets: Int32Array[] = [];
+  private lens = new Int32Array(0);
 
   /** Bucket width: slightly less than the shortest edge of the mesh (km). */
   private bucketWidth(sm: SimMesh): number {
@@ -94,35 +103,21 @@ export class RegionDijkstra {
   }
 
   private prepareBuckets(nb: number): void {
-    if (this.bHead.length < nb) {
-      this.bHead = new Int32Array(nb);
-      this.bLen = new Int32Array(nb);
-      this.bCap = new Int32Array(nb);
-    }
-    this.bHead.fill(-1, 0, nb);
-    this.bLen.fill(0, 0, nb);
-    this.bCap.fill(0, 0, nb);
-    this.used = 0;
-    if (this.bucketVal.length === 0) this.bucketVal = new Int32Array(4096);
+    while (this.buckets.length < nb) this.buckets.push(new Int32Array(256));
+    if (this.lens.length < nb) this.lens = new Int32Array(nb);
+    this.lens.fill(0, 0, nb);
   }
 
-  /** Append cell v to bucket b (a bucket that outgrows its block moves to a doubled block at the end). */
+  /** Append cell v to bucket b, growing its array when full. */
   private bucketPush(b: number, v: number): void {
-    const len = this.bLen[b];
-    if (len === this.bCap[b]) {
-      const cap = Math.max(64, 2 * len);
-      if (this.used + cap > this.bucketVal.length) {
-        const grown = new Int32Array(Math.max(2 * this.bucketVal.length, this.used + cap));
-        grown.set(this.bucketVal.subarray(0, this.used));
-        this.bucketVal = grown;
-      }
-      const head = this.used;
-      if (len > 0) this.bucketVal.copyWithin(head, this.bHead[b], this.bHead[b] + len);
-      this.bHead[b] = head;
-      this.bCap[b] = cap;
-      this.used += cap;
+    const len = this.lens[b];
+    let arr = this.buckets[b];
+    if (len === arr.length) {
+      const grown = new Int32Array(2 * arr.length);
+      grown.set(arr);
+      this.buckets[b] = arr = grown;
     }
-    this.bucketVal[this.bHead[b] + len] = v;
-    this.bLen[b] = len + 1;
+    arr[len] = v;
+    this.lens[b] = len + 1;
   }
 }

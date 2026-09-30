@@ -54,7 +54,7 @@ export function createTimeline(ctx: UiContext): HTMLElement {
   const liveBtn = button({ label: 'Live', icon: 'history', variant: 'ghost', title: 'Back to the live simulation', onClick: () => commands.showKeyframe(null) });
   const branchBtn = button({ label: 'Play from here', icon: 'branch', variant: 'ghost', title: 'Discard later history and continue from this keyframe', onClick: () => commands.playFromKeyframe() });
   const history = h('div', { class: 'wg-history' },
-    h('div', { class: 'wg-history-head' }, histLabel, h('span', { class: 'wg-row', style: { gap: '4px', flex: '0' } }, branchBtn, liveBtn)),
+    h('div', { class: 'wg-history-head' }, histLabel, h('span', { class: 'wg-history-actions' }, branchBtn, liveBtn)),
     h('div', { class: 'wg-history-track' }, ticks, range),
   );
   /** Scrubber positions: 0..count-1 = keyframes, count = live. */

@@ -19,10 +19,15 @@ export interface PlateSlot {
   q: Quat;
   /** Row-major 3×3 matrix of q. */
   readonly m: Float64Array;
-  /** 1 where the plate owns lattice cell j (length padded to a multiple of 4). */
+  /** 1 where the plate owns lattice cell j (length padded to a multiple of OWNED_BLOCK, zeros beyond n). */
   readonly owned: Uint8Array;
   /** Uint32 view of `owned`: lets hot loops skip four unowned cells per test. */
   readonly owned4: Uint32Array;
+  /**
+   * Owned cells per block of OWNED_BLOCK lattice cells (kept exact by every writer of `owned`: claimCell,
+   * releaseCell, consumption, tectonic erosion, splits, construction). Per-plate loops skip empty blocks.
+   */
+  readonly blockOwned: Uint8Array;
   readonly crust: Uint8Array;
   readonly elev: Float32Array;
   readonly age: Float32Array;
@@ -134,6 +139,25 @@ export interface SimState {
   warnedSubstepCap: boolean;
 }
 
+/** Lattice cells per `blockOwned` entry (16 words of `owned4`). */
+export const OWNED_BLOCK = 64;
+
+/** Set owned[j] (keeps the block count exact). */
+export function markOwned(P: PlateSlot, j: number): void {
+  if (!P.owned[j]) {
+    P.owned[j] = 1;
+    P.blockOwned[j >> 6]++;
+  }
+}
+
+/** Clear owned[j] (keeps the block count exact). */
+export function markUnowned(P: PlateSlot, j: number): void {
+  if (P.owned[j]) {
+    P.owned[j] = 0;
+    P.blockOwned[j >> 6]--;
+  }
+}
+
 export function slotBit(slot: number): number {
   return (1 << slot) >>> 0;
 }
@@ -159,7 +183,7 @@ export function setPlateRotation(p: PlateSlot, q: Quat): void {
 
 /** Allocate plate arrays in the given slot. */
 export function createPlateSlot(slot: number, n: number, spec: PlateSpec, q: Quat): PlateSlot {
-  const owned = new Uint8Array(4 * Math.ceil(n / 4));
+  const owned = new Uint8Array(OWNED_BLOCK * Math.ceil(n / OWNED_BLOCK));
   const p: PlateSlot = {
     slot,
     spec,
@@ -167,6 +191,7 @@ export function createPlateSlot(slot: number, n: number, spec: PlateSpec, q: Qua
     m: new Float64Array(9),
     owned,
     owned4: new Uint32Array(owned.buffer),
+    blockOwned: new Uint8Array(owned.length / OWNED_BLOCK),
     crust: new Uint8Array(n),
     elev: new Float32Array(n),
     age: new Float32Array(n),
@@ -333,7 +358,7 @@ export function createSimState(mesh: SphereMesh, draft: WorldDraft, params: Tect
     const e = toExt[i];
     const k = draft.plate[e];
     const p = state.slots[k] as PlateSlot;
-    p.owned[i] = 1;
+    markOwned(p, i);
     p.crust[i] = draft.crust[e];
     p.elev[i] = draft.elev[e];
     p.age[i] = draft.age[e];

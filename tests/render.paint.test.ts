@@ -123,6 +123,11 @@ describe('land / sea rule', () => {
       if (Math.abs(gridLat(o.height, r)) > (40 * Math.PI) / 180) continue;
       for (let c = 0; c < o.width; c++) {
         const p = r * o.width + c;
+        // Pixels right on the coastline are anti-aliased (blended with their other-class
+        // neighbours by sub-pixel coverage): only the land/sea colour rule away from it is tested.
+        const land = hm[p] > 0;
+        const nb = [r * o.width + ((c + 1) % o.width), r * o.width + ((c + o.width - 1) % o.width), p - o.width, p + o.width];
+        if (nb.some((q) => q >= 0 && q < hm.length && hm[q] > 0 !== land)) continue;
         const bluish = rgba[4 * p + 2] > rgba[4 * p] + 20;
         if (hm[p] <= 0 !== bluish) bad++;
         n++;

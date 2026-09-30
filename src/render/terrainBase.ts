@@ -108,6 +108,18 @@ export function scratchFloat32(slot: number, n: number): Float32Array {
   return b.length === n ? b : b.subarray(0, n);
 }
 
+const scratchI32: Int32Array[] = [];
+
+/** Reusable Int32 scratch buffer #slot of at least n values (same contract as scratchFloat32). */
+export function scratchInt32(slot: number, n: number): Int32Array {
+  let b = scratchI32[slot];
+  if (!b || b.length < n) {
+    b = new Int32Array(n);
+    scratchI32[slot] = b;
+  }
+  return b.length === n ? b : b.subarray(0, n);
+}
+
 const scratchU8: Uint8Array[] = [];
 
 /** Reusable Uint8 scratch buffer #slot of at least n bytes (same contract as scratchFloat32). */
@@ -118,6 +130,19 @@ export function scratchUint8(slot: number, n: number): Uint8Array {
     scratchU8[slot] = b;
   }
   return b.length === n ? b : b.subarray(0, n);
+}
+
+/**
+ * Drops every scratch buffer above (the next paint reallocates what it needs); returns the bytes
+ * released. Only call between paint calls.
+ */
+export function releaseTerrainScratch(): number {
+  let bytes = 0;
+  for (const pool of [scratch, scratchI32, scratchU8] as ArrayBufferView[][]) {
+    for (const b of pool) bytes += b ? b.byteLength : 0;
+    pool.length = 0;
+  }
+  return bytes;
 }
 
 /** Direct Gaussian kernels are used up to this σ (px); wider blurs use the box-pass approximation. */

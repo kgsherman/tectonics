@@ -4,8 +4,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { VectorFieldSpec } from '../../src/core/types';
-import { buildFloatMips } from '../../src/render/globeTextures';
-import { applyShade, cloudAlpha, hillshade, nightShade } from '../../src/render/mapShading';
+import { buildFloatMips, HeightTextureSlot, RgbaTextureSlot } from '../../src/render/globeTextures';
+import { applyShade, hillshade, nightShade } from '../../src/render/mapShading';
 import { ParticleSystem } from '../../src/render/particles';
 import { HeightField } from '../../src/render/viewHeight';
 
@@ -63,7 +63,30 @@ describe('views perf', () => {
     expect(copyMs).toBeLessThanOrEqual(10);
   });
 
-  it('map shading: hillshade+apply 1024×512 ≤ 15 ms, 2048×1024 ≤ 50 ms (no stall > 50 ms); night ≤ 5 ms; clouds ≤ 12 ms', () => {
+  it('globe texture slots 2048×1024: new frame ≤ 12 ms (overlay premultiply) / 8 ms (height, GPU mips); identical resend ≤ 8 ms', () => {
+    const w = 2048, h = 1024, n = w * h;
+    const overlay = new Uint8ClampedArray(4 * n);
+    // Sparse lines of partial alpha (typical overlay: most pixels transparent).
+    for (let i = 0; i < n; i += 37) { overlay[4 * i] = 255; overlay[4 * i + 3] = 150 + (i % 100); }
+    const heights = terrain(w, h);
+    const ov = new RgbaTextureSlot(false, true, 1);
+    const hs = new HeightTextureSlot(1, true);
+    ov.set(overlay, w, h);
+    hs.set(heights, w, h);
+    const ovNew = best(5, (k) => { overlay[4 * k + 3] ^= 1; ov.set(overlay, w, h); });
+    const hNew = best(5, (k) => { heights[k] += 1; hs.set(heights, w, h); });
+    const ovSame = best(5, () => ov.set(overlay, w, h));
+    const hSame = best(5, () => hs.set(heights, w, h));
+    console.log(`slots 2048: overlay new ${ovNew.toFixed(1)} / same ${ovSame.toFixed(1)} ms; height new ${hNew.toFixed(1)} / same ${hSame.toFixed(1)} ms`);
+    expect(ovNew).toBeLessThanOrEqual(12);
+    expect(hNew).toBeLessThanOrEqual(8);
+    expect(ovSame).toBeLessThanOrEqual(8);
+    expect(hSame).toBeLessThanOrEqual(8);
+    ov.dispose();
+    hs.dispose();
+  });
+
+  it('map shading: hillshade+apply 1024×512 ≤ 15 ms, 2048×1024 ≤ 50 ms (no stall > 50 ms); night ≤ 5 ms', () => {
     for (const [w, h, budget] of [[1024, 512, 15], [2048, 1024, 50]] as const) {
       const hm = terrain(w, h);
       const rgba = new Uint8ClampedArray(w * h * 4).fill(120);
@@ -74,12 +97,7 @@ describe('views perf', () => {
     }
     const nightOut = new Uint8ClampedArray(360 * 180 * 4);
     const nightMs = best(10, (k) => nightShade(360, 180, 0.3, k * 0.01, nightOut));
-    const uni = Float32Array.from({ length: 512 * 256 }, (_, i) => (i * 0.618) % 1);
-    const cover = Float32Array.from({ length: 360 * 180 }, (_, i) => (i % 97) / 97);
-    const cloudOut = new Uint8ClampedArray(512 * 256 * 4);
-    const cloudMs = best(10, () => cloudAlpha(cover, 360, 180, uni, 512, 256, 0.85, cloudOut));
-    console.log(`nightShade 360x180: ${nightMs.toFixed(2)} ms; cloudAlpha 512x256: ${cloudMs.toFixed(2)} ms`);
+    console.log(`nightShade 360x180: ${nightMs.toFixed(2)} ms`);
     expect(nightMs).toBeLessThanOrEqual(5);
-    expect(cloudMs).toBeLessThanOrEqual(12);
   });
 });

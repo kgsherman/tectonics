@@ -59,7 +59,7 @@ export const CLIMATE_SPECS: Record<ClimateNumKey, NumSpec> = {
 };
 
 export const LIVE_INTERVAL_SPEC: NumSpec = {
-  min: 2, max: 100, step: 1, label: 'Every', unit: 'Myr', hint: 'Simulated time between live climate updates',
+  min: 2, max: 100, step: 1, label: 'Update every', unit: 'Myr', hint: 'Simulated time between live climate updates',
 };
 export const SEA_LEVEL_SPEC: NumSpec = {
   min: -2000, max: 2000, step: 10, label: 'Sea level', unit: 'm', hint: 'Display and climate sea level (re-runs the climate)',

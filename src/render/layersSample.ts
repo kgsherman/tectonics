@@ -154,6 +154,16 @@ function knownBuf(n: number): Uint8Array {
   return knownScratch;
 }
 
+/** Drops this module's scratch buffers (between paint calls only); returns the bytes released. */
+export function releaseSampleScratch(): number {
+  let bytes = (scratchInt?.byteLength ?? 0) + (knownScratch?.byteLength ?? 0);
+  for (const b of scratch) bytes += b ? b.byteLength : 0;
+  scratch.length = 0;
+  scratchInt = null;
+  knownScratch = null;
+  return bytes;
+}
+
 /** Month slice (0..11) of a monthly field, or its annual mean (month < 0; `annual` if given). */
 export function monthSlice(field: Float32Array, N: number, month: number, annual?: Float32Array, slot = 14): Float32Array {
   if (field.length === N) return field;

@@ -3,6 +3,7 @@
  * the main thread's mesh / snapshot / climate / displayed height map → InspectorView.
  */
 import type { ClimateResult, SphereMesh, WorldPointerEvent, WorldSnapshot } from '../core/types';
+import { FrameTask } from './frameTask';
 import { inspectAt, type HeightMapRef, type InspectSample } from './inspect';
 import type { Action, AppState } from './state';
 import type { Store } from './store';
@@ -20,7 +21,7 @@ export class HoverController {
   /** Pointer left the planet: keep showing the last sample, dimmed. */
   private stale = false;
   private hint: number | undefined;
-  private raf = 0;
+  private readonly task = new FrameTask(() => this.sample());
 
   constructor(
     private readonly store: Store<AppState, Action>,
@@ -49,24 +50,24 @@ export class HoverController {
 
   /** Re-sample at the last position (data changed or pointer moved), at most once per frame. */
   refresh(): void {
-    if (this.raf || !this.point) return;
-    this.raf = requestAnimationFrame(() => {
-      this.raf = 0;
-      const p = this.point;
-      const s = this.store.getState();
-      if (!p || s.runtime.editorActive) return;
-      let sample: InspectSample;
-      try {
-        sample = inspectAt({
-          mesh: this.src.mesh(), snapshot: this.src.snapshot(), climate: this.src.climate(), heightMap: this.src.heightMap(),
-          month: s.runtime.month, seaLevel: s.settings.seaLevel,
-        }, p.lat, p.lon, this.hint);
-      } catch (err) {
-        console.error('worldgen: hover sampling failed', err);
-        return;
-      }
-      this.hint = sample.tectonic?.cell;
-      this.view.update(sample, s.runtime.month, this.stale);
-    });
+    if (this.point) this.task.schedule();
+  }
+
+  private sample(): void {
+    const p = this.point;
+    const s = this.store.getState();
+    if (!p || s.runtime.editorActive) return;
+    let sample: InspectSample;
+    try {
+      sample = inspectAt({
+        mesh: this.src.mesh(), snapshot: this.src.snapshot(), climate: this.src.climate(), heightMap: this.src.heightMap(),
+        month: s.runtime.month, seaLevel: s.settings.seaLevel,
+      }, p.lat, p.lon, this.hint);
+    } catch (err) {
+      console.error('worldgen: hover sampling failed', err);
+      return;
+    }
+    this.hint = sample.tectonic?.cell;
+    this.view.update(sample, s.runtime.month, this.stale);
   }
 }

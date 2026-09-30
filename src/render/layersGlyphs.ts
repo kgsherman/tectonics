@@ -12,6 +12,14 @@ const { SRGB_TO_LINEAR, encodeSrgb } = _colormaps;
 /** Scratch coverage buffers by slot (painting is synchronous; a layer lives within one paint call). */
 const alphaPool: Float32Array[] = [];
 
+/** Drops the coverage pool (between paint calls only); returns the bytes released. */
+export function releaseGlyphScratch(): number {
+  let bytes = 0;
+  for (const b of alphaPool) bytes += b ? b.byteLength : 0;
+  alphaPool.length = 0;
+  return bytes;
+}
+
 /** Max-accumulated coverage over a w×h raster (lon wraps); composited once onto an image. */
 export class AlphaLayer {
   readonly a: Float32Array;

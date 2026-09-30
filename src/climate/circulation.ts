@@ -246,6 +246,12 @@ export function computeCirculation(g: LatLonGrid, tSl: Float64Array, land: Uint8
     polarFilter(g, windV, off);
     capSpeed(windU, windV, off, n, W.maxSpeed);
     steering(g, windU, windV, off, f, lfCoast, Ts, steerU, steerV, heatU, heatV);
+    // The thermal-wind shear is a zonal finite difference, whose cells shrink toward the poles:
+    // filter it like the surface wind (the cross-pole flow, zonal wavenumber 1, passes).
+    polarFilter(g, steerU, off);
+    polarFilter(g, steerV, off);
+    polarFilter(g, heatU, off);
+    polarFilter(g, heatV, off);
     convergence(g, windU, windV, off, ascent);
     smoothField(g, ascent, W.ascentSmoothKm, 3, off);
     for (let i = 0; i < n; i++) ascent[off + i] /= W.ascentRef;

@@ -104,7 +104,8 @@ export class GlobeView implements WorldView {
       uAtmoColor: { value: ATMOSPHERE_COLOR.clone() },
     };
     const aniso = this.renderer.capabilities.getMaxAnisotropy();
-    this.surface = new GlobeSurface(this.shared, aniso);
+    // R16F is color-renderable with EXT_color_buffer_float: height mips are then built on the GPU.
+    this.surface = new GlobeSurface(this.shared, aniso, this.renderer.extensions.has('EXT_color_buffer_float'));
     this.sky = new GlobeSky(this.shared, this.dpr());
     this.clouds = new GlobeClouds(this.shared);
     this.arrows = new GlobeArrows();
@@ -146,7 +147,8 @@ export class GlobeView implements WorldView {
 
   setHeightMap(height: Float32Array | null, width: number, height_: number): void {
     if (height) {
-      this.heights.set(height, width, height_);
+      // Identical resend (month/layer change, pause re-push): nothing to upload or re-derive.
+      if (!this.heights.set(height, width, height_) && this.surface.hasHeight) return;
       this.detailFader.noteHeights(heightSignature(height, width * height_), performance.now());
     } else {
       this.heights.clear();

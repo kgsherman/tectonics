@@ -50,6 +50,58 @@ export const ebmTuning = {
   /** Seasonal snow on terrain this high (m) has half its albedo effect; an annual-mean surface T below snowPolarWarm − 10 °C counts as ice sheet. */
   snowPatchyHeight: 2000,
   snowPolarWarm: -5,
+  /**
+   * Land snow / ice mass balance (energyStep.ts; mass M in kg/m² water equivalent per land cell).
+   * Snowfall: the dynamics carries no moisture, so precipitation over cold land follows the
+   * Clausius–Clapeyron scaling of ice-sheet models, P = snowfallRef·exp(snowfallPerK·T_s) (mm/yr;
+   * ≈ 1.2 m/yr at 0 °C, 0.4 m/yr at −15 °C, 30 mm/yr at −50 °C: Antarctic coast and plateau), falling
+   * as snow below snowfallWarm..snowfallCold (linear ramp, °C).
+   */
+  snowfallRef: 1200,
+  snowfallPerK: 0.074,
+  snowfallWarm: 2,
+  snowfallCold: -2,
+  /**
+   * Melt: a snow- or ice-covered surface cannot warm above 0 °C; the air over it is coupled to the
+   * melting surface with meltCoupling (W/m²/K × snow cover) and the absorbed heat melts the pack
+   * (latent heat of fusion, J/kg).
+   */
+  meltCoupling: 15,
+  latentFusion: 3.34e5,
+  /** Snow cover fraction 1 − exp(−M/snowCoverMass) (kg/m²). */
+  snowCoverMass: 15,
+  /**
+   * Albedo weight of a melting seasonal snowpack relative to cold fresh snow (wet, patchy snow,
+   * forest masking), and the planetary albedo of a melting glacier surface (ablation zone: wet
+   * snow, bare ice, meltwater), reached on the sea-ice ramp seaIceRampCold..seaIceRampWarm of the
+   * surface temperature.
+   */
+  snowWetWeight: 0,
+  albedoIceSheetMelt: 0.5,
+  /**
+   * Perennial mass (firn and ice) turns snow into glacier: glacier weight G = smoothstep(glacierMassLow,
+   * glacierMassHigh, M), which takes the ice-sheet albedo, is never patchy on high terrain and
+   * behaves as an ice sheet at the output (EF/ET, perennial snow). Mass is capped at glacierMassMax,
+   * which also bounds how long an unsustainable ice cap survives (≲ 1–2 model years).
+   */
+  glacierMassLow: 150,
+  glacierMassHigh: 600,
+  glacierMassMax: 1500,
+  /**
+   * Cold start: land whose steady annual-mean surface temperature is below glacierInitT (°C) starts
+   * glaciated (M = glacierMassMax); the mass balance then keeps or removes the ice (the ice-covered
+   * branch of the hysteresis: an ice sheet keeps its own summers cold). Other land starts bare and
+   * glaciates only where its seasonal snow survives the summer.
+   */
+  glacierInitT: -12,
+  /**
+   * Ice-sheet surface (energyIce.ts): height above sea level iceProfileScale·sqrt(d + iceProfileEdgeKm)
+   * (m, d = km from the glacier margin; plastic ice with τ₀ ≈ 70 kPa after isostatic bed
+   * depression), capped at iceSheetMaxHeight (m); 0 disables the elevation feedback.
+   */
+  iceProfileScale: 90,
+  iceProfileEdgeKm: 0,
+  iceSheetMaxHeight: 3500,
   /** Land/atmosphere column heat capacity, J/m²/K. */
   cLand: 0.8e7,
   /** Heat capacity of the air column over the ocean, J/m²/K. */
@@ -122,6 +174,13 @@ export const ebmTuning = {
    * (W/m²), shaped by inversionPower.
    */
   inversionMax: 7,
+  /**
+   * Extra inversion (K) over glaciers and ice sheets: a permanent snow surface with no summer heat
+   * store in the ground and very weak winter mixing (20–25 K inversions on the Antarctic plateau).
+   */
+  inversionIceSheetExtra: 7,
+  /** Terrain slope (m/km) scale of the ice-sheet extra: × exp(−(slope/this)²) (flat interiors only). */
+  inversionIceSheetSlope: 4,
   inversionInsolation: 250,
   inversionPower: 1.5,
   /** Terrain slope (m/km) over which katabatic mixing weakens the inversion by 1/e (0 = no slope effect). */
@@ -135,10 +194,25 @@ export const ebmTuning = {
   inversionCloudOvercast: 0.9,
   /** Sea-water freezing point °C. */
   freezeT: -1.8,
-  /** Sea ice: latent heat per unit volume J/m³, thickness at which a cell is fully covered (m), max thickness (m). */
+  /**
+   * Sea ice: latent heat per unit volume J/m³, reference thickness (m: initial and warm-start ice,
+   * minimum conductive thickness), max thickness (m).
+   */
   iceLatent: 917 * 3.34e5,
   iceFullThickness: 1.0,
   iceMaxThickness: 6,
+  /**
+   * Sea-ice area (Hibler 1979): open water freezes into new ice of the lead-closing thickness (m);
+   * melting removes the thin end of a uniform 0..2h thickness distribution, dA = (A/2h)·dV; the
+   * ice part is never thinner than seaIceMinThickness (m) on average.
+   */
+  seaIceLeadThickness: 1.0,
+  seaIceMinThickness: 0.3,
+  /**
+   * Ocean heat flux into the base of sea ice (W/m²): entrainment of the warmer water below the
+   * polar mixed layer (Arctic ≈ 2–5, Southern Ocean ≈ 10–30 W/m²; McPhee et al.).
+   */
+  iceBasalHeatFlux: 4,
   /** Conductive coupling k/(h + h_snow), W/m/K and m of equivalent snow insulation. */
   iceConductivity: 2.0,
   iceSnowEquivalent: 1.5,
@@ -149,7 +223,7 @@ export const ebmTuning = {
    * Temperature of the deep water below polar surface layers (°C): T_sub ≥ min(zonal + ΔT, this), so
    * upwelling of warmer deep water limits sea ice (Antarctic divergence).
    */
-  deepWaterT: 1.5,
+  deepWaterT: 2.0,
   /** Thermocline tilt: T_sub is up to this much colder at the eastern coast (warmer at the western). */
   upwellingTiltDeltaT: 7,
   /** Air heat advection: effective velocity = factor × steering wind (boundary-layer heat content). */

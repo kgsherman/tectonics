@@ -206,10 +206,15 @@ export function windDivergence(spec: CloudSpec, tmp?: Float32Array): Float32Arra
  *      small, thin popcorn cells.
  */
 export function buildCloudRegimeGrid(spec: CloudSpec, out?: Uint8Array): Uint8Array {
+  return regimeGrid(spec, out, null, null);
+}
+
+/** Regime grid; optionally also returns the blurred cover and the divergence (for the aux grid). */
+function regimeGrid(spec: CloudSpec, out: Uint8Array | undefined, covOut: Float32Array | null, divOut: Float32Array | null): Uint8Array {
   const { w, h } = spec;
   const n = w * h;
   const img = out && out.length === n * 4 ? out : new Uint8Array(n * 4);
-  const cov = new Float32Array(n);
+  const cov = covOut ?? new Float32Array(n);
   const tmp = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const v = spec.cover[i];
@@ -217,6 +222,7 @@ export function buildCloudRegimeGrid(spec: CloudSpec, out?: Uint8Array): Uint8Ar
   }
   blur121(cov, w, h, 2, tmp);
   const div = windDivergence(spec, tmp);
+  if (divOut) divOut.set(div);
   for (let r = 0; r < h; r++) {
     const lat = Math.PI / 2 - ((r + 0.5) * Math.PI) / h;
     const a = Math.abs(lat);
@@ -243,6 +249,98 @@ export function buildCloudRegimeGrid(spec: CloudSpec, out?: Uint8Array): Uint8Ar
     }
   }
   return img;
+}
+
+/** Box blur of half-width r along longitude (wrapping) then latitude (clamped), `passes` times. */
+function boxBlur(f: Float32Array, w: number, h: number, r: number, passes: number, tmp: Float32Array): void {
+  const k = 1 / (2 * r + 1);
+  for (let p = 0; p < passes; p++) {
+    for (let row = 0; row < h; row++) {
+      const o = row * w;
+      let s = 0;
+      for (let d = -r; d <= r; d++) s += f[o + ((d % w) + w) % w];
+      for (let c = 0; c < w; c++) {
+        tmp[o + c] = s * k;
+        s += f[o + (c + r + 1) % w] - f[o + ((c - r) % w + w) % w];
+      }
+    }
+    for (let c = 0; c < w; c++) {
+      let s = 0;
+      for (let d = -r; d <= r; d++) s += tmp[Math.min(h - 1, Math.max(0, d)) * w + c];
+      for (let row = 0; row < h; row++) {
+        f[row * w + c] = s * k;
+        s += tmp[Math.min(h - 1, row + r + 1) * w + c] - tmp[Math.max(0, row - r) * w + c];
+      }
+    }
+  }
+}
+
+export interface CloudGrids {
+  w: number;
+  h: number;
+  /** buildCloudRegimeGrid (coverage, stratocumulus, deep convection, shallow cumulus). */
+  regime: Uint8Array;
+  /**
+   * RGBA8 auxiliary regimes: R = cirrus (anvil outflow around deep convection, jet-stream cirrus in
+   * the storm tracks, a thin background), G = open-cell cumulus (cold-air outbreaks: equatorward flow
+   * in the mid-latitudes), B, A = 0 (reserved).
+   */
+  aux: Uint8Array;
+  /** Advection wind (m/s): the monthly wind smoothed to synoptic scales (little flow-map strain). */
+  flowU: Float32Array;
+  flowV: Float32Array;
+  climate: CloudClimate;
+}
+
+/**
+ * Everything the cloud renderers derive from a CloudSpec, in one pass (runs in the cloud worker):
+ * regime and auxiliary grids, smoothed advection wind and the climate analysis.
+ */
+export function buildCloudGrids(spec: CloudSpec): CloudGrids {
+  const { w, h } = spec;
+  const n = w * h;
+  const cov = new Float32Array(n), div = new Float32Array(n), tmp = new Float32Array(n);
+  const regime = regimeGrid(spec, undefined, cov, div);
+  const climate = analyzeCloudClimate(spec);
+  // Cirrus: anvil outflow spreads ~1000 km around deep convection; jet cirrus along the storm tracks.
+  const conv = new Float32Array(n);
+  for (let i = 0; i < n; i++) conv[i] = regime[4 * i + 2] / 255;
+  const cellDeg = 360 / w;
+  const rr = Math.max(1, Math.round(4 / cellDeg));
+  boxBlur(conv, w, h, rr, 2, tmp);
+  const aux = new Uint8Array(n * 4);
+  const U = spec.u, V = spec.v;
+  for (let r = 0; r < h; r++) {
+    const lat = Math.PI / 2 - ((r + 0.5) * Math.PI) / h;
+    const a = Math.abs(lat);
+    const hs = lat >= 0 ? 1 : -1;
+    const track = climate.stormLat[lat >= 0 ? 0 : 1];
+    const jet = Math.exp(-(((a - track + 4 * DEG) / (11 * DEG)) ** 2));
+    const midLat = smoothstep(30 * DEG, 40 * DEG, a) * (1 - smoothstep(62 * DEG, 72 * DEG, a));
+    for (let c = 0; c < w; c++) {
+      const i = r * w + c;
+      const x = cov[i] / COVER_REFERENCE_DENSITY;
+      const f = regime[4 * i] / 255;
+      const ci = Math.min(1, 0.9 * conv[i] + jet * smoothstep(0.35, 0.8, x) * 0.35 + 0.08 * smoothstep(0.3, 0.7, x));
+      const vv = V ? V[i] : 0;
+      const eq = Number.isFinite(vv) ? -vv * hs : 0;
+      const open = midLat * smoothstep(0.5, 3, eq) * smoothstep(0.15, 0.4, f) * (1 - smoothstep(0.75, 0.95, f)) * smoothstep(-0.5, 1.5, div[i] + 1);
+      aux[4 * i] = Math.round(255 * ci);
+      aux[4 * i + 1] = Math.round(255 * Math.min(1, open));
+    }
+  }
+  const flowU = new Float32Array(n), flowV = new Float32Array(n);
+  if (U && V) {
+    for (let i = 0; i < n; i++) {
+      const u = U[i], v = V[i];
+      flowU[i] = Number.isFinite(u) ? u : 0;
+      flowV[i] = Number.isFinite(v) ? v : 0;
+    }
+    const rw = Math.max(1, Math.round(3 / cellDeg));
+    boxBlur(flowU, w, h, rw, 2, tmp);
+    boxBlur(flowV, w, h, rw, 2, tmp);
+  }
+  return { w, h, regime, aux, flowU, flowV, climate };
 }
 
 /* ------------------------------------------------------------------ */

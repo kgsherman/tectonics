@@ -2,10 +2,11 @@
  * Sim worker logic (SPEC.md §10), independent of the worker global so it runs in Node tests.
  *
  * Owns the mesh, the TectonicSim, history keyframes and climate-input building. It does not paint:
- * every state to show (playback steps, paused state, history keyframes) goes to the paint worker as
- * a structured clone over the sim ⇄ paint channel (the sim keeps its memoized snapshot). Playback:
- * step `stepsPerFrame` → snapshot → post → wait for the paint worker's credit ('taken', sent when it
- * starts painting) → step again — so stepping and painting overlap instead of alternating.
+ * every state to show (playback steps, paused state, history keyframes) goes to a paint worker as
+ * a structured clone over a sim ⇄ paint channel (the sim keeps its memoized snapshot). Playback:
+ * step `stepsPerFrame` → snapshot → post to a free painter → step again as soon as a painter is free
+ * (its credit 'taken' arrives when it starts painting) — so stepping and painting overlap, and with
+ * helper painters (slots ≥ 1) several frames are painted at once. Stills always go to slot 0.
  */
 import { climateInputFromSnapshot } from '../climate/climate';
 import { createSphereMesh } from '../core/sphereMesh';
@@ -34,31 +35,48 @@ export interface SimHostEnv {
 /** Throttle for snapshot/status/history pushes during playback (SPEC: hover data ≤ every 250 ms). */
 const PUSH_INTERVAL_MS = 250;
 const MAX_STEPS_PER_FRAME = 100;
+/** Painter slots accepted (primary + helpers). */
+export const MAX_PAINTERS = 8;
+
+/** One painter slot's channel state (slot 0 = primary paint worker). */
+interface PainterLink {
+  port: PortLike | null;
+  /** Messages posted before the channel was connected (slot 0 only). */
+  queue: SimToPaint[];
+  /** Resolution of the mesh it holds (0 = none sent yet). */
+  meshN: number;
+  /** It has the current display settings. */
+  displaySent: boolean;
+  /** Playback snapshot it has not taken yet (0 = none: free). */
+  awaiting: number;
+}
+
+const newLink = (): PainterLink => ({ port: null, queue: [], meshN: 0, displaySent: false, awaiting: 0 });
 
 export class SimHost {
   private mesh: SphereMesh | null = null;
-  /** Resolution of the mesh the paint worker holds (0 = none sent yet). */
-  private paintMeshN = 0;
   private sim: TectonicSim | null = null;
   private seed = 1;
   private params: TectonicParams = { ...DEFAULT_TECTONIC_PARAMS };
   private readonly keyframes: KeyframeStore;
-  private paintPort: PortLike | null = null;
-  /** Messages for the paint worker posted before its channel was connected. */
-  private paintQueue: SimToPaint[] = [];
+  /** Painter slots; slot 0 always exists (queues until connected), helpers join via connectPaint(index ≥ 1). */
+  private readonly painters: PainterLink[] = [newLink()];
+  /** Round-robin preference for the next playback snapshot. */
+  private nextPainter = 0;
+  /** Climate sources registered for the current world (replayed to a painter that connects late). */
+  private climateSources: Array<{ snapshotId: number; time: number }> = [];
 
   private epoch = 0;
   /** Latest display settings relayed from a main-thread request; sent with the next show. */
   private display: DisplaySettings | null = null;
-  private displayDirty = false;
   /** Keyframe shown instead of the live state (null = live). */
   private viewing: number | null = null;
 
   private playing = false;
   private stepsPerFrame = 1;
   private showSeq = 0;
-  /** Playback snapshot the paint worker has not taken yet (0 = none: free to step). */
-  private awaiting = 0;
+  /** Show sequence number of the current playback's first snapshot. */
+  private playFrom = 0;
   private tickScheduled = false;
 
   private lastPush = -Infinity;
@@ -84,41 +102,108 @@ export class SimHost {
     }
   }
 
-  /** Connect the channel to the paint worker (also used in-process by InlinePipeline). */
-  connectPaint(port: PortLike): void {
-    if (this.paintPort && this.paintPort !== port) {
-      this.paintPort.onmessage = null;
-      this.paintPort.close?.();
+  /**
+   * Connect the channel to painter slot `index` (0 = primary; also used in-process by
+   * InlinePipeline). A helper that joins after a world was loaded gets that world first.
+   */
+  connectPaint(port: PortLike, index = 0): void {
+    if (!(Number.isInteger(index) && index >= 0 && index < MAX_PAINTERS)) throw new Error(`sim worker: invalid painter slot ${index}`);
+    while (this.painters.length <= index) this.painters.push(newLink());
+    const link = this.painters[index];
+    if (link.port && link.port !== port) {
+      link.port.onmessage = null;
+      link.port.close?.();
     }
-    this.paintPort = port;
-    port.onmessage = (e: MessageEvent) => this.receivePaint(e.data as PaintToSim);
-    const queued = this.paintQueue;
-    this.paintQueue = [];
+    link.port = port;
+    link.awaiting = 0;
+    link.displaySent = false;
+    port.onmessage = (e: MessageEvent) => this.receivePaint(e.data as PaintToSim, index);
+    const queued = link.queue;
+    link.queue = [];
     for (const m of queued) port.postMessage?.(m);
+    if (index > 0 && this.sim && this.mesh) {
+      link.meshN = 0;
+      this.postWorld(index);
+      for (const s of this.climateSources) this.toPaint({ type: 'climateSource', ...s }, index);
+    }
   }
 
-  /** A message from the paint worker. */
-  receivePaint(m: PaintToSim): void {
-    if (m?.type !== 'taken' || m.seq !== this.awaiting) return;
-    this.awaiting = 0;
+  /** A helper painter died: its slot takes no more snapshots (a snapshot it held is lost: one frame). */
+  private dropPainter(index: number): void {
+    const link = this.painters[index];
+    if (index < 1 || !link?.port) return;
+    link.port.onmessage = null;
+    link.port.close?.();
+    link.port = null;
+    link.awaiting = 0;
     if (this.playing) this.scheduleTick();
   }
 
-  private toPaint(m: SimToPaint): void {
-    if (this.paintPort?.postMessage) this.paintPort.postMessage(m);
-    else this.paintQueue.push(m);
+  /** Painter slots in use (slot 0 counts even before it is connected: its messages queue). */
+  get painterCount(): number {
+    return this.painters.filter((p, i) => i === 0 || p.port !== null).length;
+  }
+
+  /** A message from painter slot `slot`. */
+  receivePaint(m: PaintToSim, slot = 0): void {
+    const link = this.painters[slot];
+    if (m?.type !== 'taken' || !link || m.seq !== link.awaiting) return;
+    link.awaiting = 0;
+    if (this.playing) this.scheduleTick();
+  }
+
+  /** Slots that receive broadcasts: the primary (queued until connected) and connected helpers. */
+  private activeSlots(): number[] {
+    const out: number[] = [];
+    this.painters.forEach((link, i) => {
+      if (i === 0 || link.port) out.push(i);
+    });
+    return out;
+  }
+
+  /** To one painter slot, or to every painter when `slot` is undefined. */
+  private toPaint(m: SimToPaint, slot?: number): void {
+    for (const i of slot === undefined ? this.activeSlots() : [slot]) {
+      const link = this.painters[i];
+      if (link.port?.postMessage) link.port.postMessage(m);
+      else link.queue.push(m);
+    }
+  }
+
+  /** The current world (with the mesh where a painter lacks this resolution) to one slot or all. */
+  private postWorld(slot?: number): void {
+    const mesh = this.requireMesh();
+    for (const i of slot === undefined ? this.activeSlots() : [slot]) {
+      const link = this.painters[i];
+      this.toPaint({ type: 'world', epoch: this.epoch, meshN: mesh.n, mesh: link.meshN === mesh.n ? null : mesh, seed: this.seed }, i);
+      link.meshN = mesh.n;
+    }
+  }
+
+  /** First free painter (no untaken playback snapshot), round robin from the last one used; −1 when all are busy. */
+  private freePainter(): number {
+    const n = this.painters.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.nextPainter + k) % n;
+      const link = this.painters[i];
+      if ((i === 0 || link.port) && link.awaiting === 0) return i;
+    }
+    return -1;
   }
 
   private setDisplay(d: DisplaySettings): void {
     this.display = d;
-    this.displayDirty = true;
+    for (const link of this.painters) link.displaySent = false;
   }
 
   private dispatch(msg: SimRequest): void {
     switch (msg.type) {
       case 'connectPaint':
-        this.connectPaint(msg.port);
+        this.connectPaint(msg.port, msg.index ?? 0);
         return this.reply(msg.reqId, 'connectPaint', null);
+      case 'dropPainter':
+        this.dropPainter(msg.index);
+        return this.reply(msg.reqId, 'dropPainter', null);
       case 'generate': {
         this.stopPlaying();
         this.ensureMesh(msg.meshN);
@@ -199,6 +284,7 @@ export class SimHost {
         this.keyframes.truncateAfter(msg.index);
         // Climates (also those still in flight) for states after the branch point belong to the discarded future.
         this.toPaint({ type: 'branch', time: kf.time });
+        this.climateSources = this.climateSources.filter((c) => c.time <= kf.time + 1e-6);
         this.viewing = null;
         this.resetPerf();
         this.pushState(true);
@@ -208,8 +294,13 @@ export class SimHost {
       case 'climateInput': {
         const snap = this.displaySnapshot();
         const input = climateInputFromSnapshot(this.requireMesh(), snap, msg.params);
-        // Registered before the reply: the climate computed from this input reaches the paint worker later.
-        if (input.sourceId !== undefined) this.toPaint({ type: 'climateSource', snapshotId: input.sourceId, time: snap.time });
+        // Registered before the reply: the climate computed from this input reaches the painters later.
+        if (input.sourceId !== undefined) {
+          const src = { snapshotId: input.sourceId, time: snap.time };
+          this.climateSources.push(src);
+          if (this.climateSources.length > 256) this.climateSources.shift();
+          this.toPaint({ type: 'climateSource', ...src });
+        }
         return this.reply(msg.reqId, 'climateInput', input, climateInputTransfers(input));
       }
       case 'connectClimate':
@@ -252,11 +343,13 @@ export class SimHost {
     this.keyframes.clear();
     this.viewing = null;
     this.resetPerf();
-    this.toPaint({ type: 'world', epoch: this.epoch, meshN: mesh.n, mesh: this.paintMeshN === mesh.n ? null : mesh, seed: this.seed });
-    this.paintMeshN = mesh.n;
+    this.climateSources = [];
+    this.postWorld();
     this.recordKeyframe();
     this.pushState(true);
     this.show('still', 0, 'full', true);
+    // Helpers warm their caches on the new world (quietly), so the first playback frames are not late.
+    for (let slot = 1; slot < this.painters.length; slot++) if (this.painters[slot].port) this.show('still', 0, 'preview', false, slot);
     return this.loadedInfo();
   }
 
@@ -283,8 +376,12 @@ export class SimHost {
   private startPlaying(): void {
     this.requireSim();
     this.viewing = null;
+    if (!this.playing) {
+      this.toPaint({ type: 'start', epoch: this.epoch });
+      this.playFrom = this.showSeq + 1;
+    }
     this.playing = true;
-    this.awaiting = 0;
+    for (const link of this.painters) link.awaiting = 0;
     this.resetPerf();
     this.scheduleTick();
   }
@@ -292,7 +389,7 @@ export class SimHost {
   private stopPlaying(): void {
     if (this.playing) this.toPaint({ type: 'stop', epoch: this.epoch });
     this.playing = false;
-    this.awaiting = 0;
+    for (const link of this.painters) link.awaiting = 0;
   }
 
   private scheduleTick(): void {
@@ -304,7 +401,8 @@ export class SimHost {
   private readonly tick = (): void => {
     this.tickScheduled = false;
     if (!this.playing || !this.sim) return;
-    if (this.awaiting) return; // resumed by the paint worker's credit
+    const slot = this.freePainter();
+    if (slot < 0) return; // resumed by a painter's credit
     try {
       const t0 = this.env.now();
       this.sim.step(this.stepsPerFrame);
@@ -312,17 +410,18 @@ export class SimHost {
       this.perf.lastStepMs = (t1 - t0) / this.stepsPerFrame;
       this.sim.snapshot();
       this.perf.lastSnapshotMs = this.env.now() - t1;
-      // Hand the frame to the paint worker first; bookkeeping overlaps with its painting.
-      this.show('play', 0, 'preview', false);
+      // Hand the frame to the painter first; bookkeeping overlaps with its painting.
+      this.show('play', 0, 'preview', false, slot);
+      this.nextPainter = (slot + 1) % this.painters.length;
       this.recordKeyframe();
       this.win.steps += this.stepsPerFrame;
       this.win.frames++;
       this.updateRates();
       this.pushState(false);
+      // Another painter is free (helpers): keep it fed instead of waiting for the next credit.
+      if (this.freePainter() >= 0) this.scheduleTick();
     } catch (e) {
-      this.playing = false;
-      this.awaiting = 0;
-      this.toPaint({ type: 'stop', epoch: this.epoch });
+      this.stopPlaying();
       this.env.post({ type: 'error', reqId: 0, message: `playback stopped: ${errorMessage(e)}` });
       this.pushState(true);
     }
@@ -363,16 +462,18 @@ export class SimHost {
   /* States for the paint worker                                         */
   /* ------------------------------------------------------------------ */
 
-  /** Post the displayed state (live or keyframe) to the paint worker. */
-  private show(kind: ShowMessage['kind'], reqId: number, quality: PaintQuality, previewFirst: boolean): void {
+  /** Post the displayed state (live or keyframe) to a painter (stills: the primary, slot 0). */
+  private show(kind: ShowMessage['kind'], reqId: number, quality: PaintQuality, previewFirst: boolean, slot = 0): void {
+    const link = this.painters[slot];
     const seq = ++this.showSeq;
     const msg: ShowMessage = {
       type: 'show', seq, epoch: this.epoch, reqId, kind, snapshot: this.displaySnapshot(), keyframe: this.viewing,
-      display: this.displayDirty ? this.display : null, quality, parts: 'all', previewFirst,
+      display: link.displaySent ? null : this.display, quality, parts: 'all', previewFirst,
+      playFrom: kind === 'play' ? this.playFrom : undefined,
     };
-    this.displayDirty = false;
-    if (kind === 'play') this.awaiting = seq;
-    this.toPaint(msg);
+    link.displaySent = true;
+    if (kind === 'play') link.awaiting = seq;
+    this.toPaint(msg, slot);
   }
 
   private displaySnapshot(): WorldSnapshot {

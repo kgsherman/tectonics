@@ -13,6 +13,13 @@ import { syntheticSnapshot } from '../helpers/fixtures';
 const SLACK = 2;
 const BUDGET_SUBSTEP_MS = 25;
 const BUDGET_STEP_MS = 60;
+/**
+ * Playback (sim worker, one step per frame): step + snapshot must leave room for ≥ 20 display fps;
+ * targets ≤ 22 ms per step (long-run average; the first ~50 Myr of a fresh world run ~20% slower)
+ * and ≤ 6 ms per snapshot on an idle machine.
+ */
+const BUDGET_FRAME_MS = 32;
+const BUDGET_SNAPSHOT_MS = 6;
 
 function randomDraft(mesh: SphereMesh, seed: number, plateCount: number): WorldDraft {
   try {
@@ -60,17 +67,28 @@ describe('TectonicSim performance (n = 100k)', () => {
     });
   }
 
-  it('snapshot and toDraft stay interactive', () => {
+  it('snapshot and toDraft stay interactive; a playback frame (step + snapshot) fits the sim stage', () => {
     const sim = new TectonicSim(mesh, randomDraft(mesh, 4, 16));
-    sim.step(3);
-    const t0 = now();
+    sim.step(20);
     sim.snapshot();
-    const snapMs = now() - t0;
+    const snapMs: number[] = [];
+    const frameMs: number[] = [];
+    for (let r = 0; r < 12; r++) {
+      const t0 = now();
+      sim.step();
+      const t1 = now();
+      sim.snapshot();
+      const t2 = now();
+      snapMs.push(t2 - t1);
+      frameMs.push(t2 - t0);
+    }
     const t1 = now();
     sim.toDraft();
     const draftMs = now() - t1;
-    console.log(`[tectonics perf] snapshot ${snapMs.toFixed(1)} ms, toDraft ${draftMs.toFixed(1)} ms`);
-    expect(snapMs).toBeLessThan(40 * SLACK);
+    const snap = median(snapMs), frame = median(frameMs);
+    console.log(`[tectonics perf] snapshot ${snap.toFixed(1)} ms (budget ${BUDGET_SNAPSHOT_MS}), step + snapshot ${frame.toFixed(1)} ms (budget ${BUDGET_FRAME_MS}), toDraft ${draftMs.toFixed(1)} ms`);
+    expect(snap).toBeLessThan(BUDGET_SNAPSHOT_MS * SLACK);
+    expect(frame).toBeLessThan(BUDGET_FRAME_MS * SLACK);
     expect(draftMs).toBeLessThan(20 * SLACK);
   });
 });

@@ -4,9 +4,10 @@
  */
 import { applyStencil } from './dynAdvect';
 import {
-  iceFraction, iceSheetWeight, snowCoverFactor, snowWeight,
+  glacierWeight, iceAreaAfter, snowCoverFactor, snowfallRate, snowMassCover, snowWeight,
   type EbmCoupling, type EbmModel, type EbmMonthly, type EbmState,
 } from './energy';
+import { applyIceFlow, applyIceSurface } from './energyIce';
 import { solveCyclic, solveTridiag } from './numerics';
 import { ebmTuning } from './tuning';
 
@@ -16,21 +17,29 @@ import { ebmTuning } from './tuning';
  */
 export function integrateYear(M: EbmModel, S: EbmState, cp: EbmCoupling, out: EbmMonthly | null): void {
   const n = M.g.n;
+  // Ice flow feeds last year's ablation zones; ice-sheet surfaces follow the glacier mask.
+  applyIceFlow(M, S);
+  applyIceSurface(M, S);
   if (out) {
     out.tAir.fill(0);
     out.sst.fill(0);
     out.ice.fill(0);
+    out.mMin.set(S.M);
   }
   const inv = 1 / M.stepsPerMonth;
+  const minY = M.minY;
   for (let k = 0; k < M.stepsPerYear; k++) {
     step(M, S, cp, k);
+    for (let i = 0; i < n; i++) if (S.M[i] < minY[i]) minY[i] = S.M[i];
     if (!out) continue;
     const o = Math.floor(k / M.stepsPerMonth) * n;
     const { To, ice } = M.work;
+    const Mm = S.M, mMin = out.mMin;
     for (let i = 0; i < n; i++) {
       out.tAir[o + i] += S.T[i] * inv;
       out.sst[o + i] += To[i] * inv;
       out.ice[o + i] += ice[i] * inv;
+      if (Mm[i] < mMin[i]) mMin[i] = Mm[i];
     }
   }
 }
@@ -43,16 +52,23 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
   const month = Math.floor(k / M.stepsPerMonth) % 12;
   const A = t.olrA, B = t.olrB, Tf = t.freezeT, aIce = t.albedoIce;
   const cL = t.cLand, cA = t.cAir, cI = t.cIceSurface, gam = t.airSeaExchange;
-  const Tc = S.T, E = S.E, Ti = S.Ti, Es = S.Es;
+  const Tc = S.T, E = S.E, Ti = S.Ti, Es = S.Es, Mass = S.M;
   // Seasonal stratified layer (energy.ts EbmState.Es): capacity and per-step mixing into the deep layer.
   const Cs = t.stratDepth > 0 ? t.rhoCpWater * t.stratDepth : 0;
   const invCs = Cs > 0 ? 1 / Cs : 0;
   const stratMix = Cs > 0 ? 1 - Math.exp(-dt / (t.stratMixDays * 86400)) : 1;
-  const { F, dep, To, tAirMean, cEff, ice } = work;
+  const { F, dep, To, tAirMean, cEff, ice, melt } = work;
+  const mMax = t.glacierMassMax;
+  const rampLand = 1 / (t.seaIceRampWarm - t.seaIceRampCold);
+  const LfSnow = t.latentFusion;
+  const { accY, ablY } = M;
   const qOff = k * ny;
 
   // (0) Land forcing with snow albedo lagged from the previous step (plus the free-troposphere
-  //     coupling of high terrain toward the row-mean air temperature); ocean surface state.
+  //     coupling of high terrain toward the row-mean air temperature) and snowfall on the land
+  //     snow/ice mass; ocean surface state. Snow albedo: the colder of a temperature ramp (fresh
+  //     snow of the cold season) and the cover of the snowpack itself, which stays bright until it
+  //     has melted; glaciers take the ice-sheet albedo and are not patchy on high terrain.
   const ft = M.freeTrop;
   const albOff = cp.albedoOffset;
   const aOff = month * n;
@@ -67,9 +83,24 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
       if (land[i]) {
+        const ts0 = Tc[i] - lapse[i];
+        const sf = snowfallRate(ts0) * dt;
+        accY[i] += sf;
+        let m = Mass[i] + sf;
+        if (m > mMax) m = mMax;
+        Mass[i] = m;
+        const G = glacierWeight(m);
+        const cover = snowMassCover(m);
+        let w = snowWeight(ts0);
+        const wet = cover * t.snowWetWeight;
+        if (wet > w) w = wet;
+        if (G > w) w = G;
         const a0 = albOff ? aL + albOff[aOff + i] : aL;
-        const aSnow = aIce + (t.albedoIceSheet - aIce) * iceSheetWeight(S.Tann[i]);
-        const alb = a0 + (aSnow - a0) * snowWeight(Tc[i] - lapse[i]) * snowCoverFactor(S.Tann[i], lapse[i]);
+        const wCold = (t.seaIceRampWarm - ts0) * rampLand;
+        const aSheet = t.albedoIceSheetMelt + (t.albedoIceSheet - t.albedoIceSheetMelt) * (wCold < 0 ? 0 : wCold > 1 ? 1 : wCold);
+        const aSnow = aIce + (aSheet - aIce) * G;
+        const alb = a0 + (aSnow - a0) * w * snowCoverFactor(G, lapse[i]);
+        melt[i] = t.meltCoupling * cover;
         // Free-troposphere coupling target: the free air at the terrain height follows the moist
         // adiabat, which in warm climates is shallower than the standard lapse rate Γ (the surface
         // of a tropical plateau sits in air warmer than T_sl − Γh).
@@ -77,7 +108,7 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
         To[i] = 0;
         ice[i] = 0;
       } else {
-        ice[i] = iceFraction(E[i], eFull);
+        ice[i] = E[i] < 0 ? S.Ai[i] : 0;
         To[i] = Tf + Math.max(0, E[i]) / Co + (Es[i] > 0 ? Es[i] * invCs : 0);
       }
     }
@@ -100,7 +131,26 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
       if (land[i]) {
         let d = src[i] - Tc[i];
         if (kWarm && kCold) d *= d > 0 ? kWarm[i] : kCold[i];
-        Tc[i] = (cdL * (Tc[i] + d) + F[i]) / (cdL + B + ft[i]);
+        const rhs = cdL * (Tc[i] + d) + F[i];
+        const den = cdL + B + ft[i];
+        let tn = rhs / den;
+        const m = Mass[i];
+        if (m > 0 && tn > lapse[i]) {
+          // Snow or ice at the surface: it cannot warm above 0 °C; the surplus melts it.
+          const lam = melt[i];
+          tn = (rhs + lam * lapse[i]) / (den + lam);
+          const dm = (lam * (tn - lapse[i]) * dts) / LfSnow;
+          if (dm >= m) {
+            // The pack is gone within the sub-step: only its latent heat is taken up.
+            tn = (rhs - (m * LfSnow) / dts) / den;
+            Mass[i] = 0;
+            ablY[i] += m;
+          } else {
+            Mass[i] = m - dm;
+            ablY[i] += dm;
+          }
+        }
+        Tc[i] = tn;
       } else {
         const a = ice[i];
         const tsf = (1 - a) * To[i] + a * Ti[i];
@@ -143,6 +193,10 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
   const hSnow = t.iceSnowEquivalent;
   const Lf = t.iceLatent;
   const hFull = t.iceFullThickness;
+  const hLead = t.seaIceLeadThickness;
+  const hMin = t.seaIceMinThickness;
+  const fBasal = t.iceBasalHeatFlux;
+  const Ai = S.Ai;
   const aMelt = t.albedoSeaIceMelt;
   const tConv = t.convectiveCapT;
   const kConv = t.convectiveDamping;
@@ -201,8 +255,10 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
       } else {
         e += es;
         es = 0;
-        const a = Math.min(1, -e / eFull);
-        const hi = Math.max(hFull, -e / Lf);
+        const v = -e / Lf;
+        let a = ice[i] > 0 ? ice[i] : Math.min(1, v / hLead);
+        if (a > v / hMin) a = v / hMin;
+        const hi = Math.max(hFull, v / a);
         const K = kIce / (hi + hSnow);
         // Sea-ice albedo from the previous ice-surface temperature (melting ice is darker).
         const wCold = Math.min(1, Math.max(0, (t.seaIceRampWarm - ti) * rampI));
@@ -213,19 +269,25 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
           melt = cdi * ti + saI - A + K * Tf + gam * ta;
           tiNew = 0;
         }
-        // Net flux into the ocean enthalpy from the ice part and from the open water at T_f.
+        // Net flux into the ocean enthalpy from the ice part and from the open water at T_f; heat
+        // of upwelled deep water reaches the whole cell (it melts the ice from below).
         const G = melt - K * (Tf - tiNew);
-        const Fw = saW - A - B * Tf + lu * (ts - Tf) + gam * (ta - Tf);
-        if (a < 1) {
-          const den = 1 + (dt * (G - Fw)) / eFull;
-          e = den > 0.3 ? (e + dt * Fw) / den : e + dt * (Fw + a * (G - Fw));
-        } else {
-          e += dt * G;
-        }
+        const Fw = saW - A - B * Tf + gam * (ta - Tf);
+        const Fu = lu * (ts - Tf);
+        const e0 = e;
+        e += dt * ((1 - a) * Fw + a * (G + fBasal) + Fu);
+        if (e < -eMax) e = -eMax;
+        // Area: open water freezing in the leads closes them with new ice; net melt thins the pack
+        // from its thin end (iceAreaAfter).
+        let aa = a;
+        if (Fw < 0 && e < 0) aa += ((1 - a) * -Fw * dt) / (Lf * hLead);
+        Ai[i] = iceAreaAfter(e0, e, aa > 1 ? 1 : aa);
         ti = tiNew;
       }
       if (e < -eMax) e = -eMax;
-      const aNew = iceFraction(e, eFull);
+      if (e >= 0) Ai[i] = 0;
+      else if (E[i] >= 0) Ai[i] = iceAreaAfter(E[i], e, 0);
+      const aNew = Ai[i];
       if (aNew > 0 && ice[i] === 0) ti = Math.min(Tf, ta);
       E[i] = e;
       Es[i] = es;
@@ -246,9 +308,10 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
         if (q === 0 || land[i]) continue;
         let e = E[i] + dt * q;
         if (e < -eMax) e = -eMax;
-        const aNew = iceFraction(e, eFull);
+        const aNew = iceAreaAfter(E[i], e, Ai[i]);
         if (aNew > 0 && ice[i] === 0) Ti[i] = Math.min(Tf, tAirMean[i]);
         E[i] = e;
+        Ai[i] = aNew;
         ice[i] = aNew;
         To[i] = Tf + Math.max(0, e) / Co;
       }
@@ -276,8 +339,9 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
         if (land[i]) continue;
         let e = E[i] + Co * (To[i] - work.dep[i]);
         if (e < -eMax) e = -eMax;
+        const aNew = iceAreaAfter(E[i], e, Ai[i]);
         E[i] = e;
-        const aNew = iceFraction(e, eFull);
+        Ai[i] = aNew;
         if (aNew > 0 && ice[i] === 0) Ti[i] = Math.min(Tf, tAirMean[i]);
         ice[i] = aNew;
         To[i] = Tf + Math.max(0, e) / Co;
@@ -297,7 +361,7 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
     const sf = work.stab;
     // Ice sheets keep their own (inversion) factor in kE/kN/kS.
     for (let i = 0; i < n; i++) {
-      sf[i] = land[i] ? 1 - (1 - t.stableLandDiffusion) * snowWeight(Tc[i] - lapse[i]) * (1 - iceSheetWeight(S.Tann[i])) : 1;
+      sf[i] = land[i] ? 1 - (1 - t.stableLandDiffusion) * snowWeight(Tc[i] - lapse[i]) * (1 - glacierWeight(Mass[i])) : 1;
     }
     const { kE, kN, kS } = M;
     const sE = work.kE2, sN = work.kN2, sS = work.kS2;

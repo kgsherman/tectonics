@@ -94,7 +94,33 @@ export function smoothingHalfWidths(g: LatLonGrid, km: number): { hx: Int32Array
   return { hx, hy: Math.round(L / (EARTH_RADIUS_M * g.dLat)) };
 }
 
-/** Zonal running-sum box blur of one row-major field slice (lon wraps). `tmp` length ≥ nx. */
+/** cos/sin of the zonal wavenumber-1 phase 2π(c + ½)/nx per column, cached by nx. */
+const phaseTables = new Map<number, { cos: Float64Array; sin: Float64Array }>();
+export function zonalPhase(nx: number): { cos: Float64Array; sin: Float64Array } {
+  let t = phaseTables.get(nx);
+  if (!t) {
+    const cos = new Float64Array(nx);
+    const sin = new Float64Array(nx);
+    for (let c = 0; c < nx; c++) {
+      const a = (2 * Math.PI * (c + 0.5)) / nx;
+      cos[c] = Math.cos(a);
+      sin[c] = Math.sin(a);
+    }
+    t = { cos, sin };
+    phaseTables.set(nx, t);
+  }
+  return t;
+}
+
+/**
+ * Zonal running-sum box blur of one row-major field slice (lon wraps). `tmp` length ≥ nx.
+ *
+ * Zonal wavenumbers 0 and 1 pass unchanged: a field that is smooth across a pole varies around a
+ * polar latitude circle like a + b·cos(λ − λ₀) (a gradient across the pole), which the wide boxes of
+ * the polar rows would otherwise flatten row by row into zonal bands, with inconsistent gradients
+ * (winds, thermal wind, convergence) in the last rows. Away from the poles the boxes are narrow and
+ * their wavenumber-1 response is ≈ 1 anyway.
+ */
 export function boxBlurZonal(
   f: Float64Array | Float32Array,
   off: number,
@@ -103,23 +129,39 @@ export function boxBlurZonal(
   hx: Int32Array,
   tmp: Float64Array,
 ): void {
+  const ph = zonalPhase(nx);
+  const pc = ph.cos, ps = ph.sin;
   for (let j = 0; j < ny; j++) {
     const h = hx[j];
     if (h <= 0) continue;
     const base = off + j * nx;
-    if (2 * h + 1 >= nx) {
+    // Wavenumber-1 part of the row and the box's response to it.
+    let a1 = 0;
+    let b1 = 0;
+    for (let c = 0; c < nx; c++) {
+      const v = f[base + c];
+      a1 += v * pc[c];
+      b1 += v * ps[c];
+    }
+    a1 *= 2 / nx;
+    b1 *= 2 / nx;
+    const L = 2 * h + 1;
+    if (L >= nx) {
       let s = 0;
       for (let c = 0; c < nx; c++) s += f[base + c];
       const m = s / nx;
-      for (let c = 0; c < nx; c++) f[base + c] = m;
+      for (let c = 0; c < nx; c++) f[base + c] = m + a1 * pc[c] + b1 * ps[c];
       continue;
     }
+    const keep = 1 - Math.sin((Math.PI * L) / nx) / (L * Math.sin(Math.PI / nx));
     for (let c = 0; c < nx; c++) tmp[c] = f[base + c];
     let s = 0;
     for (let k = -h; k <= h; k++) s += tmp[(k + nx) % nx];
-    const inv = 1 / (2 * h + 1);
+    const inv = 1 / L;
+    const ka = keep * a1;
+    const kb = keep * b1;
     for (let c = 0; c < nx; c++) {
-      f[base + c] = s * inv;
+      f[base + c] = s * inv + ka * pc[c] + kb * ps[c];
       const add = c + h + 1;
       const rem = c - h;
       s += tmp[add >= nx ? add - nx : add] - tmp[rem < 0 ? rem + nx : rem];
@@ -127,7 +169,13 @@ export function boxBlurZonal(
   }
 }
 
-/** Meridional running-sum box blur (window truncated at the poles). `tmp` length ≥ ny. */
+/**
+ * Meridional running-sum box blur. The window continues across each pole onto the opposite
+ * meridian (row −1 − k at column c ≡ row k at column c + nx/2), as a great circle through the pole
+ * does, so a gradient across the pole is kept (its wavenumber-1 part changes sign across the pole)
+ * and polar rows are not biased toward their equatorward neighbours. With an odd nx the opposite
+ * column is rounded down. `tmp` length ≥ ny + 2·min(hy, ny).
+ */
 export function boxBlurMeridional(
   f: Float64Array | Float32Array,
   off: number,
@@ -137,24 +185,46 @@ export function boxBlurMeridional(
   tmp: Float64Array,
 ): void {
   if (hy <= 0) return;
+  const e = Math.min(hy, ny);
+  const len = ny + 2 * e;
+  const half = nx >> 1;
+  const ext = tmp.length >= len ? tmp : new Float64Array(len);
+  // The rows beyond the poles are read from the opposite columns, which the in-place sweep may
+  // already have smoothed: keep the unsmoothed polar rows.
+  const north = new Float64Array(e * nx);
+  const south = new Float64Array(e * nx);
+  for (let k = 0; k < e; k++) {
+    for (let c = 0; c < nx; c++) {
+      north[k * nx + c] = f[off + k * nx + c];
+      south[k * nx + c] = f[off + (ny - 1 - k) * nx + c];
+    }
+  }
   for (let c = 0; c < nx; c++) {
-    for (let j = 0; j < ny; j++) tmp[j] = f[off + j * nx + c];
+    const co = c + half < nx ? c + half : c + half - nx;
+    // ext[k] = row k − e of the great circle through column c (column c + nx/2 beyond the poles).
+    for (let k = 0; k < e; k++) {
+      ext[e - 1 - k] = north[k * nx + co];
+      ext[e + ny + k] = south[k * nx + co];
+    }
+    for (let j = 0; j < ny; j++) ext[e + j] = f[off + j * nx + c];
+    // Window of row j: ext[e + j − hy .. e + j + hy], clipped to the extended column.
     let s = 0;
     let cnt = 0;
-    for (let j = 0; j <= Math.min(hy, ny - 1); j++) {
-      s += tmp[j];
+    const last = Math.min(len - 1, e + hy);
+    for (let k = Math.max(0, e - hy); k <= last; k++) {
+      s += ext[k];
       cnt++;
     }
     for (let j = 0; j < ny; j++) {
       f[off + j * nx + c] = s / cnt;
-      const add = j + hy + 1;
-      const rem = j - hy;
-      if (add < ny) {
-        s += tmp[add];
+      const add = e + j + hy + 1;
+      const rem = e + j - hy;
+      if (add < len) {
+        s += ext[add];
         cnt++;
       }
       if (rem >= 0) {
-        s -= tmp[rem];
+        s -= ext[rem];
         cnt--;
       }
     }
@@ -165,7 +235,7 @@ export function boxBlurMeridional(
 export function smoothField(g: LatLonGrid, f: Float64Array | Float32Array, km: number, passes = 3, off = 0): void {
   if (km <= 0 || passes <= 0) return;
   const { hx, hy } = smoothingHalfWidths(g, km);
-  const tmp = new Float64Array(Math.max(g.nx, g.ny));
+  const tmp = new Float64Array(Math.max(g.nx, 3 * g.ny));
   for (let p = 0; p < passes; p++) {
     boxBlurZonal(f, off, g.nx, g.ny, hx, tmp);
     boxBlurMeridional(f, off, g.nx, g.ny, hy, tmp);

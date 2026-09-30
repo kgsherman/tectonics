@@ -143,7 +143,12 @@ describe('rivers on the satellite layer', () => {
       const o = 4 * p;
       if (withR[o] !== without[o] || withR[o + 1] !== without[o + 1] || withR[o + 2] !== without[o + 2]) {
         changed++;
-        if (hm[p] <= 0) onSea++;
+        // Sea pixels on the coastline are anti-aliased with their land neighbours (whose colours
+        // follow the full-quality drainage network): only open water must be untouched.
+        const c = p % 1024, r = (p - c) / 1024;
+        const nearLand = hm[r * 1024 + ((c + 1) % 1024)] > 0 || hm[r * 1024 + ((c + 1023) % 1024)] > 0 ||
+          (r > 0 && hm[p - 1024] > 0) || (r < 511 && hm[p + 1024] > 0);
+        if (hm[p] <= 0 && !nearLand) onSea++;
       }
     }
     expect(changed).toBeGreaterThan(200);

@@ -9,6 +9,7 @@ import { LAPSE_RATE, SECONDS_PER_DAY } from '../core/constants';
 import type { LatLonGrid } from './dynGrid';
 import { makeBilinearStencil } from './dynGrid';
 import type { OutputSurface } from './dynInput';
+import { glacierWeight } from './energy';
 import { fillFromNearest, nearestValidIndex } from './numerics';
 import { ebmTuning } from './tuning';
 
@@ -29,6 +30,10 @@ export interface CoreMonthly {
   currentV: Float64Array;
   /** m/s. */
   upwelling: Float64Array;
+  /** Optional n: perennial land snow/ice mass (kg/m², the year's minimum) → OutputFields.landIce. */
+  landMass?: Float64Array;
+  /** Optional n: ice-sheet surface raise above the bed (m): output land temperatures refer to the ice surface. */
+  iceRaise?: Float64Array;
 }
 
 export interface OutputFields {
@@ -46,6 +51,10 @@ export interface OutputFields {
   currentV: Float32Array;
   /** m/day. */
   upwelling: Float32Array;
+  /** w·h glacier / ice-sheet cover 0..1 of land cells (0 over the ocean). */
+  landIce: Float32Array;
+  /** w·h ice-sheet surface raise above the bed (m) of land cells. */
+  iceRaise: Float32Array;
 }
 
 function smoothstep(e0: number, e1: number, x: number): number {
@@ -106,6 +115,8 @@ export function assembleOutput(g: LatLonGrid, coreLand: Uint8Array, core: CoreMo
   const o: OutputFields = {
     temp: f32(), sst: f32(), seaIce: f32(), pressure: f32(), windU: f32(), windV: f32(), steerU: f32(), steerV: f32(),
     ascent: f32(), baroclinic: f32(), currentU: f32(), currentV: f32(), upwelling: f32(),
+    landIce: new Float32Array(N),
+    iceRaise: new Float32Array(N),
   };
   const isOcean = new Uint8Array(n);
   for (let i = 0; i < n; i++) isOcean[i] = coreLand[i] ? 0 : 1;
@@ -115,6 +126,28 @@ export function assembleOutput(g: LatLonGrid, coreLand: Uint8Array, core: CoreMo
   const hasSea = nearSea[0] >= 0;
   const W = outputWeights(g, coreLand, out, hasLand, hasSea);
   const { idx, wt, wLand, wSea, bLand, bSea } = W;
+  // Ice-sheet surface raise (m) of output land cells, interpolated from the land core cells.
+  const raiseOut = o.iceRaise;
+  if (core.iceRaise) {
+    const rr = Float64Array.from(core.iceRaise);
+    for (let i = 0; i < n; i++) if (!coreLand[i]) rr[i] = 0;
+    if (hasLand) fillFromNearest(rr, 0, nearLand);
+    for (let p = 0, k = 0; p < N; p++, k += 4) {
+      if (!out.land[p]) continue;
+      raiseOut[p] = wLand[k] * rr[idx[k]] + wLand[k + 1] * rr[idx[k + 1]] + wLand[k + 2] * rr[idx[k + 2]] + wLand[k + 3] * rr[idx[k + 3]];
+    }
+  }
+  // Glacier cover: interpolated from the land core cells.
+  if (core.landMass) {
+    const gl = new Float64Array(n);
+    for (let i = 0; i < n; i++) gl[i] = coreLand[i] ? glacierWeight(core.landMass[i]) : 0;
+    if (hasLand) fillFromNearest(gl, 0, nearLand);
+    for (let p = 0, k = 0; p < N; p++, k += 4) {
+      if (!out.land[p]) continue;
+      const v = wLand[k] * gl[idx[k]] + wLand[k + 1] * gl[idx[k + 1]] + wLand[k + 2] * gl[idx[k + 2]] + wLand[k + 3] * gl[idx[k + 3]];
+      o.landIce[p] = v > 1 ? 1 : v > 0 ? v : 0;
+    }
+  }
   // Extended (across the coast) land and ocean fields of one month.
   const tL = new Float64Array(n);
   const tO = new Float64Array(n);
@@ -164,7 +197,7 @@ export function assembleOutput(g: LatLonGrid, coreLand: Uint8Array, core: CoreMo
       let ice: number;
       if (out.land[p]) {
         const b = bLand[p];
-        temp = b * landT + (1 - b) * (hasSea ? oceanT : landT) - LAPSE_RATE * out.surfaceHeight[p];
+        temp = b * landT + (1 - b) * (hasSea ? oceanT : landT) - LAPSE_RATE * (out.surfaceHeight[p] + raiseOut[p]);
         o.currentU[q] = 0;
         o.currentV[q] = 0;
         o.upwelling[q] = 0;

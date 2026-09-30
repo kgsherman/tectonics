@@ -32,17 +32,22 @@ export class GlobeSurface {
   readonly height: HeightTextureSlot;
   private readonly u: Record<string, IUniform>;
 
-  constructor(shared: SharedUniforms, anisotropy: number) {
+  /**
+   * @param gpuHeightMips R16F is color-renderable (EXT_color_buffer_float): the height mip chain is
+   *   generated on the GPU instead of box-filtered on the CPU and uploaded level by level.
+   */
+  constructor(shared: SharedUniforms, anisotropy: number, gpuHeightMips = false) {
     this.base = new RgbaTextureSlot(true, false, anisotropy);
     // Raw bytes (NoColorSpace): the shader un-premultiplies the sRGB values and decodes them itself;
     // an sRGB texture format would decode in hardware first (double decode → darker, shifted colors).
     this.overlay = new RgbaTextureSlot(false, true, anisotropy);
-    this.height = new HeightTextureSlot(anisotropy);
+    this.height = new HeightTextureSlot(anisotropy, gpuHeightMips);
     this.u = {
       uBase: { value: null as Texture | null },
       uHasBase: { value: 0 },
       uOverlay: { value: null as Texture | null },
       uHasOverlay: { value: 0 },
+      uOverlaySize: { value: new Vector2(1, 1) },
       uHeight: { value: null as Texture | null },
       uHasHeight: { value: 0 },
       uHeightTexel: { value: new Vector2(1, 1) },
@@ -86,14 +91,14 @@ export class GlobeSurface {
 
   setOverlay(rgba: Uint8ClampedArray | null, w: number, h: number): void {
     if (!rgba) {
-      this.overlay.dispose();
-      this.u.uOverlay.value = null;
+      // Keep the textures: overlays are toggled often and come back at the same size.
       this.u.uHasOverlay.value = 0;
       return;
     }
     this.overlay.set(rgba, w, h);
     this.u.uOverlay.value = this.overlay.texture;
     this.u.uHasOverlay.value = 1;
+    (this.u.uOverlaySize.value as Vector2).set(w, h);
   }
 
   setHeight(height: Float32Array | null, w: number, h: number): void {
@@ -112,6 +117,10 @@ export class GlobeSurface {
     (this.u.uPoleHeight.value as Vector2).set(this.height.poleNorth, this.height.poleSouth);
     // Vertex sampling LOD matched to the mesh density (texels per segment).
     this.u.uHeightLod.value = Math.max(0, Math.log2(w / SEGMENTS_W));
+  }
+
+  get hasHeight(): boolean {
+    return this.u.uHasHeight.value === 1;
   }
 
   setSeaLevel(seaLevel: number): void {

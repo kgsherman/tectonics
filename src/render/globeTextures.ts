@@ -1,7 +1,7 @@
 /**
  * Equirect DataTextures for the globe. Each slot owns a CPU copy of the caller's data (the contract
  * lets callers reuse/transfer their buffers right after a set* call; uploads happen at render time),
- * reuses the GPU texture while the size is unchanged, and only uploads when new data arrives.
+ * keeps one GPU texture per raster size, and only uploads when the data actually changed.
  * Textures are row-0-north and sampled at (uv.x, 1 − uv.y) in the shaders, so flipY stays false.
  */
 import {
@@ -9,6 +9,7 @@ import {
   RepeatWrapping, RGBAFormat, RGFormat, SRGBColorSpace, UnsignedByteType,
 } from 'three';
 import type { ColorSpace, PixelFormat, TextureDataType } from 'three';
+import { copyIfChanged, premultiply, SizeCache } from './viewBuffers';
 
 interface TextureSpec {
   format: PixelFormat;
@@ -36,15 +37,32 @@ function createTexture(spec: TextureSpec, data: Uint8Array | Float32Array, w: nu
   return tex;
 }
 
+/** Raster sizes kept per slot (playback preview + paused full quality). */
+const SIZES_PER_SLOT = 2;
+
+interface RgbaEntry {
+  texture: DataTexture;
+  data: Uint8Array;
+  /** Straight-alpha copy of the caller's data (premultiplying slots: cheap change detection). */
+  raw: Uint8Array | null;
+  /** The texture has never been uploaded (its data must be sent even if the copy compares equal). */
+  pristine: boolean;
+}
+
 /**
  * RGBA8 equirect image (base: sRGB texture, decoded by the GPU; overlay: raw sRGB bytes premultiplied
  * on copy for fringe-free filtering, un-premultiplied and decoded in the shader).
+ *
+ * One texture per raster size is kept (most recent SIZES_PER_SLOT sizes): switching between the
+ * 1024×512 playback previews and the 2048×1024 paused frames re-uploads into existing GPU storage
+ * (texSubImage2D) instead of reallocating it. Data identical to what the texture already holds is not
+ * uploaded again (no upload, no mip rebuild).
  */
 export class RgbaTextureSlot {
   texture: DataTexture | null = null;
-  private data: Uint8Array | null = null;
-  private w = 0;
-  private h = 0;
+  /** Number of uploads scheduled so far (diagnostics/tests). */
+  uploads = 0;
+  private readonly sizes = new SizeCache<RgbaEntry>(SIZES_PER_SLOT, (e) => e.texture.dispose());
 
   constructor(
     private readonly srgb: boolean,
@@ -52,48 +70,38 @@ export class RgbaTextureSlot {
     private readonly anisotropy: number,
   ) {}
 
-  /** Copies rgba (w*h*4) and schedules an upload. Returns true when the texture object changed. */
+  /**
+   * Copies rgba (w*h*4) and schedules an upload when it differs from the texture's contents. Returns
+   * true when the active texture object changed (first image or another raster size).
+   */
   set(rgba: Uint8ClampedArray, w: number, h: number): boolean {
     if (!(w > 0 && h > 0) || rgba.length < w * h * 4) throw new Error(`RgbaTextureSlot: expected ${w}x${h}x4 bytes, got ${rgba.length}`);
-    const recreate = !this.texture || w !== this.w || h !== this.h;
-    if (recreate) {
-      this.dispose();
-      this.data = new Uint8Array(w * h * 4);
-      this.w = w;
-      this.h = h;
-    }
-    const dst = this.data!;
-    if (this.premultiply) {
-      for (let i = 0; i < w * h * 4; i += 4) {
-        const a = rgba[i + 3];
-        const s = a / 255;
-        dst[i] = rgba[i] * s + 0.5;
-        dst[i + 1] = rgba[i + 1] * s + 0.5;
-        dst[i + 2] = rgba[i + 2] * s + 0.5;
-        dst[i + 3] = a;
-      }
-    } else {
-      dst.set(rgba.subarray(0, w * h * 4));
-    }
-    if (recreate) {
-      this.texture = createTexture(
+    const { value: e } = this.sizes.get(w, h, () => {
+      const data = new Uint8Array(w * h * 4);
+      const texture = createTexture(
         {
           format: RGBAFormat, type: UnsignedByteType, colorSpace: this.srgb ? SRGBColorSpace : NoColorSpace,
           internalFormat: null, mipmaps: 'gpu', unpackAlignment: 4,
         },
-        dst, w, h, this.anisotropy,
+        data, w, h, this.anisotropy,
       );
-    } else {
-      this.texture!.needsUpdate = true;
+      return { texture, data, raw: this.premultiply ? new Uint8Array(w * h * 4) : null, pristine: true };
+    });
+    const changed = copyIfChanged(rgba, e.raw ?? e.data, w * h);
+    if (changed || e.pristine) {
+      if (e.raw) premultiply(e.raw, e.data, w * h);
+      e.texture.needsUpdate = true;
+      e.pristine = false;
+      this.uploads++;
     }
-    return recreate;
+    const switched = this.texture !== e.texture;
+    this.texture = e.texture;
+    return switched;
   }
 
   dispose(): void {
-    this.texture?.dispose();
+    this.sizes.clear();
     this.texture = null;
-    this.data = null;
-    this.w = this.h = 0;
   }
 }
 
@@ -130,56 +138,73 @@ export function buildFloatMips(src: Float32Array, w: number, h: number, reuse?: 
   return levels;
 }
 
+interface HeightEntry {
+  texture: DataTexture;
+  level0: Float32Array;
+  /** CPU mip chain (null when the GPU builds the mips). */
+  mips: FloatMip[] | null;
+  pristine: boolean;
+  poleNorth: number;
+  poleSouth: number;
+}
+
 /**
- * Height map as an R16F texture (uploaded from Float32 data; the GPU stores half floats) with a CPU
- * box-filtered mip chain (R16F is not guaranteed renderable, so GPU mip generation is avoided).
+ * Height map as an R16F texture (uploaded from Float32 data; the GPU stores half floats), one texture
+ * per raster size (as RgbaTextureSlot). Mips: generated on the GPU when R16F is color-renderable
+ * (`gpuMips`, i.e. EXT_color_buffer_float: one fast generateMipmap instead of a CPU box-filter chain
+ * and a dozen extra level uploads), otherwise a CPU box-filtered chain. Unchanged data is not
+ * re-uploaded.
  */
 export class HeightTextureSlot {
   texture: DataTexture | null = null;
-  private w = 0;
-  private h = 0;
   /** Mean of the northern/southern-most rows (closes the displaced mesh at the poles). */
   poleNorth = 0;
   poleSouth = 0;
+  /** Number of uploads scheduled so far (diagnostics/tests). */
+  uploads = 0;
+  private readonly sizes = new SizeCache<HeightEntry>(SIZES_PER_SLOT, (e) => e.texture.dispose());
 
-  constructor(private readonly anisotropy: number) {}
+  constructor(private readonly anisotropy: number, private readonly gpuMips = false) {}
 
   set(height: Float32Array, w: number, h: number): void {
     if (!(w > 0 && h > 0) || height.length < w * h) throw new Error(`HeightTextureSlot: expected ${w}x${h} floats, got ${height.length}`);
-    const sameSize = this.texture !== null && w === this.w && h === this.h;
-    const prev = sameSize ? (this.texture!.mipmaps as FloatMip[]) : undefined;
-    const level0 = prev ? prev[0].data : new Float32Array(w * h);
-    level0.set(height.subarray(0, w * h));
-    let sn = 0, ss = 0;
-    for (let c = 0; c < w; c++) {
-      sn += level0[c];
-      ss += level0[(h - 1) * w + c];
-    }
-    this.poleNorth = sn / w;
-    this.poleSouth = ss / w;
-    const mips = buildFloatMips(level0, w, h, prev);
-    if (!sameSize) {
-      this.dispose();
-      this.w = w;
-      this.h = h;
-      this.texture = createTexture(
+    const { value: e } = this.sizes.get(w, h, () => {
+      const level0 = new Float32Array(w * h);
+      const texture = createTexture(
         {
           format: RedFormat, type: FloatType, colorSpace: NoColorSpace,
-          internalFormat: 'R16F', mipmaps: 'cpu', unpackAlignment: 4,
+          internalFormat: 'R16F', mipmaps: this.gpuMips ? 'gpu' : 'cpu', unpackAlignment: 4,
         },
         level0, w, h, this.anisotropy,
       );
+      return { texture, level0, mips: null, pristine: true, poleNorth: 0, poleSouth: 0 };
+    });
+    const changed = copyIfChanged(height, e.level0, w * h);
+    if (changed || e.pristine) {
+      const level0 = e.level0;
+      let sn = 0, ss = 0;
+      for (let c = 0; c < w; c++) {
+        sn += level0[c];
+        ss += level0[(h - 1) * w + c];
+      }
+      e.poleNorth = sn / w;
+      e.poleSouth = ss / w;
+      if (!this.gpuMips) {
+        e.mips = buildFloatMips(level0, w, h, e.mips ?? undefined);
+        e.texture.mipmaps = e.mips;
+      }
+      e.texture.needsUpdate = true;
+      e.pristine = false;
+      this.uploads++;
     }
-    const tex = this.texture!;
-    tex.image = { data: level0, width: w, height: h };
-    tex.mipmaps = mips;
-    tex.needsUpdate = true;
+    this.poleNorth = e.poleNorth;
+    this.poleSouth = e.poleSouth;
+    this.texture = e.texture;
   }
 
   dispose(): void {
-    this.texture?.dispose();
+    this.sizes.clear();
     this.texture = null;
-    this.w = this.h = 0;
   }
 }
 

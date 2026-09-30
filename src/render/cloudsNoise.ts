@@ -39,6 +39,38 @@ function bspline(f: number, w: Float64Array): void {
   w[3] = f3 / 6;
 }
 
+/** Derivatives of the cubic B-spline weights with respect to f. */
+function bsplineDeriv(f: number, w: Float64Array): void {
+  const g = 1 - f;
+  w[0] = -0.5 * g * g;
+  w[1] = 1.5 * f * f - 2 * f;
+  w[2] = -1.5 * f * f + f + 0.5;
+  w[3] = 0.5 * f * f;
+}
+
+interface AxisWeights {
+  idx: Int32Array;
+  wts: Float64Array;
+}
+
+/** Per-voxel lattice indices and (derivative) weights along one axis (same for x, y, z). */
+function axisWeights(size: number, L: number, deriv: boolean): AxisWeights {
+  const idx = new Int32Array(size * 4);
+  const wts = new Float64Array(size * 4);
+  const w = new Float64Array(4);
+  for (let v = 0; v < size; v++) {
+    const t = ((v + 0.5) * L) / size - 0.5;
+    const i = Math.floor(t);
+    if (deriv) bsplineDeriv(t - i, w);
+    else bspline(t - i, w);
+    for (let k = 0; k < 4; k++) {
+      idx[v * 4 + k] = (((i - 1 + k) % L) + L) % L;
+      wts[v * 4 + k] = w[k];
+    }
+  }
+  return { idx, wts };
+}
+
 /**
  * One periodic octave: `period` lattice cells per tile, B-spline smoothed to size³ voxels, added
  * with weight `amp` into `out` (size³ floats). Separable: x, then y, then z.
@@ -47,19 +79,18 @@ function addOctave(out: Float32Array, size: number, period: number, amp: number,
   const L = period;
   const g = new Float32Array(L * L * L);
   for (let i = 0; i < g.length; i++) g[i] = rng.next() * 2 - 1;
-  // Per-voxel lattice indices and weights along one axis (same for x, y, z).
-  const idx = new Int32Array(size * 4);
-  const wts = new Float64Array(size * 4);
-  const w = new Float64Array(4);
-  for (let v = 0; v < size; v++) {
-    const t = ((v + 0.5) * L) / size - 0.5;
-    const i = Math.floor(t);
-    bspline(t - i, w);
-    for (let k = 0; k < 4; k++) {
-      idx[v * 4 + k] = (((i - 1 + k) % L) + L) % L;
-      wts[v * 4 + k] = w[k];
-    }
-  }
+  const b = axisWeights(size, L, false);
+  addSpline(out, g, size, L, amp, b, b, b);
+}
+
+/**
+ * Adds amp · Σ g_ijk Bx(x − i) By(y − j) Bz(z − k) (per-axis weights: value or derivative) over the
+ * periodic L³ lattice g into out (size³). Separable: x, then y, then z.
+ */
+function addSpline(
+  out: Float32Array, g: Float32Array, size: number, L: number, amp: number, wx: AxisWeights, wy: AxisWeights, wz: AxisWeights,
+): void {
+  let { idx, wts } = wx;
   // Pass x: [lz][ly][x]
   const ax = new Float32Array(L * L * size);
   for (let lz = 0; lz < L; lz++) {
@@ -74,6 +105,7 @@ function addOctave(out: Float32Array, size: number, period: number, amp: number,
     }
   }
   // Pass y: [lz][y][x]
+  ({ idx, wts } = wy);
   const ay = new Float32Array(L * size * size);
   for (let lz = 0; lz < L; lz++) {
     for (let y = 0; y < size; y++) {
@@ -86,6 +118,7 @@ function addOctave(out: Float32Array, size: number, period: number, amp: number,
     }
   }
   // Pass z: [z][y][x]
+  ({ idx, wts } = wz);
   const plane = size * size;
   for (let z = 0; z < size; z++) {
     const o = z * 4;
@@ -142,6 +175,162 @@ let shared: CloudNoiseVolume | null = null;
 export function cloudNoiseVolume(): CloudNoiseVolume {
   shared ??= buildCloudNoiseVolume();
   return shared;
+}
+
+/* ------------------------------------------------------------------ */
+/* Detail volume (value + analytic gradient)                           */
+/* ------------------------------------------------------------------ */
+
+/** Voxels per tile edge of the detail volume. */
+export const CLOUD_DETAIL_SIZE = 64;
+/**
+ * Lattice cells per tile of the detail volume: 4 voxels per cell, so one fetch carries crisp
+ * content (one octave) while trilinear reconstruction stays smooth, and a tile spans 16 features
+ * (the finest fetches repeat far less visibly than the 8-cell shape tile).
+ */
+export const CLOUD_DETAIL_PERIOD = 16;
+/**
+ * Gradient encoding: byte = 127.5 + 255·CLOUD_DETAIL_GRAD_K·g, with g = ∂n/∂(lattice cell) of the
+ * normalized value n (σ units); ±5 σ per cell fills the byte range (the gradient's std is ≈ 1.2).
+ */
+export const CLOUD_DETAIL_GRAD_K = 0.1;
+
+/**
+ * Tileable detail noise (deterministic for a seed; ~60–120 ms for 64³, build it off the main thread):
+ * one octave of periodic B-spline noise (CLOUD_DETAIL_PERIOD cells per tile) with its analytic
+ * gradient. R: value (mean 0.5, std CLOUD_NOISE_STD); G, B, A: ∂/∂x, ∂/∂y, ∂/∂z per lattice cell in
+ * σ units (see CLOUD_DETAIL_GRAD_K). The globe uses the gradient for cloud-top lighting (no
+ * screen-space derivatives: they shade pixel-scale detail in 2×2 blocks) and to warp finer fetches.
+ */
+export function buildCloudDetailVolume(size = CLOUD_DETAIL_SIZE, period = CLOUD_DETAIL_PERIOD, seed = 0xde7a11): CloudNoiseVolume {
+  const rng = new Rng(seed);
+  const L = period;
+  const g = new Float32Array(L * L * L);
+  for (let i = 0; i < g.length; i++) g[i] = rng.next() * 2 - 1;
+  const b = axisWeights(size, L, false), d = axisWeights(size, L, true);
+  const n = size * size * size;
+  const v = new Float32Array(n), gx = new Float32Array(n), gy = new Float32Array(n), gz = new Float32Array(n);
+  addSpline(v, g, size, L, 1, b, b, b);
+  addSpline(gx, g, size, L, 1, d, b, b);
+  addSpline(gy, g, size, L, 1, b, d, b);
+  addSpline(gz, g, size, L, 1, b, b, d);
+  let s = 0, s2 = 0;
+  for (let i = 0; i < n; i++) {
+    s += v[i];
+    s2 += v[i] * v[i];
+  }
+  const mean = s / n;
+  const sd = Math.sqrt(Math.max(1e-12, s2 / n - mean * mean));
+  const data = new Uint8Array(n * 4);
+  const kv = (CLOUD_NOISE_STD * 255) / sd, kg = (CLOUD_DETAIL_GRAD_K * 255) / sd;
+  const q = (x: number): number => (x < 0 ? 0 : x > 255 ? 255 : Math.round(x));
+  for (let i = 0; i < n; i++) {
+    const o = 4 * i;
+    data[o] = q(127.5 + (v[i] - mean) * kv);
+    data[o + 1] = q(127.5 + gx[i] * kg);
+    data[o + 2] = q(127.5 + gy[i] * kg);
+    data[o + 3] = q(127.5 + gz[i] * kg);
+  }
+  return { size, data };
+}
+
+/* ------------------------------------------------------------------ */
+/* Cell volume (Worley)                                                */
+/* ------------------------------------------------------------------ */
+
+/** Voxels per tile edge of the cell volume. */
+export const CLOUD_CELL_SIZE = 64;
+/** Jittered feature points per tile edge (8 voxels per cell). */
+export const CLOUD_CELL_PERIOD = 8;
+/** F2 − F1 (in cell units) that maps to byte 255 in the R channel. */
+export const CLOUD_CELL_EDGE_RANGE = 0.6;
+
+/**
+ * Tileable cellular (Worley) noise for mesoscale cellular convection (deterministic; ~40–80 ms for
+ * 64³, build it off the main thread). One jittered feature point per lattice cell, periodic.
+ * R: F2 − F1 (distance to the cell border, 0 on it; cell units / CLOUD_CELL_EDGE_RANGE, clamped),
+ * G: F1 (distance to the cell's centre, cell units / 1.2), B: a random value per cell (brightness
+ * variation between cells), A: unused (0). Slices of 3D Voronoi cells are convex polygons: the
+ * honeycomb of closed stratocumulus cells and the rings of open cells.
+ */
+export function buildCloudCellVolume(size = CLOUD_CELL_SIZE, period = CLOUD_CELL_PERIOD, seed = 0xce11): CloudNoiseVolume {
+  const rng = new Rng(seed);
+  const P = period;
+  const pts = new Float32Array(P * P * P * 3);
+  const ids = new Float32Array(P * P * P);
+  for (let i = 0; i < P * P * P; i++) {
+    pts[3 * i] = 0.1 + 0.8 * rng.next();
+    pts[3 * i + 1] = 0.1 + 0.8 * rng.next();
+    pts[3 * i + 2] = 0.1 + 0.8 * rng.next();
+    ids[i] = rng.next();
+  }
+  const data = new Uint8Array(size * size * size * 4);
+  const scale = P / size;
+  for (let z = 0; z < size; z++) {
+    const pz = (z + 0.5) * scale, cz = Math.floor(pz);
+    for (let y = 0; y < size; y++) {
+      const py = (y + 0.5) * scale, cy = Math.floor(py);
+      for (let x = 0; x < size; x++) {
+        const px = (x + 0.5) * scale, cx = Math.floor(px);
+        let f1 = 1e9, f2 = 1e9, id1 = 0;
+        for (let dz = -1; dz <= 1; dz++) {
+          const kz = cz + dz, wz = ((kz % P) + P) % P;
+          for (let dy = -1; dy <= 1; dy++) {
+            const ky = cy + dy, wy = ((ky % P) + P) % P;
+            for (let dx = -1; dx <= 1; dx++) {
+              const kx = cx + dx, wx = ((kx % P) + P) % P;
+              const c = (wz * P + wy) * P + wx;
+              const ex = kx + pts[3 * c] - px, ey = ky + pts[3 * c + 1] - py, ez = kz + pts[3 * c + 2] - pz;
+              const d = Math.sqrt(ex * ex + ey * ey + ez * ez);
+              if (d < f1) {
+                f2 = f1;
+                f1 = d;
+                id1 = ids[c];
+              } else if (d < f2) {
+                f2 = d;
+              }
+            }
+          }
+        }
+        const o = 4 * ((z * size + y) * size + x);
+        data[o] = Math.min(255, Math.round((255 * (f2 - f1)) / CLOUD_CELL_EDGE_RANGE));
+        data[o + 1] = Math.min(255, Math.round((255 * f1) / 1.2));
+        data[o + 2] = Math.round(255 * id1);
+      }
+    }
+  }
+  return { size, data };
+}
+
+let sharedCells: CloudNoiseVolume | null = null;
+
+/** Lazily built shared cell volume (prefer receiving it from the cloud worker in the browser). */
+export function cloudCellVolume(): CloudNoiseVolume {
+  sharedCells ??= buildCloudCellVolume();
+  return sharedCells;
+}
+
+let sharedDetail: CloudNoiseVolume | null = null;
+
+/** Lazily built shared detail volume (prefer receiving it from the cloud worker in the browser). */
+export function cloudDetailVolume(): CloudNoiseVolume {
+  sharedDetail ??= buildCloudDetailVolume();
+  return sharedDetail;
+}
+
+/** Installs a detail volume built elsewhere (e.g. by the cloud worker) as the shared one. */
+export function setCloudDetailVolume(vol: CloudNoiseVolume): void {
+  sharedDetail = vol;
+}
+
+/** Installs a shape/warp volume built elsewhere (e.g. by the cloud worker) as the shared one. */
+export function setCloudNoiseVolume(vol: CloudNoiseVolume): void {
+  shared = vol;
+}
+
+/** The shared volumes if already built (no work). */
+export function peekCloudVolumes(): { noise: CloudNoiseVolume | null; detail: CloudNoiseVolume | null } {
+  return { noise: shared, detail: sharedDetail };
 }
 
 /** Trilinear sample of channel R only (see sampleCloudNoise). */

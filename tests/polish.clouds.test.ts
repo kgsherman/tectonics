@@ -2,17 +2,17 @@ import { describe, expect, it } from 'vitest';
 import type { CloudSpec } from '../src/core/types';
 import {
   ALPHA_MAX, ANISO, cloudNoise, combineNoise, coverageThreshold, cycloneEffect, cycloneTemplate, DETAIL_CORR_LENGTH, detailStage,
-  noiseDrift, opticalDepth, SHAPE_CORR_LENGTH, shapeStage, swirlProfile,
+  noiseDrift, opticalDepth, SHAPE_CORR_LENGTH, SHAPE_STAGE_SIZE, shapeStage, swirlProfile,
 } from '../src/render/cloudsField';
 import {
   analyzeCloudClimate, buildCloudRegimeGrid, COVER_REFERENCE_DENSITY, coverageFraction, createCycloneMemo, CYCLONE_COUNT,
   CYCLONE_STRIDE, cycloneStates, windDivergence,
 } from '../src/render/cloudsModel';
 import {
-  buildCloudNoiseVolume, CLOUD_NOISE_STD, cloudNoiseVolume, sampleCloudNoise, sampleCloudNoiseR,
+  buildCloudNoiseVolume, CLOUD_NOISE_STD, cloudDetailVolume, cloudNoiseVolume, sampleCloudNoise, sampleCloudNoiseR,
 } from '../src/render/cloudsNoise';
 import { buildCloudNoiseRaster, rasterizeClouds } from '../src/render/cloudsRaster';
-import { CLOUDS_FRAGMENT } from '../src/render/shadersClouds';
+import { CLOUDS_FRAGMENT, CLOUDS_VERTEX } from '../src/render/shadersClouds';
 
 const DEG = Math.PI / 180;
 
@@ -114,8 +114,8 @@ describe('flow-map crossfade', () => {
   it('uses correlation lengths that match the noise autocorrelation (no contrast pulsing)', () => {
     // The globe blends two phases of the same noise a small offset d apart and renormalizes with
     // ρ(d): shape ≈ exp(−d²/L²), detail ≈ exp(−d/λ). A wrong ρ makes contrast and coverage pulse.
-    const vol = cloudNoiseVolume();
-    const tmp = new Float32Array(4), s1 = new Float64Array(7), s2 = new Float64Array(7);
+    const vol = cloudNoiseVolume(), dvol = cloudDetailVolume();
+    const tmp = new Float32Array(4), s1 = new Float64Array(SHAPE_STAGE_SIZE), s2 = new Float64Array(SHAPE_STAGE_SIZE);
     let seed = 7;
     const rnd = (): number => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
     const N = 3000;
@@ -126,9 +126,9 @@ describe('flow-map crossfade', () => {
         const uz = 2 * rnd() - 1, ut = 2 * Math.PI * rnd(), ur = Math.sqrt(1 - uz * uz);
         // Separation in the anisotropic noise domain (shapeStage scales z by ANISO itself).
         shapeStage(vol, r * Math.cos(t), r * Math.sin(t), z, tmp, s1);
-        const x1 = s1[3], n1 = detailStage(vol, s1, tmp);
+        const x1 = s1[3], n1 = detailStage(dvol, s1, tmp);
         shapeStage(vol, r * Math.cos(t) + d * ur * Math.cos(ut), r * Math.sin(t) + d * ur * Math.sin(ut), z + (d * uz) / ANISO, tmp, s2);
-        const x2 = s2[3], n2 = detailStage(vol, s2, tmp);
+        const x2 = s2[3], n2 = detailStage(dvol, s2, tmp);
         bb += x1 * x2; b1 += x1 * x1; b2 += x2 * x2; dd += n1 * n2; d1 += n1 * n1; d2 += n2 * n2;
       }
       expect(Math.abs(bb / Math.sqrt(b1 * b2) - Math.exp(-((d / SHAPE_CORR_LENGTH) ** 2)))).toBeLessThan(0.06);
@@ -327,7 +327,9 @@ describe('shader source', () => {
   it('interpolates every shared constant', () => {
     expect(CLOUDS_FRAGMENT).not.toMatch(/undefined|NaN|\$\{/);
     expect(CLOUDS_FRAGMENT).toContain('uniform sampler3D uNoise');
-    expect(CLOUDS_FRAGMENT).toContain(`uniform vec4 uCyc[${2 * CYCLONE_COUNT}]`);
+    // Cyclones are evaluated per vertex (smooth fields; see CLOUDS_VERTEX).
+    expect(CLOUDS_VERTEX).toContain(`uniform vec4 uCyc[${2 * CYCLONE_COUNT}]`);
+    expect(CLOUDS_VERTEX).not.toMatch(/undefined|NaN|\$\{/);
     // The drift path mirrors noiseDrift().
     expect(noiseDrift(0)[0]).toBeCloseTo(0.2 * Math.sin(1.3), 6);
   });

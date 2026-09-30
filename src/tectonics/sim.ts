@@ -29,6 +29,9 @@ export const DEFAULT_TECTONIC_PARAMS: TectonicParams = {
   seed: 1,
 };
 
+/** First-substep single-candidate path: cells with interior mask value ≥ this (2+ rings from any seed). */
+const FAST_MIN_NEAR = 3;
+
 /** Module counter: every sim instance (and every out-of-band state edit) gets a fresh id. */
 let instanceCounter = 0;
 function nextInstanceId(): number {
@@ -156,7 +159,12 @@ export class TectonicSim {
     let t = profStart();
     const deep = markDeepInterior(state, dt, count);
     t = profLap('A0.interior', t);
-    for (let s = 0; s < count; s++) runSubstep(state, dt / count, s < count - 1 ? deep : null);
+    for (let s = 0; s < count; s++) {
+      // Intermediate substeps skip the deep interior; the first takes the single-candidate path 2+
+      // rings from any seed, the last for the deep interior (see runSubstep).
+      const last = s === count - 1;
+      runSubstep(state, dt / count, last ? null : deep, s === 0 || last ? deep : null, last ? 256 : FAST_MIN_NEAR);
+    }
 
     // E–J once per step.
     t = profStart();

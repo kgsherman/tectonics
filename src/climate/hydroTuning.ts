@@ -228,6 +228,8 @@ export interface HydroTuning {
   cloudPolarWeight: number;
   /** Shallow-cumulus base cover over open water. */
   cloudMarineBase: number;
+  /** Exponent e of the layer-cloud RH normalization rh·(gateThreshold / r0_cloud)^e (0 = raw column RH). */
+  cloudThresholdExponent: number;
 }
 
 export const HYDRO_TUNING: HydroTuning = {
@@ -317,15 +319,16 @@ export const HYDRO_TUNING: HydroTuning = {
   cloudRhLow: 0.25,
   cloudRhHigh: 0.75,
   cloudRhWeight: 0.6,
-  cloudPrecipWeight: 0.6,
+  cloudPrecipWeight: 0.8,
   cloudPrecipRefMmDay: 4,
-  cloudStratusWeight: 0.45,
+  cloudStratusWeight: 0.55,
   cloudStratusRefK: 3,
   cloudStratusSubsidence: 0.5,
   cloudSubsidenceThinning: 0.9,
-  cloudStormWeight: 0.5,
-  cloudPolarWeight: 0.6,
+  cloudStormWeight: 0.3,
+  cloudPolarWeight: 0.45,
   cloudMarineBase: 0.15,
+  cloudThresholdExponent: 0.6,
 };
 
 /** Defaults merged with an optional partial override. */

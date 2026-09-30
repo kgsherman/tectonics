@@ -18,13 +18,15 @@ import { wireStoreEffects } from './effects';
 import { layerUsesClimate } from '../worker/layerInfo';
 import { downloadBlob, downloadUrl, exportName, rgbaToPngBlob } from './exportImage';
 import { fmtNum } from './format';
+import { FrameTask } from './frameTask';
 import { HoverController } from './hoverController';
+import { PlaybackPresenter } from './playbackPresenter';
 import { installShortcuts, type Command } from './keyboard';
 import { RateMeter } from './rateMeter';
 import { PAINT_FULL } from './schema';
 import { browserStorage, loadSettings } from './settings';
 import { SimClient, type WorkerLike } from './simClient';
-import { initialState, reduce, worldParamsKey, type Action, type AppState, type ViewKind } from './state';
+import { displayedTime, initialState, reduce, worldParamsKey, type Action, type AppState, type ViewKind } from './state';
 import { createStore, shallowEqual, type Store } from './store';
 import { createFirstRunHint } from './ui/firstRunHint';
 import { buildLayout } from './ui/layout';
@@ -36,8 +38,15 @@ import { ViewSync } from './viewSync';
 
 export interface AppWorkers {
   sim: () => WorkerLike;
-  paint: () => WorkerLike;
+  /** Paint worker for painter slot `slot` (0 = primary, ≥ 1 = playback helper). */
+  paint: (slot?: number) => WorkerLike;
   climate: () => WorkerLike;
+  /**
+   * Extra paint workers for playback frames only (created with `paint`): painting is the slower
+   * pipeline stage at 100k cells, so a helper roughly doubles the playback frame rate on machines
+   * with spare cores. Default 0.
+   */
+  paintHelpers?: number;
 }
 
 export class App implements Commands {
@@ -67,20 +76,30 @@ export class App implements Commands {
   private awaitingStill = false;
   private generating = false;
   private scrubTarget: number | null | undefined = undefined;
-  private scrubRaf = 0;
+  private readonly scrubTask = new FrameTask(() => this.sendScrub());
   /** Playback frames shown per second, and the paint worker's last paint time. */
   private readonly frameRate = new RateMeter();
   private lastPaintMs = 0;
+  /** Playback frames from several painters: in order, one per display frame (PlaybackPresenter). */
+  private readonly displayFrame = new FrameTask(() => this.playback.onDisplayFrame());
+  private readonly playback = new PlaybackPresenter<FrameMessage>({
+    present: (f) => this.present(f),
+    isStale: (f) => isStaleEpoch(f.epoch, this.epoch),
+    now: () => performance.now(),
+    scheduleDisplayFrame: () => this.displayFrame.schedule(),
+    setTimer: (fn, ms) => void globalThis.setTimeout(fn, ms),
+  });
 
   constructor(root: HTMLElement, workers: AppWorkers) {
     const storage = browserStorage();
     this.store = createStore(initialState(loadSettings(storage)), reduce);
     const ctx: UiContext = { store: this.store, commands: this };
 
-    this.sim = new SimClient(workers.sim(), workers.paint());
-    this.climateClient = new ClimateClient(workers.climate, (port) => {
-      this.sim.send({ type: 'connectClimate', epoch: this.epoch, port }, [port]);
-    });
+    const helpers = Array.from({ length: Math.max(0, Math.min(3, Math.floor(workers.paintHelpers ?? 0))) }, (_, i) => workers.paint(i + 1));
+    this.sim = new SimClient(workers.sim(), workers.paint(), undefined, helpers);
+    this.climateClient = new ClimateClient(workers.climate, (port, painter) => {
+      this.sim.send({ type: 'connectClimate', epoch: this.epoch, port, painter }, [port]);
+    }, undefined, Math.max(1, this.sim.painterCount));
     this.climate = new ClimateCoordinator({
       store: this.store, sim: this.sim, climate: this.climateClient, epoch: () => this.epoch,
       onResult: (c, ms) => this.applyClimate(c, ms),
@@ -117,7 +136,7 @@ export class App implements Commands {
       },
     });
     this.viewport.showCover({ kind: 'loading', title: 'Starting…', detail: 'Loading the simulation workers.' });
-    this.viewport.el.appendChild(createFirstRunHint(ctx, storage, this.viewport.host));
+    this.viewport.el.appendChild(createFirstRunHint(ctx, storage, this.viewport.host, () => this.viewport.view?.getView?.().center ?? null));
     root.append(layout.root, this.toasts.el);
 
     this.wireWorker();
@@ -201,21 +220,21 @@ export class App implements Commands {
 
   showKeyframe(index: number | null): void {
     if (!this.store.getState().runtime.worldLoaded) return;
-    // Coalesce scrubber drags to one request per animation frame.
+    // Coalesce scrubber drags to one request per frame (FrameTask: also runs in hidden tabs).
     this.scrubTarget = index;
-    if (this.scrubRaf) return;
-    this.scrubRaf = requestAnimationFrame(() => {
-      this.scrubRaf = 0;
-      const target = this.scrubTarget;
-      this.scrubTarget = undefined;
-      if (target === undefined) return;
-      this.epoch++;
-      this.setPlaying(false);
-      this.expectStill();
-      this.sim.request({ type: 'showKeyframe', epoch: this.epoch, index: target, display: displaySettings(this.store.getState()) })
-        .then(() => this.climateAfterChange(target === null ? 'full' : 'scrub'))
-        .catch((e) => this.toasts.error('Could not show that point in history', errorMessage(e)));
-    });
+    this.scrubTask.schedule();
+  }
+
+  private sendScrub(): void {
+    const target = this.scrubTarget;
+    this.scrubTarget = undefined;
+    if (target === undefined || !this.store.getState().runtime.worldLoaded) return;
+    this.epoch++;
+    this.setPlaying(false);
+    this.expectStill();
+    this.sim.request({ type: 'showKeyframe', epoch: this.epoch, index: target, display: displaySettings(this.store.getState()) })
+      .then(() => this.climateAfterChange(target === null ? 'full' : 'scrub'))
+      .catch((e) => this.toasts.error('Could not show that point in history', errorMessage(e)));
   }
 
   playFromKeyframe(): void {
@@ -261,15 +280,20 @@ export class App implements Commands {
   exportScreenshot(): void {
     try {
       const s = this.store.getState();
-      downloadUrl(this.viewport.screenshot(), exportName(`${s.settings.view.view}-${s.settings.view.layer}`, s.runtime.time));
+      downloadUrl(this.viewport.screenshot(), exportName(`${s.settings.view.view}-${s.settings.view.layer}`, displayedTime(s.runtime)));
     } catch (e) {
       this.toasts.error('Screenshot failed', errorMessage(e));
     }
   }
 
   /** For debugging from the console (window.__worldgen). */
-  debugState(): { epoch: number; mesh: number; snapshot: number; climate: number } {
-    return { epoch: this.epoch, mesh: this.mesh?.n ?? 0, snapshot: this.snapshot?.id ?? 0, climate: this.climateResult?.id ?? 0 };
+  debugState(): {
+    epoch: number; mesh: number; snapshot: number; climate: number; painters: number; framesDropped: number; framesWithGap: number;
+  } {
+    return {
+      epoch: this.epoch, mesh: this.mesh?.n ?? 0, snapshot: this.snapshot?.id ?? 0, climate: this.climateResult?.id ?? 0,
+      painters: this.sim.painterCount, framesDropped: this.playback.sequencer.dropped, framesWithGap: this.playback.sequencer.gaps,
+    };
   }
 
   /* ------------------------------------------------------------------ */
@@ -434,10 +458,14 @@ export class App implements Commands {
         this.climate.playbackTick(e.time);
         // Sim and paint workers run side by side: the frame rate follows the slower stage.
         const simMs = perf.lastStepMs * this.store.getState().settings.speed + (perf.lastSnapshotMs ?? 0);
+        // Several painters work side by side: each paints every n-th frame.
+        const n = Math.max(1, this.sim.painterCount);
+        const painters = n > 1 ? ` ×${n}` : '';
         this.viewport.setPerf(
-          `${fmtNum(perf.framesPerSec, 0)} fps · sim ${fmtNum(simMs, 0)} ms ∥ paint ${fmtNum(perf.lastPaintMs, 0)} ms`,
+          `${fmtNum(perf.framesPerSec, 0)} fps · sim ${fmtNum(simMs, 0)} ms ∥ paint ${fmtNum(perf.lastPaintMs, 0)} ms${painters}`,
           `${fmtNum(perf.stepsPerSec, 1)} steps/s · per frame: ${this.store.getState().settings.speed} step(s) at ${fmtNum(perf.lastStepMs, 0)} ms` +
-            ` + snapshot ${fmtNum(perf.lastSnapshotMs ?? 0, 0)} ms (sim worker), paint ${fmtNum(perf.lastPaintMs, 0)} ms (paint worker)`,
+            ` + snapshot ${fmtNum(perf.lastSnapshotMs ?? 0, 0)} ms (sim worker), paint ${fmtNum(perf.lastPaintMs, 0)} ms` +
+            (n > 1 ? ` per frame on each of ${n} paint workers` : ' (paint worker)'),
         );
       } else {
         this.viewport.setPerf(null);
@@ -450,7 +478,9 @@ export class App implements Commands {
     sim.on('error', (e) => {
       if (e.reqId) this.paints.complete(e.reqId);
       this.toasts.error('Simulation worker', e.message);
-      if (/playback stopped/.test(e.message)) this.setPlaying(false);
+      // The sim stopped on its own: settle like a pause (new epoch, full still of the live state —
+      // a helper may have shown a newer state than the primary painter holds).
+      if (/playback stopped/.test(e.message) && this.store.getState().runtime.playing) this.pause(false);
       // The paint worker cannot stop the sim: a failing playback paint pauses it the normal way.
       if (/^paint failed/.test(e.message) && this.store.getState().runtime.playing) this.pause(false);
       if (/^paint failed/.test(e.message)) {
@@ -471,12 +501,22 @@ export class App implements Commands {
   }
 
   private onFrame(f: FrameMessage): void {
-    if (f.kind === 'play') this.sim.send({ type: 'frameAck', epoch: this.epoch, frameId: f.frameId });
+    // Acknowledge on receipt (to the painter that sent it) so painting never waits on the display.
+    if (f.kind === 'play') this.sim.send({ type: 'frameAck', epoch: this.epoch, frameId: f.frameId, painter: f.painter });
     if (f.reqId) this.paints.complete(f.reqId);
     if (isStaleEpoch(f.epoch, this.epoch)) return;
-    if (f.kind === 'play') this.frameRate.tick(performance.now());
+    this.playback.receive(f);
+  }
+
+  private present(f: FrameMessage): void {
+    if (f.kind === 'play') {
+      const now = performance.now();
+      this.frameRate.tick(now);
+      this.playback.setFrameRate(this.frameRate.rate(now));
+    }
     if (f.rgba) this.lastPaintMs = f.paintMs;
     this.viewport.applyFrame(f);
+    if (f.keyframe === null) this.store.dispatch({ type: 'frameShown', time: f.time });
     this.viewport.showCover(null);
     if (f.kind === 'still' && f.quality === 'full') this.awaitingStill = false;
     this.updateRendering();
@@ -520,7 +560,7 @@ export class App implements Commands {
     const painting = idle && (this.awaitingStill || this.paints.busy);
     const c = rt.climate;
     const climate = idle && c.phase === 'computing' && c.purpose !== 'live' && layerUsesClimate(s.settings.view.layer);
-    this.viewport.setRendering(painting || climate, painting ? 'Rendering…' : `Computing climate… ${Math.round(c.progress * 100)}%`);
+    this.viewport.setRendering(painting || climate, painting ? 'Rendering…' : 'Computing climate…', painting ? '' : `${Math.round(c.progress * 100)}%`);
   }
 
   private runShortcut(c: Command): void {

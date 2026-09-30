@@ -14,8 +14,22 @@ import { PaintCache } from './paintCache';
 import { checkSize } from './paintGeometry';
 import { normalizeMonth, paintSatellite } from './satellite';
 import { getHeightField } from './terrain';
+import { releaseTerrainScratch } from './terrainBase';
+import { releaseSampleScratch } from './layersSample';
+import { releaseCategoryScratch } from './layersCategory';
+import { releaseGlyphScratch } from './layersGlyphs';
 
 export { PaintCache } from './paintCache';
+
+/**
+ * Frees the painter's module-level scratch pools (per-pixel work buffers kept between paint calls to
+ * avoid per-frame allocation); the next paint reallocates what it needs. Returns the bytes released.
+ * Call only between paint calls (the paint worker does it after ~15 s idle). PaintCache contents are
+ * not touched.
+ */
+export function releasePaintScratch(): number {
+  return releaseTerrainScratch() + releaseSampleScratch() + releaseCategoryScratch() + releaseGlyphScratch();
+}
 
 function checkOptions(opts: PaintOptions): void {
   checkSize(opts.width, opts.height);

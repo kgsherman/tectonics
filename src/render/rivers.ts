@@ -13,6 +13,7 @@ import * as _layersCommon from './layersCommon';
 import type { PaintCache } from './paintCache';
 import * as _riversRoute from './riversRoute';
 import type { Drainage } from './riversRoute';
+import * as _terrain from './terrain';
 import type { HeightField } from './terrain';
 
 // Imported values are copied into module constants: some module runners (vitest / vite-node SSR)
@@ -22,11 +23,16 @@ const { resampleGrid } = _grid;
 const { SRGB_TO_LINEAR, encodeSrgb } = _colormaps;
 const { gridLookup, sampleField } = _layersCommon;
 const { routeDrainage } = _riversRoute;
+const { HF_NOISE_SCALE } = _terrain;
 
 /** Per-pixel surface state from the satellite pass (0..255): snow cover and desert weight. */
 export interface SurfaceState {
   snow: Uint8Array;
   desert: Uint8Array;
+  /** Optional: forest cover (winter: frozen rivers show as white corridors through dark taiga). */
+  trees?: Uint8Array;
+  /** Optional: glacier / ice-sheet cover (no lakes or rivers drawn on the ice). */
+  ice?: Uint8Array;
 }
 
 export interface RiverNetwork {
@@ -276,6 +282,59 @@ export function getRiverNetwork(heightKey: string, hf: HeightField, climate: Cli
   });
 }
 
+/** Upstream area (routing cells, log scale) where valley lines start / reach full strength. */
+const LINE_A0 = 6;
+const LINE_A1 = 60;
+
+/**
+ * Output-resolution valley-line field (0..255) from the drainage network: 0 on interfluves, rising
+ * along every channel whose upstream area exceeds LINE_A0 routing cells (full at LINE_A1) — the
+ * dendritic valley network of the actual height field, bilinearly upsampled (≈ 2–4 px wide lines).
+ * Cached with the network.
+ */
+export function drainageLines(heightKey: string, hf: HeightField, climate: ClimateResult | null, opts: PaintOptions, cache: PaintCache): Uint8Array {
+  const net = getRiverNetwork(heightKey, hf, climate, opts, cache);
+  return cache.getOrBuild(`drainlines|${heightKey}|${climate ? climate.id : 'none'}|${opts.seaLevel}`, () => buildLines(net, hf.w, hf.h));
+}
+
+function buildLines(net: RiverNetwork, w: number, h: number): Uint8Array {
+  const d = net.drainage, f = net.f;
+  const dw = d.w, dh = d.h;
+  const cellV = new Float32Array(dw * dh);
+  const l0 = Math.log(LINE_A0), inv = 1 / (Math.log(LINE_A1) - l0);
+  for (let i = 0; i < cellV.length; i++) {
+    if (d.ocean[i]) continue;
+    const a = d.area[i];
+    if (!(a > LINE_A0)) continue;
+    let t = (Math.log(a) - l0) * inv;
+    t = t > 1 ? 1 : t;
+    cellV[i] = t * t * (3 - 2 * t);
+  }
+  const out = new Uint8Array(w * h);
+  const cx0 = new Int32Array(w), cx1 = new Int32Array(w), cxt = new Float32Array(w);
+  for (let x = 0; x < w; x++) {
+    const u = (x + 0.5) / f - 0.5;
+    const u0 = Math.floor(u);
+    cx0[x] = ((u0 % dw) + dw) % dw;
+    cx1[x] = (cx0[x] + 1) % dw;
+    cxt[x] = u - u0;
+  }
+  for (let y = 0; y < h; y++) {
+    let v = (y + 0.5) / f - 0.5;
+    if (v < 0) v = 0;
+    else if (v > dh - 1) v = dh - 1;
+    const r0 = Math.min(dh - 1, Math.floor(v)), r1 = Math.min(dh - 1, r0 + 1), tv = v - r0;
+    const o0 = r0 * dw, o1 = r1 * dw;
+    for (let x = 0; x < w; x++) {
+      const a = cx0[x], b = cx1[x], tu = cxt[x];
+      const top = cellV[o0 + a] + (cellV[o0 + b] - cellV[o0 + a]) * tu;
+      const bot = cellV[o1 + a] + (cellV[o1 + b] - cellV[o1 + a]) * tu;
+      out[y * w + x] = ((top + (bot - top) * tv) * 255 + 0.5) | 0;
+    }
+  }
+  return out;
+}
+
 // Water colours (linear light).
 const RIVER = [SRGB_TO_LINEAR[34], SRGB_TO_LINEAR[58], SRGB_TO_LINEAR[78]];
 const LAKE = [SRGB_TO_LINEAR[22], SRGB_TO_LINEAR[52], SRGB_TO_LINEAR[74]];
@@ -284,6 +343,8 @@ const SALT = [SRGB_TO_LINEAR[222], SRGB_TO_LINEAR[216], SRGB_TO_LINEAR[200]];
 /** Shallow saline lakes of closed basins: greener, more turbid than open lakes. */
 const LAKE_SALINE = [SRGB_TO_LINEAR[40], SRGB_TO_LINEAR[92], SRGB_TO_LINEAR[96]];
 const RIPARIAN = [SRGB_TO_LINEAR[62], SRGB_TO_LINEAR[88], SRGB_TO_LINEAR[44]];
+/** Snow on a frozen river and its treeless floodplain. */
+const FROZEN_RIVER = [SRGB_TO_LINEAR[226], SRGB_TO_LINEAR[232], SRGB_TO_LINEAR[240]];
 
 function blendPixel(rgba: Uint8ClampedArray, p: number, c: number[], a: number): void {
   if (a <= 0) return;
@@ -317,6 +378,7 @@ function drawLakes(rgba: Uint8ClampedArray, hf: HeightField, net: RiverNetwork, 
       const p = y * w + x;
       const H = height[p];
       if (H <= sea) continue; // lakes are inland water on land pixels only
+      if (surf.ice && surf.ice[p] > 128) continue; // subglacial: under the ice
       if (H < lake.level) {
         const frozen = surf.snow[p] / 255;
         const c = frozen > 0.5 ? LAKE_ICE : lake.endorheic ? LAKE_SALINE : LAKE;
@@ -324,7 +386,7 @@ function drawLakes(rgba: Uint8ClampedArray, hf: HeightField, net: RiverNetwork, 
       } else if (H < lake.saltLevel) {
         // Playa: salt crust brightest at the lowest ground, fading and mottled toward the rim.
         const depth = (lake.saltLevel - H) / Math.max(1, lake.saltLevel - lake.floor);
-        const a = (0.35 + 0.5 * (depth > 1 ? 1 : depth)) * (0.8 + 0.25 * patch[p]);
+        const a = (0.35 + 0.5 * (depth > 1 ? 1 : depth)) * (0.8 + 0.25 * patch[p] * HF_NOISE_SCALE);
         blendPixel(rgba, p, SALT, a > 0.9 ? 0.9 : a);
       }
     }
@@ -370,12 +432,20 @@ function drawRivers(rgba: Uint8ClampedArray, hf: HeightField, net: RiverNetwork,
   }
   for (const p of touched) {
     if (height[p] <= sea) continue;
+    if (surf.ice && surf.ice[p] > 128) continue;
     const snow = surf.snow[p] / 255;
     // Riparian vegetation strips stand out in drylands (Nile-like oases).
     const arid = surf.desert[p] / 255;
     blendPixel(rgba, p, RIPARIAN, 0.5 * halo[p] * arid * (1 - snow));
-    // Frozen, snow-covered rivers vanish under the snow.
-    blendPixel(rgba, p, RIVER, 0.65 * cov[p] * (1 - smooth(0.3, 0.8, snow)));
+    // Frozen, snow-covered rivers vanish under the snow on open ground, but through a winter
+    // forest the treeless floodplain and the frozen channel show as a white corridor.
+    const sc = smooth(0.3, 0.8, snow);
+    blendPixel(rgba, p, RIVER, 0.65 * cov[p] * (1 - sc));
+    if (surf.trees && sc > 0) {
+      let corr = cov[p] + 0.45 * halo[p];
+      corr = corr > 1 ? 1 : corr;
+      blendPixel(rgba, p, FROZEN_RIVER, 0.85 * corr * sc * (surf.trees[p] / 255));
+    }
   }
 }
 

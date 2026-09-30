@@ -149,11 +149,20 @@ function overridingPlateFields(state: SimState, sc: StepScratch, dt: number): vo
 function smoothUplift(state: SimState, sc: StepScratch): void {
   const { top } = state;
   const { adjOffset, adj } = state.sm;
-  const { uplift, tmpA, dijkstra: dj } = sc;
+  const { uplift, tmpA, tmpB, dijkstra: dj } = sc;
   const { reached } = dj;
   const count = dj.reachedCount;
   if (count === 0) return;
   const passes = Math.max(1, Math.round(((2 * UPLIFT_SMOOTH_KM) / state.sm.spacingKm) ** 2));
+  // Same-plate neighbour counts (tops do not change while smoothing).
+  const sameOf = tmpB;
+  for (let r = 0; r < count; r++) {
+    const c = reached[r];
+    const t = top[c];
+    let same = 0;
+    for (let q = adjOffset[c], e = adjOffset[c + 1]; q < e; q++) if (top[adj[q]] === t) same++;
+    sameOf[c] = same;
+  }
   for (let pass = 0; pass < passes; pass++) {
     for (let r = 0; r < count; r++) tmpA[reached[r]] = 0;
     for (let r = 0; r < count; r++) {
@@ -161,8 +170,7 @@ function smoothUplift(state: SimState, sc: StepScratch): void {
       const u = uplift[c];
       if (!(u > 0)) continue;
       const t = top[c];
-      let same = 0;
-      for (let q = adjOffset[c], e = adjOffset[c + 1]; q < e; q++) if (top[adj[q]] === t) same++;
+      const same = sameOf[c];
       if (same === 0) {
         tmpA[c] += u;
         continue;

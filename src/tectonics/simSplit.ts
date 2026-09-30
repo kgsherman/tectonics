@@ -2,7 +2,7 @@ import type { PlateSpec, Quat, Vec3 } from '../core/types';
 import { plateColor, plateName } from './draft';
 import { insertRankAbove, insertRankBelow } from './simPolarity';
 import {
-  createPlateSlot, freeSlotIndex, installSlot, slotBit, type PlateSlot, type SimState,
+  createPlateSlot, freeSlotIndex, installSlot, markOwned, markUnowned, slotBit, type PlateSlot, type SimState,
 } from './simState';
 
 /**
@@ -39,8 +39,8 @@ export function splitPlate(
   C.pushInv.set(P.pushInv);
   for (let j = 0; j < n; j++) {
     if (!side[j]) continue;
-    C.owned[j] = 1;
-    P.owned[j] = 0;
+    markOwned(C, j);
+    markUnowned(P, j);
   }
   C.ownedCount = childCount;
   P.ownedCount -= childCount;

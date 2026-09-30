@@ -7,6 +7,15 @@ import type { OverlayFlags, PaintOptions, PaintSources } from '../core/types';
 import { PaintCache, paintHeightMap, paintLayer, paintOverlay } from '../render/paint';
 import type { DisplaySettings, ExportedImage, PaintParts, PaintQuality } from './protocol';
 
+/**
+ * PaintOptions plus painter hints outside the frozen contract (optional; a painter that does not
+ * know a hint ignores it).
+ */
+export interface PaintOptionsExt extends PaintOptions {
+  /** Currents layer: draw the arrow streamlets (default true). */
+  flowGlyphs?: boolean;
+}
+
 export interface PaintedFrame {
   width: number;
   height: number;
@@ -22,9 +31,10 @@ export class FramePainter {
     private readonly now: () => number,
   ) {}
 
-  options(d: DisplaySettings, width: number, height: number, quality: PaintQuality, seed: number): PaintOptions {
+  options(d: DisplaySettings, width: number, height: number, quality: PaintQuality, seed: number): PaintOptionsExt {
     return {
       width, height, month: d.month, seaLevel: d.seaLevel, hillshade: false, seed, detail: d.detail, rivers: quality === 'full', quality,
+      flowGlyphs: d.flowGlyphs !== false,
     };
   }
 
@@ -59,7 +69,8 @@ export class FramePainter {
 
   /** Full-quality equirectangular export of the current layer; the overlay includes the graticule. */
   exportImage(src: PaintSources, d: DisplaySettings, width: number, height: number, seed: number): ExportedImage {
-    const opts = this.options(d, width, height, 'full', seed);
+    // A still image has no particles: always draw the flow glyphs.
+    const opts = this.options({ ...d, flowGlyphs: true }, width, height, 'full', seed);
     const { rgba } = paintLayer(d.layer, src, opts, this.cache);
     const flags: OverlayFlags = { ...d.overlays };
     const overlay = flags.boundaries || flags.coastlines || flags.graticule ? paintOverlay(flags, src, opts, this.cache) : null;

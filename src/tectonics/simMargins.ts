@@ -101,6 +101,8 @@ interface BasinScratch {
   comp: Int32Array;
   queue: Int32Array;
   cells: Int32Array;
+  /** Crust type per world cell at the start of the pass. */
+  crust: Uint8Array;
 }
 const basinOf = new WeakMap<SimState, BasinScratch>();
 
@@ -118,18 +120,20 @@ function fillTrappedBasins(state: SimState): void {
   const { adjOffset, adj } = state.sm;
   let sc = basinOf.get(state);
   if (!sc) {
-    sc = { comp: new Int32Array(n), queue: new Int32Array(n), cells: new Int32Array(n) };
+    sc = { comp: new Int32Array(n), queue: new Int32Array(n), cells: new Int32Array(n), crust: new Uint8Array(n) };
     basinOf.set(state, sc);
   }
   const { comp, queue } = sc;
-  const crustAt = (i: number): number => (slots[top[i]] as PlateSlot).crust[src[i]];
+  // Labelling and ring selection see the crust before any conversion: read it once per cell.
+  const wc = sc.crust;
+  for (let i = 0; i < n; i++) wc[i] = (slots[top[i]] as PlateSlot).crust[src[i]];
   comp.fill(-1);
   // Label oceanic components; remember each one's size and youngest crust.
   const sizes: number[] = [];
   const minAge: number[] = [];
   const onePlate: boolean[] = [];
   for (let i = 0; i < n; i++) {
-    if (comp[i] >= 0 || crustAt(i) === CRUST_CONTINENTAL) continue;
+    if (comp[i] >= 0 || wc[i] === CRUST_CONTINENTAL) continue;
     const id = sizes.length;
     let tail = 0, size = 0, youngest = Infinity, single = true;
     comp[i] = id;
@@ -142,7 +146,7 @@ function fillTrappedBasins(state: SimState): void {
       if (top[c] !== top[i]) single = false;
       for (let q = adjOffset[c], e = adjOffset[c + 1]; q < e; q++) {
         const a = adj[q];
-        if (comp[a] >= 0 || crustAt(a) === CRUST_CONTINENTAL) continue;
+        if (comp[a] >= 0 || wc[a] === CRUST_CONTINENTAL) continue;
         comp[a] = id;
         queue[tail++] = a;
       }
@@ -165,7 +169,7 @@ function fillTrappedBasins(state: SimState): void {
     const k = comp[i];
     if (k < 0 || !fill[k]) continue;
     for (let q = adjOffset[i], e = adjOffset[i + 1]; q < e; q++) {
-      if (crustAt(adj[q]) === CRUST_CONTINENTAL) {
+      if (wc[adj[q]] === CRUST_CONTINENTAL) {
         ring[count++] = i;
         break;
       }

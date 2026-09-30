@@ -1,3 +1,4 @@
+import type { DynamicsResultWithIce } from './dyn';
 import type { DynamicsResult, HydrologyResult } from './internal';
 import { solveAnnualCycle } from './hydroAnnual';
 import type { MoistureSolution, MonthlyInit } from './hydroAnnual';
@@ -171,7 +172,7 @@ export function computeHydrology(
 
   const tPost = now();
   const snow = new Float32Array(12 * n);
-  computeSnowCover({ n, temp: dyn.temp, precip: sol.precip, land: dyn.land, seaIce: dyn.seaIce }, t, snow);
+  computeSnowCover({ n, temp: dyn.temp, precip: sol.precip, land: dyn.land, seaIce: dyn.seaIce, landIce: (dyn as DynamicsResultWithIce).landIce }, t, snow);
   const cloud = new Float32Array(12 * n);
   // Normalized ascent / storm-track index (as in the precipitation multiplier) for the cloud regimes.
   const hg = makeHydroGrid(dyn.w, dyn.h);
@@ -184,7 +185,7 @@ export function computeHydrology(
     stormN[k] = bRms > 1e-30 ? Math.max(0, dyn.baroclinic[k] / bRms) : 0;
   }
   computeCloudCover(
-    { n, rh: sol.rh, precip: sol.precip, stab: sol.stab, landFraction: dyn.landFraction, seaIce: dyn.seaIce, ascent: ascN, storm: stormN, temp: dyn.temp },
+    { n, rh: sol.rh, precip: sol.precip, stab: sol.stab, gateR0: sol.gateR0, landFraction: dyn.landFraction, seaIce: dyn.seaIce, ascent: ascN, storm: stormN, temp: dyn.temp },
     t,
     cloud,
   );

@@ -50,7 +50,14 @@ vec3 linearToSrgb(vec3 c) {
  *    extends across the smooth coast without sea tint and vice versa: Catmull-Rom (sharp, clamped to
  *    the class's colour range in the central 2×2 texels so lakes/rivers/ice edges do not ring) where
  *    the 4×4 neighbourhood is (almost) all one class, blending to positive B-spline weights (always
- *    well conditioned) toward the coast.
+ *    well conditioned) toward the coast;
+ *  - on land, sharp two-colour edges of the painted raster (lake shores, Köppen class and snow
+ *    edges: binary texel masks that magnify into staircases) are rebuilt like the coast:
+ *    the two dominant colours A, B of the land's central 2×2 texels define a membership
+ *    t = proj(c − A, B − A) per texel, B-spline smoothed (kept within ±0.5 of Catmull-Rom so
+ *    single-texel features survive), thresholded at 0.5 and anti-aliased over one screen pixel,
+ *    each side coloured by its own texels. Gated by contrast and by how well the whole stencil fits
+ *    two colours, so gradients, texture and junctions keep the Catmull-Rom colour (classEdge()).
  * Only meaningful when base and height are one raster (same size): callers disable it otherwise.
  * Longitude wraps; rows clamp at the poles. Needs GLSL_CONSTANTS.
  */
@@ -85,6 +92,89 @@ vec3 antiRing(vec3 cr, vec3 lo, vec3 hi) {
   return hi.x >= lo.x ? clamp(cr, lo, hi) : clamp(cr, 0.0, 1.0);
 }
 
+// Two-colour edge reconstruction inside the class 'want' (1 land, 0 sea) of a 4×4 stencil: returns
+// 'base' with sharp binary colour edges rebuilt as smooth anti-aliased contours (see the header).
+// f: sample position in the central cell; pxTex: texels per screen pixel.
+vec3 classEdge(vec3 cv[16], float lv[16], float want, vec2 f, vec4 bx, vec4 by, vec4 dbx, vec4 dby, vec4 cx, vec4 cy,
+               float pxTex, vec3 base) {
+  // Anchors: A = the class's central texel nearest the sample, B = its central texel most unlike A.
+  vec3 A = base;
+  float best = -1.0;
+  for (int j = 1; j <= 2; j++) {
+    for (int i = 1; i <= 2; i++) {
+      int k = 4 * j + i;
+      float w = (i == 1 ? 1.0 - f.x : f.x) * (j == 1 ? 1.0 - f.y : f.y);
+      if (lv[k] == want && w > best) {
+        best = w;
+        A = cv[k];
+      }
+    }
+  }
+  if (best < 0.0) return base;
+  vec3 sA = sqrt(max(A, 0.0));
+  vec3 B = A;
+  float far = 0.0;
+  for (int j = 1; j <= 2; j++) {
+    for (int i = 1; i <= 2; i++) {
+      int k = 4 * j + i;
+      vec3 d = sqrt(max(cv[k], 0.0)) - sA;
+      float q = dot(d, d);
+      if (lv[k] == want && q > far) {
+        far = q;
+        B = cv[k];
+      }
+    }
+  }
+  // Perceptual contrast gate (distance in √linear ≈ gamma-2 space).
+  float contrast = smoothstep(0.004, 0.02, far);
+  if (contrast <= 0.0) return base;
+  vec3 D = B - A;
+  float inv = 1.0 / max(dot(D, D), 1e-10);
+  float sw = 0.0, stt = 0.0, scw = 0.0, sct = 0.0, wa = 0.0, wb = 0.0, dev = 0.0, nc = 0.0;
+  vec2 gw = vec2(0.0), gt = vec2(0.0);
+  vec3 ca = vec3(0.0), cb = vec3(0.0);
+  for (int j = 0; j < 4; j++) {
+    for (int i = 0; i < 4; i++) {
+      int k = 4 * j + i;
+      if (lv[k] != want) continue;
+      float tu = dot(cv[k] - A, D) * inv;
+      // Distance of the texel from the two-colour model (0 for exactly A or B; a gradient continuing
+      // beyond A/B, texture or a third colour give large values).
+      vec3 rsd = cv[k] - A - tu * D;
+      dev += min(tu * tu, (tu - 1.0) * (tu - 1.0)) + dot(rsd, rsd) * inv;
+      nc += 1.0;
+      float t = clamp(tu, 0.0, 1.0);
+      float w = bx[i] * by[j];
+      vec2 dw = vec2(dbx[i] * by[j], bx[i] * dby[j]);
+      sw += w;
+      stt += w * t;
+      gw += dw;
+      gt += dw * t;
+      float wc = cx[i] * cy[j];
+      scw += wc;
+      sct += wc * t;
+      ca += (w - w * t) * cv[k];
+      wa += w - w * t;
+      cb += (w * t) * cv[k];
+      wb += w * t;
+    }
+  }
+  if (sw < 1e-4) return base;
+  float T = stt / sw;
+  vec2 gT = (gt - T * gw) / sw;
+  if (scw > 0.3) {
+    float tc = sct / scw;
+    T = clamp(T, tc - 0.5, tc + 0.5);
+  }
+  float e = smoothstep(-0.5, 0.5, (T - 0.5) / max(length(gT) * pxTex, 1e-4));
+  vec3 colA = wa > 1e-5 ? ca / wa : A;
+  vec3 colB = wb > 1e-5 ? cb / wb : B;
+  // Only a binary stencil (every texel of the class ≈ A or B) is a painted class edge; gradients,
+  // texture, anti-aliased lines and junctions of three colours keep the Catmull-Rom colour.
+  float binary = 1.0 - smoothstep(0.004, 0.03, dev / max(nc, 1.0));
+  return mix(base, mix(colA, colB, e), contrast * binary);
+}
+
 // Height scale (m) of the squashed coast field.
 const float COAST_SCALE = 15.0;
 
@@ -99,9 +189,10 @@ struct TerrainSample {
   vec3 seaCol;    // linear RGB of sea texels around the point
 };
 
-// heightTex/baseTex: texel-exact rasters; sameSize: base and height rasters have equal dimensions.
+// heightTex/baseTex: texel-exact rasters; sameSize: base and height rasters have equal dimensions;
+// pxTex: height texels per screen pixel (anti-aliasing width of rebuilt colour edges).
 TerrainSample reconstructTerrain(sampler2D heightTex, vec2 hSize, sampler2D baseTex, vec2 bSize, bool sameSize,
-                                 bool hasBase, vec2 st, float sea) {
+                                 bool hasBase, vec2 st, float sea, float pxTex) {
   TerrainSample r;
   ivec2 hs = ivec2(hSize);
   vec2 p = st * hSize - 0.5;
@@ -120,6 +211,9 @@ TerrainSample reconstructTerrain(sampler2D heightTex, vec2 hSize, sampler2D base
   // Per-class colour range of the central 2×2 texels (anti-ringing bounds; empty = min > max).
   vec3 lmin = vec3(2.0), lmax = vec3(-1.0), smin = vec3(2.0), smax = vec3(-1.0);
   bool fused = sameSize && hasBase;
+  // Fused stencil kept for the class-edge pass.
+  vec3 cv[16];
+  float lv[16];
   for (int j = 0; j < 4; j++) {
     int row = clamp(i0.y + j, 0, hs.y - 1);
     float rh = 0.0, rdh = 0.0, rhc = 0.0, rdhc = 0.0, rhb = 0.0, rdhb = 0.0, rm = 0.0, rdm = 0.0, rmb = 0.0;
@@ -144,6 +238,8 @@ TerrainSample reconstructTerrain(sampler2D heightTex, vec2 hSize, sampler2D base
         float wb = bx[i] * by[j];
         float wc = cx[i] * cy[j];
         float isLand = v > sea ? 1.0 : 0.0;
+        cv[4 * j + i] = c;
+        lv[4 * j + i] = isLand;
         lc += (wb * isLand) * c;
         wl += wb * isLand;
         sc += (wb - wb * isLand) * c;
@@ -204,6 +300,8 @@ TerrainSample reconstructTerrain(sampler2D heightTex, vec2 hSize, sampler2D base
   // linear light), so it is clamped to the class's range in the central 2×2 (anti-ringing).
   if (wlr > 0.7) lcol = mix(lcol, antiRing(lcr / wlr, lmin, lmax), smoothstep(0.7, 0.97, wlr));
   if (wsr > 0.7) scol = mix(scol, antiRing(scr / wsr, smin, smax), smoothstep(0.7, 0.97, wsr));
+  // Land only: painted sea colours are depth ramps (a one-texel shelf halo would turn into a hard band).
+  if (fused) lcol = classEdge(cv, lv, 1.0, f, bx, by, dbx, dby, cx, cy, pxTex, lcol);
   r.h = h;
   r.g = g;
   r.gc = gc;
@@ -313,6 +411,60 @@ float reliefShade(float rel) {
   if (rel >= 1.0) return 1.0 + 0.35 * (1.0 - exp(-1.2857 * (rel - 1.0)));
   float s = 1.0 - 0.85 * (1.0 - rel);
   return s >= 0.5 ? s : 0.3 + 0.2 * exp((s - 0.5) * 5.0);
+}
+// Light-independent relief cue (albedo factor, 1 on flat ground): steep slopes darken slightly and
+// ground above (below) its surroundings ~150 km around brightens (darkens), so ranges read as ranges
+// in any light direction, including the overhead sun, without extra highlight (no plastic sheen).
+// tilt: exaggerated slope (tan); localRelief: height minus the coarse (~8 texel) mean, metres.
+float reliefCue(float tilt, float localRelief) {
+  float slope = 1.0 - 0.24 * smoothstep(0.1, 1.2, tilt);
+  return slope * (1.0 + 0.18 * clamp(localRelief * (1.0 / 1000.0), -1.0, 1.0));
+}
+`;
+
+/**
+ * Crisp magnification of a premultiplied RGBA overlay of anti-aliased lines and areas (boundaries,
+ * coastlines, isobars, graticule): bilinear magnification of a 1–2 texel line gives a band as wide as
+ * the zoom and just as soft, following every texel step of the traced line. Here the coverage is
+ * B-spline smoothed (C2: a line traced texel by texel becomes a smooth curve) and thresholded at
+ * 0.4 of its local peak — about the painted width (a 1-texel line keeps ~1.25 texels, B-spline
+ * peak 2/3) at the painted peak opacity — with a one-screen-pixel anti-aliased edge; the colour is
+ * the B-spline average of the premultiplied texels, un-premultiplied. The local peak is a smooth
+ * soft maximum (Σw·a⁴ / Σw·a³ with the B-spline weights: exact for one opacity, no texel-shaped
+ * plateaus where opacities differ); isolated faint fringe texels fade out. pxTex: overlay texels per
+ * screen pixel. Returns premultiplied RGBA in the texture's encoding. Needs GLSL_TERRAIN_RECON
+ * (weights, wrapCol).
+ */
+export const GLSL_OVERLAY_SHARP = /* glsl */ `
+vec4 overlaySharp(sampler2D tex, vec2 size, vec2 st, float pxTex) {
+  ivec2 is = ivec2(size);
+  vec2 p = st * size - 0.5;
+  vec2 fp = floor(p);
+  vec2 f = p - fp;
+  ivec2 i0 = ivec2(fp) - 1;
+  vec4 bx = bsWeights(f.x), by = bsWeights(f.y);
+  vec4 dbx = bsDerivs(f.x), dby = bsDerivs(f.y);
+  float p3 = 0.0, p4 = 0.0;
+  vec2 ga = vec2(0.0);
+  vec4 cb = vec4(0.0);
+  for (int j = 0; j < 4; j++) {
+    int row = clamp(i0.y + j, 0, is.y - 1);
+    for (int i = 0; i < 4; i++) {
+      vec4 o = texelFetch(tex, ivec2(wrapCol(i0.x + i, is.x), row), 0);
+      float w = bx[i] * by[j];
+      ga += vec2(dbx[i] * by[j], bx[i] * dby[j]) * o.a;
+      cb += w * o;
+      float a3 = w * o.a * o.a * o.a;
+      p3 += a3;
+      p4 += a3 * o.a;
+    }
+  }
+  if (p3 < 1e-7) return vec4(0.0);
+  float peak = p4 / p3;
+  float thr = 0.4 * peak;
+  float e = max(0.5 * length(ga) * pxTex, 1e-4);
+  float cov = peak * smoothstep(thr - e, thr + e, cb.a) * smoothstep(0.02, 0.08, peak);
+  return vec4(cb.rgb / max(cb.a, 1e-4) * cov, cov);
 }
 `;
 

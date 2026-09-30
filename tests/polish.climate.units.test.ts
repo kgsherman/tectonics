@@ -76,7 +76,8 @@ describe('cloud regimes', () => {
   const t = HYDRO_TUNING;
   it('thins humid layer cloud under subsidence and adds storm-track cloud', () => {
     expect(cloudCover(0.7, 0, 0, 1, t, -1.2)).toBeLessThan(cloudCover(0.7, 0, 0, 1, t, 0) - 0.2);
-    expect(cloudCover(0.5, 0.5, 0, 1, t, 0, 1)).toBeGreaterThan(cloudCover(0.5, 0.5, 0, 1, t, 0, 0) + 0.2);
+    // Storm-track cloud adds ≥ 0.15 (polish 2 lowered its weight: storm tracks sat at 0.87–0.88 cover).
+    expect(cloudCover(0.5, 0.5, 0, 1, t, 0, 1)).toBeGreaterThan(cloudCover(0.5, 0.5, 0, 1, t, 0, 0) + 0.15);
   });
   it('builds stratocumulus over cool water under subsidence but not over warm water', () => {
     const cool = cloudCover(0.4, 0, 4, 1, t, -1, 0, 16);

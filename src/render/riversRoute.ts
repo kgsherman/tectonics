@@ -17,6 +17,8 @@ export interface Drainage {
   recv: Int32Array;
   /** Discharge leaving the cell, km³/yr (after lake evaporation losses). */
   q: Float32Array;
+  /** Upstream drainage area in routing cells (the cell itself included; lon-row area weighted, 1 = an equatorial cell). */
+  area: Float32Array;
   /** Lake id per cell (−1 none), dilated by LAKE_ZONE_RINGS cells so shores follow the finer output terrain. */
   lakeOf: Int32Array;
   lakes: Lake[];
@@ -33,6 +35,10 @@ export interface Lake {
   cells: number;
   waterCells: number;
   endorheic: boolean;
+  /** Water balance (km³/yr): inflow reaching the basin and open-water evaporation over the whole basin; mean aridity 0..1. */
+  inflow: number;
+  evap: number;
+  arid: number;
 }
 
 /** Binary min-heap of (key, index) with Float64 keys. */
@@ -118,6 +124,20 @@ export interface RouteInput {
 const LAKE_MIN_DEPTH = 120;
 /** Outlet incision of open lakes as a fraction of the basin depth (lowers their level). */
 const BREACH = 0.45;
+/**
+ * Dryland transmission loss per 40 km of channel: fraction TL_K·aridity/(q + TL_Q0)^0.88 (q in
+ * km³/yr) above aridity TL_ARID0 — about 0.5 km³/yr lost per 40 km whatever the size: wadis of
+ * ≲ 1 km³/yr die within a cell or two, a Nile-sized exotic river (~100 km³/yr) loses ~30 % over
+ * 2000 km of desert.
+ */
+const TL_K = 0.4;
+const TL_Q0 = 0.1;
+const TL_ARID0 = 0.35;
+/**
+ * Hyper-arid closed basins hold at most this fraction of their floor as standing water (a terminal
+ * or ephemeral lake), whatever the inflow; the rest of the floor is playa / salt crust.
+ */
+const ARID_LAKE_FRAC = 0.05;
 /** Dilation (cells) of the drawable lake zone around a depression. */
 const LAKE_ZONE_RINGS = 2;
 
@@ -213,13 +233,28 @@ export function routeDrainage(inp: RouteInput): Drainage {
 
   // --- Accumulation (descending filled order = reverse flood order) ------------------------------
   const q = new Float32Array(n);
+  const area = new Float32Array(n);
+  const cell0 = areaRow[h >> 1];
   for (let t = nOrder - 1; t >= 0; t--) {
     const i = order[t];
     if (ocean[i]) continue;
     const r = (i / w) | 0;
     q[i] += inp.runoff[i] * 1e-6 * areaRow[r]; // mm → km, × km² = km³
+    area[i] += areaRow[r] / cell0;
+    // Transmission losses in drylands (evaporation from channels and floodplains, seepage into
+    // alluvial fans): small streams die out within a few cells, exotic rivers lose a little.
+    const ar = inp.arid[i];
+    if (ar > TL_ARID0 && q[i] > 0) {
+      let t = (ar - TL_ARID0) * (1 / (1 - TL_ARID0));
+      t = t > 1 ? 1 : t * t * (3 - 2 * t);
+      const f = (TL_K * t * (dy / 4e4)) / Math.pow(q[i] + TL_Q0, 0.88);
+      q[i] *= f < 0.95 ? 1 - f : 0.05;
+    }
     const j = recv[i];
-    if (j >= 0 && !ocean[j]) q[j] += q[i];
+    if (j >= 0 && !ocean[j]) {
+      q[j] += q[i];
+      area[j] += area[i];
+    }
   }
 
   // --- Depressions → lakes ---------------------------------------------------------------------
@@ -287,6 +322,15 @@ export function routeDrainage(inp: RouteInput): Drainage {
     let level = spill[id] - BREACH * depth;
     let waterCells = 0;
     for (const i of cells) if (elev[i] < level) waterCells++;
+    // Drylands: standing water shrinks to a terminal lake on a playa floor as the basin gets more
+    // arid (evaporation and seepage along the way, ephemeral floods), even with exotic inflow.
+    let dry = (arid - 0.45) * (1 / 0.45);
+    dry = dry < 0 ? 0 : dry > 1 ? 1 : dry * dry * (3 - 2 * dry);
+    const aridCap = Math.floor(cells.length * (1 - (1 - ARID_LAKE_FRAC) * dry));
+    if (waterCells > aridCap) {
+      waterCells = aridCap;
+      level = waterCells > 0 ? elev[sorted[waterCells - 1]] + 0.01 : -Infinity;
+    }
     let loss = evapFull * (waterCells / cells.length);
     if (endorheic) {
       // Partial fill: the lake grows until evaporation balances the inflow.
@@ -295,15 +339,15 @@ export function routeDrainage(inp: RouteInput): Drainage {
       level = waterCells > 0 ? elev[sorted[waterCells - 1]] + 0.01 : -Infinity;
       loss = inflow;
     }
-    // Salt flats around a shrunken lake in dry closed basins.
+    // Salt flats / playas around a shrunken lake in dry closed basins.
     let saltLevel = -Infinity;
-    if (endorheic && arid > 0.6) {
+    if ((endorheic || dry > 0.3) && arid > 0.6) {
       const saltCells = Math.max(1, waterCells, Math.floor(cells.length * (0.1 + 0.2 * arid)));
       saltLevel = elev[sorted[Math.min(cells.length - 1, saltCells - 1)]] + 0.01;
     }
     if (waterCells < inp.minLakeCells && saltLevel === -Infinity) continue;
     const lakeId = lakes.length;
-    lakes.push({ level, saltLevel, floor, cells: cells.length, waterCells, endorheic });
+    lakes.push({ level, saltLevel, floor, cells: cells.length, waterCells, endorheic, inflow, evap: evapFull, arid });
     // Lake zone = depression dilated by LAKE_ZONE_RINGS cells, so shores and salt rims are cut by
     // the fine output terrain rather than by the routing-cell outline. Only the rim (undrained
     // ground at or above the spill level) is added: cells past the outlet, which drain away below
@@ -334,5 +378,5 @@ export function routeDrainage(inp: RouteInput): Drainage {
       j = recv[j];
     }
   }
-  return { w, h, elev, ocean, recv, q, lakeOf, lakes };
+  return { w, h, elev, ocean, recv, q, area, lakeOf, lakes };
 }

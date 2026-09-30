@@ -5,6 +5,7 @@
 import type { ClimateResult, SphereMesh, WorldSnapshot } from '../core/types';
 import { getLegend } from '../render/paint';
 import { layerNeedsClimate } from '../worker/layerInfo';
+import type { PaintOptionsExt } from '../worker/framePainter';
 import { errorMessage } from '../worker/protocol';
 import { cloudSpec, currentFieldSpec, windFieldSpec } from './climateFields';
 import { displaySettings } from './display';
@@ -76,7 +77,10 @@ export class ViewSync {
       return;
     }
     const climate = this.data.climate();
-    const note = layerNeedsClimate(layer) && !climate ? 'No climate yet: showing a neutral map. Compute one in the Climate tab.' : undefined;
+    const computing = s.runtime.climate.phase === 'computing';
+    const note = !layerNeedsClimate(layer) || climate ? undefined
+      : computing ? 'Computing the climate: this map fills in when it is ready.'
+      : 'No climate yet: showing a neutral map. Compute one in the Climate tab.';
     const mesh = this.data.mesh();
     if (!mesh) {
       this.right.setLegend(null, note);
@@ -84,9 +88,12 @@ export class ViewSync {
     }
     try {
       const d = displaySettings(s);
-      const spec = getLegend(layer, { mesh, snapshot: this.data.snapshot(), climate }, {
+      // Same painter hints as the frames (a legend may describe the currents' arrows).
+      const opts: PaintOptionsExt = {
         width: d.fullWidth, height: d.fullHeight, month: d.month, seaLevel: d.seaLevel, hillshade: false, seed: s.runtime.worldSeed, detail: d.detail,
-      });
+        flowGlyphs: d.flowGlyphs !== false,
+      };
+      const spec = getLegend(layer, { mesh, snapshot: this.data.snapshot(), climate }, opts);
       this.right.setLegend(spec, note);
     } catch (e) {
       this.right.setLegend(null, `Legend unavailable: ${errorMessage(e)}`);

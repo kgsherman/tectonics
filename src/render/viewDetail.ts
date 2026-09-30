@@ -5,7 +5,9 @@
  * anchored to the planet frame. While the tectonic playback streams new height maps every frame the
  * coasts move with the plates, so world-anchored detail would swim relative to them. The fader hides
  * the detail while the height map keeps changing and fades it back in once the surface has been
- * static for a moment (paused world, month changes that resend identical heights).
+ * static for a moment (paused world, month changes that resend identical heights). The hold adapts
+ * to the stream: it lasts at least ~2.5 update intervals, so slow playback (a heavy world or live
+ * climate stretching frames past the base hold) never lets the detail pulse in between frames.
  */
 
 /** Cheap order-sensitive signature of a height map (≈4k samples; identical rasters → equal values). */
@@ -25,12 +27,16 @@ export class DetailFader {
   private signature = -1;
   /** Time (ms) of the last height change; −∞ = never changed (detail fully on). */
   private changedAt = -Infinity;
+  /** Current hold (ms): the base hold, stretched by a slow update stream. */
+  private hold: number;
 
   /**
    * @param holdMs detail stays hidden this long after the latest height change
    * @param fadeMs then fades in over this long
    */
-  constructor(private readonly holdMs = 1200, private readonly fadeMs = 600) {}
+  constructor(private readonly holdMs = 1200, private readonly fadeMs = 600, private readonly maxHoldMs = 4000) {
+    this.hold = holdMs;
+  }
 
   /** Records a (possibly unchanged) height map; returns true if it differs from the previous one. */
   noteHeights(signature: number, nowMs: number): boolean {
@@ -38,7 +44,13 @@ export class DetailFader {
     const first = this.signature === -1;
     this.signature = signature;
     // The first height map of a view is not "motion": show detail immediately.
-    if (!first) this.changedAt = nowMs;
+    if (!first) {
+      const interval = nowMs - this.changedAt;
+      // Consecutive changes: hold ≥ 2.5 intervals (capped). A change after a settled pause restarts
+      // from the base hold.
+      this.hold = interval < this.hold + this.fadeMs ? Math.min(this.maxHoldMs, Math.max(this.holdMs, 2.5 * interval)) : this.holdMs;
+      this.changedAt = nowMs;
+    }
     return true;
   }
 
@@ -46,11 +58,12 @@ export class DetailFader {
   reset(): void {
     this.signature = -1;
     this.changedAt = -Infinity;
+    this.hold = this.holdMs;
   }
 
   /** Detail strength 0..1 at `nowMs`. */
   value(nowMs: number): number {
-    const t = (nowMs - this.changedAt - this.holdMs) / this.fadeMs;
+    const t = (nowMs - this.changedAt - this.hold) / this.fadeMs;
     if (!(t > 0)) return 0;
     if (t >= 1) return 1;
     return t * t * (3 - 2 * t);
@@ -58,6 +71,6 @@ export class DetailFader {
 
   /** True while the value will still change (callers keep rendering until it settles). */
   animating(nowMs: number): boolean {
-    return nowMs - this.changedAt < this.holdMs + this.fadeMs;
+    return nowMs - this.changedAt < this.hold + this.fadeMs;
   }
 }

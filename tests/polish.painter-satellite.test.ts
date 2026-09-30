@@ -171,6 +171,27 @@ describe('sea ice and ice sheets', () => {
     const cache = new PaintCache();
     const hm = paintHeightMap(src, o, cache);
     const rgba = paintLayer('satellite', src, o, cache).rgba;
+    // Open sea only: small enclosed water bodies (lagoons, flooded hollows — frozen in a cold month,
+    // buried inside ice sheets) are land-locked water, not sea ice.
+    const W = o.width, H = o.height;
+    const open = new Uint8Array(W * H);
+    {
+      const seen = new Uint8Array(W * H);
+      for (let s0 = 0; s0 < W * H; s0++) {
+        if (seen[s0] || hm[s0] > 0) continue;
+        const comp: number[] = [s0];
+        seen[s0] = 1;
+        for (let k = 0; k < comp.length; k++) {
+          const p = comp[k], r = (p / W) | 0, c = p - r * W;
+          for (const q of [r * W + ((c + 1) % W), r * W + ((c + W - 1) % W), r > 0 ? p - W : -1, r < H - 1 ? p + W : -1]) {
+            if (q < 0 || seen[q] || hm[q] > 0) continue;
+            seen[q] = 1;
+            comp.push(q);
+          }
+        }
+        if (comp.length >= 64) for (const p of comp) open[p] = 1;
+      }
+    }
     const count = (lat0: number, lat1: number) => {
       let n = 0, ice = 0, mid = 0;
       for (let r = 0; r < o.height; r++) {
@@ -178,7 +199,10 @@ describe('sea ice and ice sheets', () => {
         if (lat < lat0 || lat >= lat1) continue;
         for (let q = 0; q < o.width; q++) {
           const p = r * o.width + q;
-          if (hm[p] > 0) continue;
+          if (hm[p] > 0 || !open[p]) continue;
+          // Sea pixels on the coastline are anti-aliased with their (snowy) land neighbours.
+          if (hm[r * o.width + ((q + 1) % o.width)] > 0 || hm[r * o.width + ((q + o.width - 1) % o.width)] > 0) continue;
+          if ((r > 0 && hm[p - o.width] > 0) || (r < o.height - 1 && hm[p + o.width] > 0)) continue;
           n++;
           const L = lum(rgba, p);
           if (L > 150) ice++;

@@ -13,6 +13,11 @@ export const SNOW_SHADE = L([208, 218, 234]);
 /** Tundra / alpine meadow: brown-olive when dry, mossy green-olive when humid. */
 export const TUNDRA_DRY = L([126, 116, 88]);
 export const TUNDRA_WET = L([98, 110, 72]);
+/** Glacier ice of ablation zones (bare, blue-grey) and crevassed / debris-laden margins. */
+export const ICE_BARE = L([176, 196, 214]);
+export const ICE_CREVASSE = L([118, 132, 146]);
+/** Accumulation-zone firn of ice sheets: a touch warmer / brighter than fresh seasonal snow in shade. */
+export const FIRN = L([240, 243, 248]);
 export const ROCK_DRY = L([122, 108, 94]);
 export const ROCK_WET = L([92, 92, 90]);
 export const SEA_ICE = L([226, 232, 240]);
@@ -69,12 +74,14 @@ function depthRamp(stops: Array<[number, RGB]>): Float32Array {
   }
   return out;
 }
+// The sea floor is invisible from orbit below ~50–100 m: the ramps flatten below ~150 m so narrow
+// submarine ridges (crests 100–500 m deep, far from land) do not glow like shelves.
 export const OCEAN_WARM = depthRamp([
-  [0, [44, 118, 136]], [15, [36, 108, 138]], [60, [26, 88, 132]], [200, [17, 60, 110]], [1000, [11, 36, 84]],
+  [0, [44, 118, 136]], [15, [36, 108, 138]], [60, [24, 82, 128]], [150, [12, 42, 92]], [400, [8, 29, 72]],
   [3000, [7, 25, 66]], [6000, [5, 19, 55]],
 ]);
 export const OCEAN_COLD = depthRamp([
-  [0, [38, 86, 98]], [15, [32, 78, 98]], [60, [23, 64, 94]], [200, [15, 47, 84]], [1000, [10, 33, 68]],
+  [0, [38, 86, 98]], [15, [32, 78, 98]], [60, [21, 58, 88]], [150, [11, 36, 70]], [400, [9, 28, 60]],
   [3000, [9, 26, 56]], [6000, [7, 21, 47]],
 ]);
 

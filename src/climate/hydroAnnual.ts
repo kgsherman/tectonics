@@ -33,6 +33,8 @@ export interface MoistureSolution {
   rh: Float32Array;
   /** Cold-SST stability seen by each cell (K), for stratocumulus. */
   stab: Float32Array;
+  /** Condensation reference of each cell for clouds (the humidity-gate threshold without its storm-track shift). */
+  gateR0: Float32Array;
   /** Pseudo-time steps in total (including wrap-around re-solves). */
   steps: number;
   monthsConverged: number;
@@ -87,6 +89,7 @@ export function solveAnnualCycle(
     evap: new Float32Array(12 * n),
     rh: new Float32Array(12 * n),
     stab: new Float32Array(12 * n),
+    gateR0: new Float32Array(12 * n),
     steps: 0,
     monthsConverged: 0,
     maxResidual: 0,
@@ -177,6 +180,7 @@ export function solveAnnualCycle(
       out.precip[off + i] = state.P[i] * SECONDS_PER_MONTH;
       out.evap[off + i] = state.E[i] * SECONDS_PER_MONTH;
       out.stab[off + i] = forcing.stab[i];
+      out.gateR0[off + i] = forcing.cloudR0[i];
       memory[i] = keepMemory * memory[i] + (1 - keepMemory) * state.P[i];
     }
     if (!memoryValid) {

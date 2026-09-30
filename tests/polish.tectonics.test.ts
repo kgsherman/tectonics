@@ -12,7 +12,7 @@ import { settleDebug } from '../src/tectonics/simDirty';
 import { accreteMargins } from '../src/tectonics/simMargins';
 import { RegionDijkstra } from '../src/tectonics/simDijkstra';
 import { simMeshOf, walkFrom, walkNearest, type SimMesh } from '../src/tectonics/simMesh';
-import type { PlateSlot, SimState } from '../src/tectonics/simState';
+import { markUnowned, type PlateSlot, type SimState } from '../src/tectonics/simState';
 import { smallMesh, twoPlateDraft } from './helpers/fixtures';
 
 const DEG = Math.PI / 180;
@@ -119,9 +119,9 @@ describe('tectonics polish: exact accelerations', () => {
         let surrounded = true;
         for (let r = adjOffset[h]; r < adjOffset[h + 1]; r++) surrounded &&= P.owned[adj[r]] === 1;
         if (!surrounded) continue;
-        P.owned[h] = 0;
+        markUnowned(P, h);
         P.ownedCount--;
-        Q.owned[h] = 0;
+        markUnowned(Q, h);
         Q.ownedCount--;
         holes++;
         used[i] = 1;

@@ -207,6 +207,18 @@ let lastMap: WeakRef<MeshGridMap> | null = null;
 let lastCC: WeakRef<CellCategories> | null = null;
 let lastRes: PixelCategories | null = null;
 
+/** Drops the scratch pools and the memoized result (between paint calls only); returns bytes released. */
+export function releaseCategoryScratch(): number {
+  let bytes = 0;
+  for (const b of pool16) bytes += b ? b.byteLength : 0;
+  for (const b of pool32) bytes += b ? b.byteLength : 0;
+  pool16.length = 0;
+  pool32.length = 0;
+  lastMap = lastCC = null;
+  lastRes = null;
+  return bytes;
+}
+
 /**
  * Resolve the smooth categories on the raster of `map` (categories must fit in Int16). The result
  * uses shared scratch buffers: it is valid until the next call with different inputs (a repeated

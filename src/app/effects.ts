@@ -6,6 +6,7 @@ import type { TectonicParams } from '../core/types';
 import type { PaintParts } from '../worker/protocol';
 import { layerIsMonthly, layerNeedsClimate } from '../worker/layerInfo';
 import type { ClimateCoordinator } from './climateCoordinator';
+import { flowGlyphs } from './display';
 import type { HoverController } from './hoverController';
 import { saveSettings, type KeyValueStorage } from './settings';
 import type { Action, AppState, ViewKind } from './state';
@@ -48,10 +49,19 @@ export function wireStoreEffects(store: Store<AppState, Action>, host: EffectHos
     if (tab === 'plates' && st.getState().runtime.worldLoaded) host.enterEditor();
   });
   st.watch((s) => s.runtime.editorActive, () => host.viewSync.legend());
+  // The legend's "no climate" note says whether one is on its way.
+  st.watch((s) => s.runtime.climate.phase, () => host.viewSync.legend());
 
   // Repaints.
   st.watch((s) => ({ layer: s.settings.view.layer, sea: s.settings.seaLevel, detail: s.settings.view.detail }), () => host.requestPaint('all'), { equal: shallowEqual });
   st.watch((s) => ({ b: s.settings.view.overlays.boundaries, c: s.settings.view.overlays.coastlines }), () => host.requestPaint('overlay'), { equal: shallowEqual });
+  // Current particles over the currents layer replace its arrow glyphs (and give them back when off).
+  // Layer changes repaint anyway (above): only a particle change on an unchanged layer needs one.
+  st.watch((s) => ({ g: flowGlyphs(s), layer: s.settings.view.layer }), (v, prev) => {
+    if (!prev || v.layer !== prev.layer) return;
+    host.requestPaint('all');
+    host.viewSync.legend();
+  }, { equal: shallowEqual });
   st.watch((s) => s.runtime.month, () => {
     if (layerIsMonthly(st.getState().settings.view.layer)) host.requestPaint('all');
     host.viewSync.weather();
@@ -74,6 +84,10 @@ export function wireStoreEffects(store: Store<AppState, Action>, host: EffectHos
     layer: s.settings.view.layer,
   }), () => host.viewSync.weather(), { equal: shallowEqual });
   st.watch((s) => s.settings.view.layer, (layer) => {
+    // Flow particles follow a flow layer: wind streaks over the currents map (or the reverse) read as noise.
+    const particles = st.getState().settings.view.particles;
+    if (layer === 'currents' && particles === 'wind') st.dispatch({ type: 'patchView', patch: { particles: 'currents' } });
+    if (layer === 'wind' && particles === 'currents') st.dispatch({ type: 'patchView', patch: { particles: 'wind' } });
     host.viewSync.legend();
     const rt = st.getState().runtime;
     // A climate-only layer without a climate: compute one rather than show a blank map.

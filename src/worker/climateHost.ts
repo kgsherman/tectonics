@@ -2,7 +2,7 @@
  * Climate worker logic (SPEC.md §10): runs computeClimate, one job at a time. Cancellation is done
  * by the main thread (terminate + respawn), so a job simply runs to completion here. The result is
  * kept as the next warm start and therefore leaves the worker by structured clone — once to the
- * main thread and once to the paint worker over the MessageChannel.
+ * main thread and once to each paint worker (primary and playback helpers) over its MessageChannel.
  */
 import { computeClimate } from '../climate/climate';
 import type { ClimateResult } from '../core/types';
@@ -21,7 +21,8 @@ interface PortLike {
 const PROGRESS_STEP = 0.02;
 
 export class ClimateHost {
-  private port: PortLike | null = null;
+  /** Climate → paint channels by painter slot. */
+  private ports: PortLike[] = [];
   private last: ClimateResult | null = null;
 
   constructor(private readonly env: ClimateHostEnv) {}
@@ -29,7 +30,7 @@ export class ClimateHost {
   handle(msg: ClimateRequest): void {
     switch (msg.type) {
       case 'connect':
-        this.port = msg.port;
+        this.ports[msg.painter ?? 0] = msg.port;
         return;
       case 'compute':
         this.compute(msg);
@@ -58,7 +59,7 @@ export class ClimateHost {
       const climate = computeClimate(msg.input, params, onProgress, warm);
       this.last = climate;
       const ms = this.env.now() - t0;
-      this.port?.postMessage({ type: 'climate', climate });
+      for (const port of this.ports) port?.postMessage({ type: 'climate', climate });
       this.env.post({ type: 'result', reqId, climate, purpose: msg.purpose, ms });
     } catch (e) {
       this.env.post({ type: 'error', reqId, message: errorMessage(e) });

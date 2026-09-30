@@ -7,6 +7,10 @@
  * unacknowledged; a playback snapshot is "taken" (credit back to the sim, which then steps again)
  * only when a frame slot is free, so sim, paint and main pipeline without running away. Still
  * paints (pause, layer/month changes, scrubbing, climate arrivals) are coalesced latest-wins.
+ *
+ * Painter slot (from connectSim): 0 = primary (everything above); a helper (slot ≥ 1) only paints
+ * the playback snapshots the sim hands it, keeps just the newest climates and takes display
+ * settings from the main thread's paint requests without replying to them.
  */
 import type { ClimateResult, PaintSources, SphereMesh, WorldSnapshot } from '../core/types';
 import { PaintCache } from '../render/paint';
@@ -34,7 +38,20 @@ export interface PaintHostEnv {
   now: () => number;
   climates?: ClimateShelf;
   paintCache?: PaintCache;
+  /**
+   * Frees the painter's module-level scratch pools (tens of MB at 2048×1024, outside PaintCache's
+   * budget); returns the bytes released. Called once the worker has been idle for `idleReleaseMs`
+   * (not during playback): the next paint reallocates what it needs.
+   */
+  releaseScratch?: () => number | void;
+  /** Idle time before `releaseScratch` runs (default IDLE_RELEASE_MS). */
+  idleReleaseMs?: number;
+  /** Delayed callback (default setTimeout); returns a cancel function. */
+  later?: (fn: () => void, ms: number) => () => void;
 }
+
+/** Paint-worker idle time after which the painter's scratch pools are released. */
+export const IDLE_RELEASE_MS = 15_000;
 
 interface StillJob {
   reqId: number;
@@ -51,12 +68,19 @@ interface Shown {
 
 /** Max climates held back while their source registration is in flight (other channel). */
 const MAX_WAITING_CLIMATES = 3;
+/** A helper paints the live playback state only: the newest climate or two suffice. */
+export const HELPER_CLIMATE_SHELF_BYTES = 48 * 1024 * 1024;
 
 export class PaintHost {
   private mesh: SphereMesh | null = null;
   private seed = 1;
   private readonly painter: FramePainter;
-  private readonly climates: ClimateShelf;
+  private climates: ClimateShelf;
+  /** Painter slot (0 = primary; helpers paint playback frames only). */
+  private slot = 0;
+  /** Show sequence number of the state on screen (0 = unknown), and of its playback's first frame. */
+  private shownSeq = 0;
+  private playFrom: number | undefined = undefined;
   /** Snapshot id → sim time of every climate input built for the current world (and timeline). */
   private readonly climateSources = new Map<number, number>();
   /** Climates whose source registration has not arrived yet (it travels on the sim channel). */
@@ -81,6 +105,9 @@ export class PaintHost {
   private sentOverlay = { key: '', epoch: -1 };
   /** Exports requested before the first state of a world arrived (the sim channel can lag the main one). */
   private pendingExports: Array<Extract<SimRequest, { type: 'exportImage' }>> = [];
+  private cancelIdle: (() => void) | null = null;
+  /** Bytes freed by the last idle release (diagnostics). */
+  lastReleasedBytes = 0;
 
   constructor(private readonly env: PaintHostEnv) {
     this.painter = new FramePainter(env.paintCache ?? new PaintCache(), env.now);
@@ -105,7 +132,7 @@ export class PaintHost {
   private dispatch(msg: SimRequest): void {
     switch (msg.type) {
       case 'connectSim':
-        this.connectSim(msg.port);
+        this.connectSim(msg.port, msg.index ?? 0);
         return this.reply(msg.reqId, 'connectSim', null);
       case 'connectClimate':
         this.connectClimate(msg.port);
@@ -115,6 +142,8 @@ export class PaintHost {
         return;
       case 'paint':
         this.acceptDisplay(msg.display);
+        // Helpers only need the settings (for their next playback frame); the primary answers.
+        if (this.isHelper) return;
         if (this.playing) {
           // The next playback frame uses the new settings.
           if (msg.reqId) this.env.post({ type: 'superseded', reqId: msg.reqId });
@@ -134,8 +163,39 @@ export class PaintHost {
   }
 
   private exportImage(msg: Extract<SimRequest, { type: 'exportImage' }>): void {
+    this.idleDisarm();
     const img = this.painter.exportImage(this.sources(), msg.display, msg.width, msg.height, this.seed);
     this.reply(msg.reqId, 'exportImage', img, transferList(img.rgba, img.overlay));
+    this.idleArm();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Idle release of the painter's scratch memory                        */
+  /* ------------------------------------------------------------------ */
+
+  private idleDisarm(): void {
+    this.cancelIdle?.();
+    this.cancelIdle = null;
+  }
+
+  /** (Re)start the idle countdown after a paint; playback keeps painting, so it never arms. */
+  private idleArm(): void {
+    this.idleDisarm();
+    const release = this.env.releaseScratch;
+    if (!release || this.playing) return;
+    const later = this.env.later ?? ((fn: () => void, ms: number) => {
+      const id = globalThis.setTimeout(fn, ms);
+      return () => globalThis.clearTimeout(id);
+    });
+    this.cancelIdle = later(() => {
+      this.cancelIdle = null;
+      if (this.playing || this.still || this.pendingPlay) return;
+      try {
+        this.lastReleasedBytes = Number(release()) || 0;
+      } catch (e) {
+        this.env.post({ type: 'error', reqId: 0, message: `paint worker: releasing scratch memory failed: ${errorMessage(e)}` });
+      }
+    }, this.env.idleReleaseMs ?? IDLE_RELEASE_MS);
   }
 
   private flushExports(): void {
@@ -160,13 +220,24 @@ export class PaintHost {
   /* Sim worker channel                                                  */
   /* ------------------------------------------------------------------ */
 
-  private connectSim(port: PortLike): void {
+  private connectSim(port: PortLike, slot: number): void {
     if (this.simPort && this.simPort !== port) {
       this.simPort.onmessage = null;
       this.simPort.close?.();
     }
     this.simPort = port;
     port.onmessage = (e: MessageEvent) => this.receiveSim(e.data as SimToPaint);
+    if (slot > 0 && this.slot === 0 && !this.env.climates) this.climates = new ClimateShelf(HELPER_CLIMATE_SHELF_BYTES);
+    this.slot = slot;
+  }
+
+  /** Painter slot (0 = primary). */
+  get painterSlot(): number {
+    return this.slot;
+  }
+
+  private get isHelper(): boolean {
+    return this.slot > 0;
   }
 
   /** A message from the sim worker. */
@@ -198,9 +269,7 @@ export class PaintHost {
       case 'show':
         this.acceptDisplay(m.display);
         if (m.kind === 'play') {
-          this.playing = true;
-          if (this.still?.reqId) this.env.post({ type: 'superseded', reqId: this.still.reqId });
-          this.still = null;
+          this.startPlaying();
           // The sim waits for a credit before stepping again, so at most one snapshot is pending.
           this.pendingPlay = m;
           this.schedulePlay();
@@ -208,11 +277,18 @@ export class PaintHost {
         }
         this.stopPlaying();
         this.shown = { snapshot: m.snapshot, keyframe: m.keyframe };
+        this.shownSeq = m.seq;
+        // A helper never shows stills: the sim sends it one to warm its caches for playback.
+        if (this.isHelper) return this.env.schedule(this.warmUp);
         this.queueStill({ reqId: m.reqId, quality: m.quality, parts: m.parts, previewFirst: m.previewFirst });
         if (this.pendingExports.length) this.flushExports();
         return;
+      case 'start':
+        this.startPlaying();
+        return;
       case 'stop':
         this.stopPlaying();
+        this.idleArm();
         return;
       case 'climateSource': {
         this.climateSources.set(m.snapshotId, m.time);
@@ -274,6 +350,12 @@ export class PaintHost {
       return false;
     }
     this.climates.add(c);
+    // Helpers paint only playback frames, which pick it up (warm its samplers meanwhile when idle);
+    // the primary reports and repaints.
+    if (this.isHelper) {
+      if (!this.playing) this.env.schedule(this.warmUp);
+      return true;
+    }
     this.env.post({ type: 'climateApplied', climateId: c.id, sourceTime: c.sourceTime });
     if (!this.shown || !this.display || this.playing) return true; // playback picks it up on the next frame
     if (!layerUsesClimate(this.display.layer)) return true;
@@ -289,6 +371,14 @@ export class PaintHost {
   /* ------------------------------------------------------------------ */
   /* Playback frames                                                     */
   /* ------------------------------------------------------------------ */
+
+  /** Playback began: pending still work is void (the next frames show newer states). */
+  private startPlaying(): void {
+    this.playing = true;
+    this.idleDisarm();
+    if (this.still?.reqId) this.env.post({ type: 'superseded', reqId: this.still.reqId });
+    this.still = null;
+  }
 
   private stopPlaying(): void {
     this.playing = false;
@@ -311,12 +401,25 @@ export class PaintHost {
     // Credit first: the sim computes the next step while this one is painted.
     this.credit(m.seq);
     this.shown = { snapshot: m.snapshot, keyframe: null };
+    this.shownSeq = m.seq;
+    this.playFrom = m.playFrom;
     try {
       const frame = this.paintFrame('play', 'preview', 'all', 0, m.epoch);
       this.gate.sent(frame.frameId);
     } catch (e) {
       this.env.post({ type: 'error', reqId: 0, message: `paint failed: ${errorMessage(e)}` });
     }
+  };
+
+  /** Helper: paint the shown state at playback quality without sending it (builds grid maps, detail, samplers). */
+  private readonly warmUp = (): void => {
+    if (this.playing || !this.shown || !this.display || !this.mesh) return;
+    try {
+      this.painter.frame(this.sources(), this.display, 'preview', 'all', this.seed, { height: true, overlay: false });
+    } catch {
+      // Warm-up only: a real playback frame reports its own failure.
+    }
+    this.idleArm();
   };
 
   /* ------------------------------------------------------------------ */
@@ -373,6 +476,7 @@ export class PaintHost {
   }
 
   private paintFrame(kind: FrameMessage['kind'], quality: PaintQuality, parts: PaintParts, reqId: number, epoch: number): FrameMessage {
+    this.idleDisarm();
     const d = this.display!;
     const src = this.sources();
     const snap = src.snapshot!;
@@ -391,8 +495,10 @@ export class PaintHost {
       type: 'frame', frameId: ++this.frameId, reqId, epoch, kind, quality, layer: d.layer, month: d.month,
       width: p.width, height: p.height, rgba: p.rgba, heightMap: p.heightMap, overlay: p.overlay, overlayRepainted: p.overlayRepainted,
       snapshotId: snap.id, time: snap.time, climateId: src.climate?.id ?? 0, keyframe: this.shown!.keyframe, paintMs: p.ms,
+      painter: this.slot, showSeq: this.shownSeq, playFrom: kind === 'play' ? this.playFrom : undefined,
     };
     this.env.post(frame, transferList(p.rgba, p.heightMap, p.overlay));
+    if (kind === 'still') this.idleArm();
     return frame;
   }
 }

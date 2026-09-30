@@ -24,6 +24,19 @@ export const CH_RIDGE = 0;
 export const CH_HILL = 1;
 export const CH_COAST = 2;
 export const CH_LITH = 3;
+/**
+ * Texel layout: DETAIL_STRIDE Int16 values per texel, scaled by DETAIL_SCALE — the four channels
+ * above at the texel's direction, then CH_RIDGE / CH_HILL / CH_COAST at the ROTATED direction
+ * (x, y, z) → (y, z, x) (CH_RIDGE2 / CH_HILL2 / CH_COAST2): independent plate-frame noises for
+ * colouring, read from the same texels (one bilinear footprint instead of two). The rotation maps
+ * the equi-angular cube grid onto itself, so these channels are exact copies of other texels.
+ */
+export const CH_RIDGE2 = 4;
+export const CH_HILL2 = 5;
+export const CH_COAST2 = 6;
+export const DETAIL_STRIDE = 8;
+/** Int16 → value scale of DetailTexture.data (range ±4). */
+export const DETAIL_SCALE = 1 / 8192;
 
 /** Fixed resolution of the coarse (low-octave) cube, per face edge. */
 const COARSE_N = 128;
@@ -45,9 +58,9 @@ const FINE_GAIN = 0.74;
 const COAST_GAIN = 0.88;
 const RIDGE: OctaveSet = { f0: 7, gain: 0.6, octaves: 7 };
 /** Gain of the fine ridged octaves (sharper pixel-scale ridges/valleys in mountain belts). */
-const RIDGE_FINE_GAIN = 0.8;
+const RIDGE_FINE_GAIN = 0.9;
 /** Ridged cascade: next-octave weight = clamp(RIDGE_W0 + RIDGE_W1·s) (softer than Musgrave's 2·s). */
-const RIDGE_W0 = 0.35;
+const RIDGE_W0 = 0.45;
 const RIDGE_W1 = 1.4;
 const LITH: OctaveSet = { f0: 3.5, gain: 0.5, octaves: 3 };
 const WARP_F = [1.8, 3.9];
@@ -105,8 +118,8 @@ export interface DetailTexture {
   n: number;
   /** n + 2. */
   stride: number;
-  /** 6·stride²·DETAIL_CHANNELS floats, layout ((face·stride + j)·stride + i)·C + ch. */
-  data: Float32Array;
+  /** 6·stride²·DETAIL_STRIDE Int16 (× DETAIL_SCALE), layout ((face·stride + j)·stride + i)·DETAIL_STRIDE + ch. */
+  data: Int16Array;
   /** Highest noise frequency (features/radian) represented. */
   fmax: number;
   /**
@@ -118,6 +131,11 @@ export interface DetailTexture {
   ridgeUp: number;
   coastAbs: number;
   hillAbs: number;
+  /**
+   * Mean |CH_COAST| over the texture. It grows with the resolution (finer octaves), so terms
+   * centred on it (the fine orogenic ridges) stay zero-mean at every resolution / quality.
+   */
+  coastMeanAbs: number;
 }
 
 /** Face resolution used for an output raster of width w (texel ≈ equatorial pixel). */
@@ -266,8 +284,9 @@ export function buildDetailTexture(seed: number, n: number): DetailTexture {
   const coarse = buildCoarse(nz);
   const stride = n + 2;
   const cStride = COARSE_N + 2;
-  const C = DETAIL_CHANNELS;
-  const data = new Float32Array(6 * stride * stride * C);
+  const S = DETAIL_STRIDE, K = 1 / DETAIL_SCALE;
+  const data = new Int16Array(6 * stride * stride * S);
+  let rs = 0, rMax = 0, cAbs = 0, hAbs = 0, cSum = 0;
   // Texel size (π/2)/n; simplex features span ~2/f, so ~3 texels per feature at fmax.
   const fmax = n / Math.PI;
   const ts = texelTs(n);
@@ -337,31 +356,45 @@ export function buildDetailTexture(seed: number, n: number): DetailTexture {
           rw = RIDGE_W0 + RIDGE_W1 * s > 1 ? 1 : RIDGE_W0 + RIDGE_W1 * s;
           rsum += ridA[m] * s;
         }
-        const q = ((face * stride + j) * stride + i) * C;
-        data[q + CH_RIDGE] = rsum / RIDGE_NORM;
-        data[q + CH_HILL] = hsum;
-        data[q + CH_COAST] = csum;
-        data[q + CH_LITH] = cs[K_LITH];
+        const q = ((face * stride + j) * stride + i) * S;
+        const rv = rsum / RIDGE_NORM;
+        rs += rv;
+        if (rv > rMax) rMax = rv;
+        if ((csum < 0 ? -csum : csum) > cAbs) cAbs = csum < 0 ? -csum : csum;
+        cSum += csum < 0 ? -csum : csum;
+        if ((hsum < 0 ? -hsum : hsum) > hAbs) hAbs = hsum < 0 ? -hsum : hsum;
+        // Int16 stores truncate (≤ DETAIL_SCALE of error); the values stay well inside ±4.
+        data[q + CH_RIDGE] = rv * K;
+        data[q + CH_HILL] = hsum * K;
+        data[q + CH_COAST] = csum * K;
+        data[q + CH_LITH] = cs[K_LITH] * K;
       }
     }
   }
-  let rs = 0, rMax = 0, cAbs = 0, hAbs = 0;
-  for (let q = 0; q < data.length; q += C) {
-    const rv = data[q + CH_RIDGE], cv = Math.abs(data[q + CH_COAST]), hv = Math.abs(data[q + CH_HILL]);
-    rs += rv;
-    if (rv > rMax) rMax = rv;
-    if (cv > cAbs) cAbs = cv;
-    if (hv > hAbs) hAbs = hv;
+  const ridgeMean = rs / (6 * stride * stride);
+  // Rotated-direction channels: the direction (y, z, x) of texel (face, j, i) is texel
+  // (face + 4, j, i) for the x faces, (face − 2, i, j) for the y and z faces.
+  for (let face = 0; face < 6; face++) {
+    const rf = face < 2 ? face + 4 : face - 2;
+    for (let j = 0; j < stride; j++) {
+      for (let i = 0; i < stride; i++) {
+        const o = ((face * stride + j) * stride + i) * S;
+        const r = face < 2 ? ((rf * stride + j) * stride + i) * S : ((rf * stride + i) * stride + j) * S;
+        data[o + CH_RIDGE2] = data[r + CH_RIDGE];
+        data[o + CH_HILL2] = data[r + CH_HILL];
+        data[o + CH_COAST2] = data[r + CH_COAST];
+      }
+    }
   }
-  const ridgeMean = rs / (data.length / C);
-  return { n, stride, data, fmax, ridgeMean, ridgeUp: rMax - ridgeMean, coastAbs: cAbs, hillAbs: hAbs };
+  return { n, stride, data, fmax, ridgeMean, ridgeUp: rMax - ridgeMean, coastAbs: cAbs, hillAbs: hAbs, coastMeanAbs: cSum / (6 * stride * stride) };
 }
 
 /**
- * Bilinear sample of all channels at unit direction (x, y, z) in the texture's frame; writes
- * DETAIL_CHANNELS values to out[o..]. Hot path: no allocation.
+ * Bilinear sample at unit direction (x, y, z) in the texture's frame; writes the first `channels`
+ * texel channels (default DETAIL_CHANNELS; up to 7 with the rotated-direction ones) to out[o..].
+ * Hot path: no allocation.
  */
-export function sampleDetail(tex: DetailTexture, x: number, y: number, z: number, out: Float64Array, o: number): void {
+export function sampleDetail(tex: DetailTexture, x: number, y: number, z: number, out: Float64Array, o: number, channels = DETAIL_CHANNELS): void {
   const ax = x < 0 ? -x : x, ay = y < 0 ? -y : y, az = z < 0 ? -z : z;
   let face: number, u: number, v: number;
   if (ax >= ay && ax >= az) {
@@ -389,11 +422,11 @@ export function sampleDetail(tex: DetailTexture, x: number, y: number, z: number
   if (j0 > n) j0 = n;
   const fu = su - i0, fv = sv - j0;
   const d = tex.data;
-  const q00 = ((face * stride + j0) * stride + i0) << 2;
-  const q10 = q00 + (stride << 2);
-  const a = (1 - fu) * (1 - fv), b = fu * (1 - fv), c = (1 - fu) * fv, e = fu * fv;
-  out[o] = a * d[q00] + b * d[q00 + 4] + c * d[q10] + e * d[q10 + 4];
-  out[o + 1] = a * d[q00 + 1] + b * d[q00 + 5] + c * d[q10 + 1] + e * d[q10 + 5];
-  out[o + 2] = a * d[q00 + 2] + b * d[q00 + 6] + c * d[q10 + 2] + e * d[q10 + 6];
-  out[o + 3] = a * d[q00 + 3] + b * d[q00 + 7] + c * d[q10 + 3] + e * d[q10 + 7];
+  const q00 = ((face * stride + j0) * stride + i0) << 3;
+  const q10 = q00 + (stride << 3);
+  const S = DETAIL_SCALE;
+  const a = (1 - fu) * (1 - fv) * S, b = fu * (1 - fv) * S, c = (1 - fu) * fv * S, e = fu * fv * S;
+  for (let k = 0; k < channels; k++) {
+    out[o + k] = a * d[q00 + k] + b * d[q00 + 8 + k] + c * d[q10 + k] + e * d[q10 + 8 + k];
+  }
 }

@@ -54,6 +54,14 @@ export interface CloudInputs {
   /** n land fraction; 12*n sea-ice fraction. */
   landFraction: Float32Array;
   seaIce: Float32Array;
+  /**
+   * Optional 12*n condensation reference r0 of each cell (the humidity-gate threshold without its
+   * storm-track shift): the layer-cloud RH is taken relative to it (× (gateThreshold / r0)^e), since
+   * cloud forms as the column approaches its own condensation onset, which sub-grid variability
+   * (land surfaces, surface-heated convection, the ice phase) lowers below the oceanic reference;
+   * e = cloudThresholdExponent < 1 because part of that variance is dry (desert boundary layers).
+   */
+  gateR0?: Float32Array;
   /** Optional 12*n normalized ascent (negative = subsidence) and storm-track index, and air temperature (°C). */
   ascent?: Float32Array;
   storm?: Float32Array;
@@ -62,7 +70,7 @@ export interface CloudInputs {
 
 /** 12*n cloud-cover field. */
 export function computeCloudCover(inp: CloudInputs, t: HydroTuning, out: Float32Array): void {
-  const { n, rh, precip, stab, landFraction, seaIce, ascent, storm, temp } = inp;
+  const { n, rh, precip, stab, landFraction, seaIce, ascent, storm, temp, gateR0 } = inp;
   const daysPerMonth = SECONDS_PER_MONTH / 86400;
   for (let m = 0; m < 12; m++) {
     for (let i = 0; i < n; i++) {
@@ -70,7 +78,8 @@ export function computeCloudCover(inp: CloudInputs, t: HydroTuning, out: Float32
       const lf = landFraction[i];
       const ice = seaIce[k];
       const openWater = (1 - (lf > 1 ? 1 : lf > 0 ? lf : 0)) * (1 - (ice > 1 ? 1 : ice > 0 ? ice : 0));
-      out[k] = cloudCover(rh[k], precip[k] / daysPerMonth, stab[k], openWater, t, ascent ? ascent[k] : 0, storm ? storm[k] : 0, temp ? temp[k] : 20);
+      const r = gateR0 && gateR0[k] > 0.05 ? rh[k] * Math.pow(t.gateThreshold / gateR0[k], t.cloudThresholdExponent) : rh[k];
+      out[k] = cloudCover(r, precip[k] / daysPerMonth, stab[k], openWater, t, ascent ? ascent[k] : 0, storm ? storm[k] : 0, temp ? temp[k] : 20);
     }
   }
 }

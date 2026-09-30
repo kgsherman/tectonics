@@ -2,8 +2,7 @@
  * CPU shading for the 2D map (pure; operates on typed arrays):
  *  - relief hillshade from the height map, matching the globe's 'relief' mode (light 35° above the
  *    horizon from the north-west, 1.0 on flat ground, seas flat at the display sea level);
- *  - day/night shading for 'sun' mode from the solar zenith angle;
- *  - cloud alpha from a cover field and a static noise field (same thresholding as the globe).
+ *  - day/night shading for 'sun' mode from the solar zenith angle.
  */
 import { PLANET_RADIUS_M, SHADE_EXAGGERATION } from './viewUtil';
 
@@ -116,40 +115,6 @@ export function nightShade(w: number, h: number, declination: number, sunLon: nu
       img[i + 1] = 4;
       img[i + 2] = 12;
       img[i + 3] = Math.round(255 * Math.min(1, Math.max(0, 1 - light)));
-    }
-  }
-  return img;
-}
-
-/**
- * Cloud RGBA (white, alpha) at w×h from a cover grid (cw×ch, bilinear) and a matching uniformized
- * noise field `uni` (w×h, values ~uniform in [0,1]): covered where uni > 1 − cover.
- */
-export function cloudAlpha(
-  cover: Float32Array, cw: number, ch: number, uni: Float32Array, w: number, h: number, opacity: number, out?: Uint8ClampedArray,
-): Uint8ClampedArray {
-  const img = out && out.length === w * h * 4 ? out : new Uint8ClampedArray(w * h * 4);
-  for (let r = 0; r < h; r++) {
-    let fr = ((r + 0.5) * ch) / h - 0.5;
-    if (fr < 0) fr = 0;
-    else if (fr > ch - 1) fr = ch - 1;
-    const r0 = Math.floor(fr), r1 = Math.min(ch - 1, r0 + 1), tr = fr - r0;
-    for (let c = 0; c < w; c++) {
-      let fc = ((c + 0.5) * cw) / w - 0.5;
-      if (fc < 0) fc += cw;
-      const c0 = Math.floor(fc) % cw, c1 = (c0 + 1) % cw, tc = fc - Math.floor(fc);
-      const v00 = cover[r0 * cw + c0], v01 = cover[r0 * cw + c1], v10 = cover[r1 * cw + c0], v11 = cover[r1 * cw + c1];
-      let cov = (v00 * (1 - tc) + v01 * tc) * (1 - tr) + (v10 * (1 - tc) + v11 * tc) * tr;
-      cov = cov === cov ? Math.min(1, Math.max(0, cov)) : 0;
-      const thr = 1 - cov;
-      const u = uni[r * w + c];
-      // Same shaping as the globe shader: edge at the coverage threshold, thickness from the noise.
-      const x = Math.min(1, Math.max(0, (u - (thr - 0.035)) / 0.085));
-      const y = Math.min(1, Math.max(0, (u - 0.12) / 0.83));
-      const alpha = x * x * (3 - 2 * x) * (0.42 + 0.58 * y * y * (3 - 2 * y)) * opacity;
-      const i = 4 * (r * w + c);
-      img[i] = img[i + 1] = img[i + 2] = 255;
-      img[i + 3] = cov < 0.004 ? 0 : Math.round(255 * alpha);
     }
   }
   return img;

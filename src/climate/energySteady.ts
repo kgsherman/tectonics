@@ -5,7 +5,7 @@
  *  2. analytic periodic local solution: T(t) = T̄ + Re Σ_h F̂_h e^{ihωt} / (λ + ihωC) for the annual
  *     and semi-annual harmonics of the absorbed insolation, used as the Jan 1 initial state.
  */
-import { snowCoverFactor, snowWeight, syncOceanAirT, type EbmModel, type EbmState } from './energy';
+import { iceSheetWeight, snowCoverFactor, snowWeight, syncOceanAirT, type EbmModel, type EbmState } from './energy';
 import { makeCyclicWork, solveCyclic } from './numerics';
 import { ebmTuning, spinupTuning } from './tuning';
 
@@ -23,7 +23,8 @@ function cellAlbedo(M: EbmModel, i: number, j: number, t: number): number {
   const aI = ebmTuning.albedoIce;
   if (M.land[i]) {
     const a0 = M.albLand[j];
-    return a0 + (aI - a0) * snowWeight(t - M.lapse[i]) * snowCoverFactor(t - M.lapse[i], M.lapse[i]);
+    const ts = t - M.lapse[i];
+    return a0 + (aI - a0) * snowWeight(ts) * snowCoverFactor(iceSheetWeight(ts), M.lapse[i]);
   }
   const a0 = M.albWater[j];
   return a0 + (aI - a0) * snowWeight(t);
@@ -184,13 +185,17 @@ export function periodicInit(M: EbmModel, Tbar: Float64Array, S: EbmState): void
         S.T[i] = T0;
         S.E[i] = 0;
         S.Ti[i] = 0;
+        // Cold land starts glaciated; the mass balance keeps or removes the ice (energyStep.ts).
+        S.M[i] = tb - M.lapse[i] < t.glacierInitT ? t.glacierMassMax : 0;
       } else if (T0 > Tf) {
         S.E[i] = cOcean[j] * (T0 - Tf);
         S.Ti[i] = Tf;
+        S.Ai[i] = 0;
       } else {
         // Ice: thicker for colder mean states, capped.
         S.E[i] = -eFull * Math.min(4, 1 + (Tf - tb) / 10);
         S.Ti[i] = Math.min(Tf, T0);
+        S.Ai[i] = 1;
       }
     }
   }

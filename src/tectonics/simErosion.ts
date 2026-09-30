@@ -5,7 +5,7 @@ import {
 import { markReleased } from './simDirty';
 import { hash01 } from './simHash';
 import { FRONT_SUBDUCTION, type StepScratch } from './simScratch';
-import type { PlateSlot, SimState } from './simState';
+import { markUnowned, type PlateSlot, type SimState } from './simState';
 
 /** Salt separating the erosion draws from other per-cell random draws of the same step. */
 const EROSION_SALT = 0x5eed_e205;
@@ -45,7 +45,7 @@ export function tectonicErosion(state: SimState, sc: StepScratch, dt: number): v
     for (let q2 = adjOffset[i], e = adjOffset[i + 1]; q2 < e; q2++) if (top[adj[q2]] !== T) k++;
     const shape = Math.min(4, 0.25 * k * k);
     if (!(hash01(seed, step, i, 0) < perStep * speed * shape)) continue;
-    P.owned[j] = 0;
+    markUnowned(P, j);
     P.ownedCount--;
     markReleased(state, i);
     counters.tectonicErosion++;

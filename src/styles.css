@@ -86,8 +86,12 @@ button.wg-chip:hover { border-color: var(--wg-border); color: var(--wg-text); }
 .wg-chip .wg-dot.is-live { background: var(--wg-accent-2); box-shadow: 0 0 8px var(--wg-accent-2); }
 .wg-chip .wg-dot.is-busy { background: var(--wg-warn); animation: wg-pulse 1.2s ease-in-out infinite; }
 .wg-chip .wg-dot.is-error { background: var(--wg-danger); }
-.wg-tasks { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 320px; color: var(--wg-text-dim); font-size: 12px; opacity: 0; transition: opacity 0.2s; }
-.wg-tasks.is-visible { opacity: 1; }
+.wg-tasks {
+  display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 320px; color: var(--wg-text-dim); font-size: 12px;
+  opacity: 0; visibility: hidden; transition: opacity 0.2s, visibility 0s linear 0.2s;
+}
+/* Hidden (idle) the finished task's label leaves the accessibility tree too. */
+.wg-tasks.is-visible { opacity: 1; visibility: visible; transition: opacity 0.2s; }
 .wg-tasks-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wg-spinner {
   width: 14px; height: 14px; border-radius: 50%; flex: none;
@@ -152,6 +156,8 @@ button.wg-chip:hover { border-color: var(--wg-border); color: var(--wg-text); }
 .wg-range:hover::-webkit-slider-thumb { transform: scale(1.12); }
 .wg-range:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--wg-accent-soft), 0 1px 3px rgba(0,0,0,0.5); }
 .wg-range:disabled { cursor: default; }
+/* Timeline sliders sit outside .wg-field: dim them when disabled (history while editing plates). */
+.wg-timeline .wg-range:disabled { opacity: 0.4; }
 
 .wg-input, .wg-select {
   height: 30px; padding: 0 9px; border-radius: 6px; border: 1px solid var(--wg-border); background: var(--wg-bg); color: var(--wg-text);
@@ -280,8 +286,13 @@ button.wg-chip:hover { border-color: var(--wg-border); color: var(--wg-text); }
 
 .wg-view-perf { position: absolute; left: 12px; bottom: 12px; padding: 5px 10px; font-size: 11.5px; color: var(--wg-text-dim); z-index: 3; font-variant-numeric: tabular-nums; }
 .wg-view-perf[hidden] { display: none; }
-.wg-view-render { position: absolute; top: 58px; right: 12px; z-index: 3; display: flex; align-items: center; gap: 8px; padding: 5px 10px; font-size: 12px; color: var(--wg-text-dim); opacity: 0; transition: opacity 0.25s; pointer-events: none; }
-.wg-view-render.is-visible { opacity: 1; }
+.wg-view-render {
+  position: absolute; top: 58px; right: 12px; z-index: 3; display: flex; align-items: center; gap: 8px; padding: 5px 10px; font-size: 12px;
+  color: var(--wg-text-dim); opacity: 0; visibility: hidden; transition: opacity 0.25s, visibility 0s linear 0.25s; pointer-events: none;
+}
+.wg-view-render.is-visible { opacity: 1; visibility: visible; transition: opacity 0.25s; }
+.wg-view-render-detail { min-width: 3ch; text-align: right; color: var(--wg-text); font-variant-numeric: tabular-nums; }
+.wg-view-render-detail:empty { display: none; }
 
 .wg-view-cover {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 4;
@@ -332,6 +343,8 @@ button.wg-chip:hover { border-color: var(--wg-border); color: var(--wg-text); }
 .wg-history { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .wg-history-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 11px; color: var(--wg-text-dim); min-height: 22px; }
 .wg-history-head .wg-btn { height: 22px; padding: 0 7px; font-size: 11.5px; gap: 5px; }
+.wg-history-head > .wg-num { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wg-history-actions { display: flex; gap: 4px; flex: none; }
 .wg-history-track { position: relative; }
 .wg-ticks { position: absolute; left: 7px; right: 7px; top: 50%; height: 8px; margin-top: -4px; pointer-events: none; }
 .wg-ticks i { position: absolute; top: 0; width: 1px; height: 8px; background: rgba(139, 155, 176, 0.35); }
@@ -364,7 +377,11 @@ button.wg-chip:hover { border-color: var(--wg-border); color: var(--wg-text); }
 .wg-cat { display: grid; grid-template-columns: 12px auto 1fr; gap: 8px; align-items: center; font-size: 12px; }
 .wg-cat.is-plain { grid-template-columns: 12px 1fr; }
 .wg-cat code { font: 600 11px ui-monospace, Consolas, monospace; color: var(--wg-text); min-width: 26px; }
-.wg-cat span { color: var(--wg-text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Long category names (Köppen "Warm-summer Mediterranean continental") wrap to a second line rather than clip. */
+.wg-cat span {
+  color: var(--wg-text-dim); line-height: 1.3; overflow: hidden; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2;
+}
 .wg-legend-empty { color: var(--wg-text-faint); font-size: 12px; }
 
 .wg-inspector { display: flex; flex-direction: column; gap: 10px; }
@@ -434,7 +451,8 @@ button.wg-chip:hover { border-color: var(--wg-border); color: var(--wg-text); }
 /* ------------------------------------------------------------------ */
 
 /* Overlay toggles under the layer tiles (always visible, even on short windows). */
-.wg-overlay-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+/* Columns sized to their labels, spare width shared out: "Boundaries" never clips next to "Grid". */
+.wg-overlay-row { display: grid; grid-template-columns: auto auto auto; gap: 4px; }
 .wg-toggle-chip {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 26px; padding: 0 6px; border-radius: 13px; cursor: pointer; min-width: 0;
   white-space: nowrap; overflow: hidden;
@@ -474,11 +492,17 @@ button.wg-chip:focus-visible, .wg-picker-btn:focus-visible, .wg-layer-item:focus
 
 /* Short windows (e.g. 1280×720): a more compact inspector keeps the legend in view. */
 @media (max-height: 820px) {
+  .wg-insp-empty { flex-direction: row; justify-content: center; padding: 9px 8px; gap: 7px; }
   .wg-climograph { height: 84px; }
   .wg-right-dock { max-height: 52%; }
   .wg-right-dock .wg-section { padding-top: 9px; padding-bottom: 10px; gap: 7px; }
   .wg-cats { max-height: 150px; }
   .wg-panel-title { padding-top: 12px; }
+}
+
+/* Tall windows (e.g. 1920×1080): long legends (Köppen, satellite surfaces) use the free height instead of a small inner scroll. */
+@media (min-height: 960px) {
+  .wg-cats { max-height: 340px; }
 }
 
 /* First-run tips. */

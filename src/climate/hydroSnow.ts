@@ -31,11 +31,13 @@ export interface SnowInputs {
   land: Uint8Array;
   /** 12*n sea-ice fraction. */
   seaIce: Float32Array;
+  /** Optional n glacier / ice-sheet cover of land cells (dynamics' mass balance): perennial snow. */
+  landIce?: Float32Array;
 }
 
 /** Snow-cover fraction 0..1 (12*n) from a spun-up monthly snowpack. */
 export function computeSnowCover(inp: SnowInputs, t: HydroTuning, out: Float32Array): void {
-  const { n, temp, precip, land, seaIce } = inp;
+  const { n, temp, precip, land, seaIce, landIce } = inp;
   const ramp = t.snowTempHigh - t.snowTempLow;
   const meltPerDegreeMonth = t.degreeDayFactor * DAYS_PER_MONTH;
   const years = Math.max(1, Math.round(t.snowSpinupYears));
@@ -61,7 +63,7 @@ export function computeSnowCover(inp: SnowInputs, t: HydroTuning, out: Float32Ar
           if (!land[i]) {
             const ice = seaIce[k];
             cover *= ice > 1 ? 1 : ice > 0 ? ice : 0;
-          }
+          } else if (landIce && landIce[i] > cover) cover = landIce[i];
           out[k] = cover;
         }
         swe = end;

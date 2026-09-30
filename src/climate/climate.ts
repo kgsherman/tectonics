@@ -4,7 +4,7 @@
  */
 import { buildMeshGridMap, meshToGrid } from '../core/grid';
 import type { ClimateInput, ClimateParams, ClimateResult, KoppenGroup, MeshGridMap, SphereMesh, WorldSnapshot } from '../core/types';
-import { computeDynamics } from './dyn';
+import { computeDynamics, type DynamicsResultWithIce } from './dyn';
 import { computeHydrology } from './hydrology';
 import type { DynamicsResult, HydrologyResult } from './internal';
 import { KOPPEN_CLASSES, classifyKoppen } from './koppen';
@@ -28,11 +28,15 @@ export const DEFAULT_CLIMATE_PARAMS: ClimateParams = {
 
 /**
  * A ClimateResult as produced by computeClimate: it additionally carries the hydrology's column
- * relative humidity so a later call can warm-start the moisture solver (not part of the contract;
- * absent on results from other producers).
+ * relative humidity so a later call can warm-start the moisture solver, and the glacier / ice-sheet
+ * cover of land cells (w·h, 0..1) from the dynamics' land snow/ice mass balance with the ice-sheet
+ * surface raise above `elev` (w·h, m) that its land temperatures refer to, read back by a warm start
+ * (not part of the contract; absent on results from other producers).
  */
-interface ClimateResultWithHydro extends ClimateResult {
+export interface ClimateResultWithHydro extends ClimateResult {
   hydroRh?: Float32Array;
+  landIce?: Float32Array;
+  iceRaise?: Float32Array;
 }
 
 /* ------------------------------------------------------------------ */
@@ -170,7 +174,7 @@ export function computeClimate(
   return result;
 }
 
-function assemble(input: ClimateInput, params: ClimateParams, dyn: DynamicsResult, hydro: HydrologyResult, warm: ClimateResult | null): ClimateResultWithHydro {
+function assemble(input: ClimateInput, params: ClimateParams, dyn: DynamicsResultWithIce, hydro: HydrologyResult, warm: ClimateResult | null): ClimateResultWithHydro {
   const { w, h } = dyn;
   const N = w * h;
   const stats: Record<string, number> = {};
@@ -194,7 +198,13 @@ function assemble(input: ClimateInput, params: ClimateParams, dyn: DynamicsResul
   stats.nonFiniteFilled = filled;
   // Near-surface temperature under snow-surface inversions (diagnostic; after the hydrology, which
   // works with the boundary-layer air mass).
-  applySurfaceInversion(temp, snow, dyn.land, w, h, params, dyn.surfaceHeight, cloud);
+  let surface: ArrayLike<number> = dyn.surfaceHeight;
+  if (dyn.iceRaise) {
+    const s = new Float32Array(N);
+    for (let i = 0; i < N; i++) s[i] = dyn.surfaceHeight[i] + dyn.iceRaise[i];
+    surface = s;
+  }
+  applySurfaceInversion(temp, snow, dyn.land, w, h, params, surface, cloud, dyn.landIce);
 
   // Köppen (every cell) and annual means.
   const koppen = new Uint8Array(N);
@@ -256,6 +266,8 @@ function assemble(input: ClimateInput, params: ClimateParams, dyn: DynamicsResul
     timings: {},
     stats,
     hydroRh: hydro.rh,
+    landIce: dyn.landIce,
+    iceRaise: dyn.iceRaise,
   };
 }
 

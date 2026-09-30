@@ -35,6 +35,16 @@ const now = (): number => globalThis.performance?.now?.() ?? Date.now();
 export type DynamicsWarmStart = WarmFields;
 
 /**
+ * DynamicsResult plus the glacier / ice-sheet cover of land cells (w·h, 0..1) from the land snow/ice
+ * mass balance (not part of the internal contract; the hydrology reads it when present).
+ */
+export interface DynamicsResultWithIce extends DynamicsResult {
+  landIce?: Float32Array;
+  /** w·h ice-sheet surface raise above the bed (m): temperatures of land cells refer to surfaceHeight + iceRaise. */
+  iceRaise?: Float32Array;
+}
+
+/**
  * Compute the monthly dynamics fields for `input` on the params.gridW × gridH output grid.
  * `warm` (a previous ClimateResult / DynamicsResult on any grid) seeds the coupled pass 2 in place
  * of the pass-1 end state (pass 1 itself always runs from the steady/periodic initialization), so
@@ -45,7 +55,7 @@ export function computeDynamics(
   params: ClimateParams,
   warm?: DynamicsWarmStart | null,
   onProgress?: (fraction: number) => void,
-): DynamicsResult {
+): DynamicsResultWithIce {
   const timings: Record<string, number> = {};
   const stats: Record<string, number> = {};
   const progress = (f: number): void => onProgress?.(Math.min(1, Math.max(0, f)));
@@ -89,6 +99,9 @@ export function computeDynamics(
   const mon1 = makeMonthly(g.n);
   spinYears(M, S1, NO_COUPLING, cold.pass1Years, cold.pass1Aitken, stats, 'pass1');
   integrateYear(M, S1, NO_COUPLING, mon1);
+  // Land snow and ice always come from the cold pass 1 (deterministic in the input: glacier margins
+  // are hysteretic, and a warm start from a previous result would carry its margins along).
+  if (S !== S1) S.M.set(S1.M);
   lap('dyn.pass1');
   progress(0.35);
 
@@ -121,7 +134,7 @@ export function computeDynamics(
     {
       tAir: mon2.tAir, sst: mon2.sst, ice: mon2.ice, pressure: circ.pressure, windU: circ.windU, windV: circ.windV,
       steerU: circ.steerU, steerV: circ.steerV, ascent: circ.ascent, baroclinic: circ.baroclinic,
-      currentU: ocean.currentU, currentV: ocean.currentV, upwelling: ocean.upwelling,
+      currentU: ocean.currentU, currentV: ocean.currentV, upwelling: ocean.upwelling, landMass: mon2.mMin, iceRaise: M.iceRaise,
     },
     surf,
     params.globalTempOffset,
@@ -152,6 +165,8 @@ export function computeDynamics(
     currentU: fields.currentU,
     currentV: fields.currentV,
     upwelling: fields.upwelling,
+    landIce: fields.landIce,
+    iceRaise: fields.iceRaise,
     timings,
     stats,
   };

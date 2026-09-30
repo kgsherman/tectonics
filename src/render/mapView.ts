@@ -7,6 +7,7 @@ import { MapGlBase } from './mapGl';
 import { MapInput } from './mapInput';
 import { drawArrows, drawBrush, drawGraticule, drawMarkers } from './mapLayers';
 import { applyShade, hillshade, nightShade } from './mapShading';
+import { copyIfChanged, premultiply } from './viewBuffers';
 import { copyVectorField, DEFAULT_PARTICLE_COUNT, ParticleSystem } from './particles';
 import { MapParticles } from './particlesMap';
 import { DetailFader, heightSignature } from './viewDetail';
@@ -20,6 +21,10 @@ import { wrapLon } from './viewUtil';
 const BACKGROUND = '#05070b';
 const NIGHT_W = 360;
 const NIGHT_H = 180;
+/** A lost GPU context that was not restored after this long is replaced by a fresh one... */
+const GPU_RECREATE_AFTER_MS = 2500;
+/** ...at most this often. */
+const GPU_RECREATE_EVERY_MS = 10000;
 
 /**
  * 2D equirectangular canvas implementation of WorldView with pan/zoom and longitude wrap (SPEC.md §8.2).
@@ -30,8 +35,11 @@ const NIGHT_H = 180;
  * is hillshaded, so feed the map the unshaded image (the same one the globe gets).
  *
  * The base image itself is rendered on the GPU when WebGL2 is available (MapGlBase: smooth
- * anti-aliased coastlines from the height map and crisp relief at any zoom, shading in the shader);
- * otherwise (or after a context loss) it is drawn with Canvas 2D and hillshaded on the CPU.
+ * anti-aliased coastlines, lake and class edges from the height map and crisp relief at any zoom,
+ * shading in the shader), and so is the overlay (crisp magnified lines); otherwise they are drawn
+ * with Canvas 2D and the base is hillshaded on the CPU. A lost GPU context is re-initialised when the
+ * browser restores it (or replaced by a fresh one if it does not), so the map never stays on the
+ * fallback after a transient loss.
  */
 export class MapView implements WorldView {
   readonly kind = 'map' as const;
@@ -43,7 +51,10 @@ export class MapView implements WorldView {
   private readonly baseCtx: CanvasRenderingContext2D;
   private readonly topCtx: CanvasRenderingContext2D;
   private readonly particleLayer = new MapParticles();
-  private readonly cloudLayer = new MapClouds();
+  /** Clouds raster asynchronously in the cloud worker; redraw the base when a raster lands. */
+  private readonly cloudLayer = new MapClouds(() => {
+    this.baseDirty = true;
+  });
   private readonly baseImage = new ImageCanvas();
   private readonly shadedImage = new ImageCanvas();
   private readonly overlayImage = new ImageCanvas();
@@ -52,7 +63,9 @@ export class MapView implements WorldView {
   private readonly pointers = new PointerHub();
   private readonly input: MapInput;
   private readonly resizeObserver: ResizeObserver;
-  private readonly gpu: MapGlBase | null;
+  private gpu: MapGlBase | null;
+  /** performance.now() of the last attempt to replace a lost GPU context. */
+  private gpuRetryAt = 0;
   private readonly detailFader = new DetailFader();
   private detailAmount = 1;
   /** Detail strength of the last GPU base draw. */
@@ -71,6 +84,13 @@ export class MapView implements WorldView {
   private baseW = 0;
   private baseH = 0;
   private hasOverlay = false;
+  /** Straight-alpha copy of the overlay (Canvas 2D fallback, context restore) and its premultiplied twin (GPU). */
+  private overlayRgba: Uint8ClampedArray | null = null;
+  private overlayPremul: Uint8Array | null = null;
+  private overlayW = 0;
+  private overlayH = 0;
+  /** The Canvas 2D copy of the overlay is stale (only maintained for the CPU fallback). */
+  private overlayImageStale = false;
   private shade: Float32Array | null = null;
   private seaLevel = 0;
   private lighting: LightingMode = { mode: 'relief' };
@@ -104,7 +124,7 @@ export class MapView implements WorldView {
     this.topCtx = context2d(this.topCanvas);
     this.root.append(this.baseCanvas, this.particleLayer.canvas, this.topCanvas);
     container.appendChild(this.root);
-    this.gpu = MapGlBase.create();
+    this.gpu = this.attachGpu(MapGlBase.create());
 
     this.input = new MapInput({
       root: this.root,
@@ -131,10 +151,13 @@ export class MapView implements WorldView {
   setBaseImage(rgba: Uint8ClampedArray, width: number, height: number): void {
     const n = width * height * 4;
     if (!(width > 0 && height > 0) || rgba.length < n) throw new Error(`MapView.setBaseImage: expected ${width}x${height}x4 bytes`);
+    const sameSize = this.baseRgba !== null && this.baseRgba.length === n && this.baseW === width && this.baseH === height;
     if (!this.baseRgba || this.baseRgba.length !== n) this.baseRgba = new Uint8ClampedArray(n);
-    this.baseRgba.set(rgba.subarray(0, n));
+    const changed = copyIfChanged(rgba, this.baseRgba, width * height) || !sameSize;
     this.baseW = width;
     this.baseH = height;
+    // Identical resend (pause re-push, lighting-only changes): nothing to upload or re-shade.
+    if (!changed && (this.gpuActive ? this.gpu!.hasBase : !this.baseImageStale)) return;
     if (this.gpuActive) {
       this.gpu!.setBase(this.baseRgba, width, height);
       this.baseImageStale = true;
@@ -147,7 +170,8 @@ export class MapView implements WorldView {
 
   setHeightMap(height: Float32Array | null, width: number, height_: number): void {
     if (height) {
-      this.heights.set(height, width, height_);
+      // Identical resend (month/layer change): no upload, no re-shade.
+      if (!this.heights.set(height, width, height_) && (!this.gpuActive || this.gpu!.hasHeight)) return;
       this.detailFader.noteHeights(heightSignature(height, width * height_), performance.now());
     } else {
       this.heights.clear();
@@ -170,7 +194,32 @@ export class MapView implements WorldView {
       throw new Error(`MapView.setOverlayImage: expected ${width}x${height}x4 bytes`);
     }
     this.hasOverlay = rgba !== null;
-    if (rgba) this.overlayImage.put(rgba, width, height);
+    if (!rgba) {
+      this.gpu?.setOverlay(null, 0, 0);
+      this.baseDirty = true;
+      return;
+    }
+    const n = width * height;
+    if (!this.overlayRgba || this.overlayRgba.length !== 4 * n) {
+      this.overlayRgba = new Uint8ClampedArray(4 * n);
+      this.overlayPremul = new Uint8Array(4 * n);
+      this.overlayImageStale = true;
+    }
+    const sameSize = width === this.overlayW && height === this.overlayH;
+    this.overlayW = width;
+    this.overlayH = height;
+    const changed = copyIfChanged(rgba, this.overlayRgba, n) || !sameSize;
+    if (changed) this.overlayImageStale = true;
+    if (this.gpuActive) {
+      // Unchanged overlays (month/layer changes) are neither re-premultiplied nor re-uploaded.
+      if (changed || !this.gpu!.hasOverlay) {
+        premultiply(this.overlayRgba, this.overlayPremul!, n);
+        this.gpu!.setOverlay(this.overlayPremul, width, height);
+      }
+    } else if (this.overlayImageStale) {
+      this.overlayImage.put(this.overlayRgba, width, height);
+      this.overlayImageStale = false;
+    }
     this.baseDirty = true;
   }
 
@@ -384,6 +433,7 @@ export class MapView implements WorldView {
 
   /** Redraws the base and annotation canvases if dirty. */
   private renderStatic(): void {
+    this.reviveGpu(performance.now());
     if (this.shadeDirty) this.updateShading();
     if (this.lighting.mode === 'sun') this.updateNight();
     if (this.baseDirty) this.drawBase();
@@ -452,13 +502,22 @@ export class MapView implements WorldView {
     }
     if (this.cloudLayer.active) layers.push(this.cloudLayer.canvas);
     if (this.lighting.mode === 'sun') layers.push(this.nightImage.canvas);
-    if (this.hasOverlay) layers.push(this.overlayImage.canvas);
+    // Overlay on top: a GPU pass (crisp when magnified) when the GPU base ran, else Canvas 2D.
+    const gpuOverlay = this.hasOverlay && gpuBase !== null && this.gpu!.hasOverlay;
+    if (this.hasOverlay && !gpuOverlay) {
+      this.ensureCpuOverlay();
+      layers.push(this.overlayImage.canvas);
+    }
     for (const k of mapWorldCopies(t)) {
       const r = mapWorldRect(t, k);
       // Snap to device pixels so adjacent copies meet without a hairline seam.
       const x0 = Math.round(r.x * dpr) / dpr, x1 = Math.round((r.x + r.w) * dpr) / dpr;
       const y0 = Math.round(r.y * dpr) / dpr, y1 = Math.round((r.y + r.h) * dpr) / dpr;
       for (const c of layers) ctx.drawImage(c, x0, y0, x1 - x0, y1 - y0);
+    }
+    if (gpuOverlay) {
+      const ov = this.gpu!.renderOverlay({ t, dpr });
+      if (ov) ctx.drawImage(ov, 0, 0, t.width, t.height);
     }
     if (this.graticuleStep > 0) drawGraticule(ctx, t, this.graticuleStep);
   }
@@ -472,6 +531,51 @@ export class MapView implements WorldView {
       this.shadeDirty = true;
     }
     if (this.shadeDirty) this.updateShading();
+  }
+
+  /** Brings the Canvas 2D overlay up to date after running on the GPU path. */
+  private ensureCpuOverlay(): void {
+    if (!this.overlayImageStale || !this.overlayRgba) return;
+    this.overlayImage.put(this.overlayRgba, this.overlayW, this.overlayH);
+    this.overlayImageStale = false;
+  }
+
+  /** Wires a (new) GPU layer: re-sends the current images whenever its context is restored. */
+  private attachGpu(gpu: MapGlBase | null): MapGlBase | null {
+    if (gpu) gpu.onRestored = () => this.uploadAllToGpu();
+    return gpu;
+  }
+
+  /** Sends base, height and overlay to the GPU layer (after a context restore or replacement). */
+  private uploadAllToGpu(): void {
+    const gpu = this.gpu;
+    if (!gpu || !gpu.usable || this.disposed) return;
+    if (this.baseRgba) {
+      gpu.setBase(this.baseRgba, this.baseW, this.baseH);
+      this.baseImageStale = true;
+    }
+    if (this.heights.present) gpu.setHeight(this.heights.data, this.heights.w, this.heights.h);
+    if (this.hasOverlay && this.overlayRgba && this.overlayPremul) {
+      premultiply(this.overlayRgba, this.overlayPremul, this.overlayW * this.overlayH);
+      gpu.setOverlay(this.overlayPremul, this.overlayW, this.overlayH);
+    }
+    this.baseDirty = true;
+  }
+
+  /**
+   * A GPU context lost and not restored by the browser (e.g. evicted for exceeding the per-page
+   * context limit) is replaced by a fresh one after a grace period, rate-limited.
+   */
+  private reviveGpu(nowMs: number): void {
+    const gpu = this.gpu;
+    if (!gpu || gpu.usable || gpu.lostAt === 0 || this.disposed) return;
+    if (nowMs - gpu.lostAt < GPU_RECREATE_AFTER_MS || nowMs - this.gpuRetryAt < GPU_RECREATE_EVERY_MS) return;
+    this.gpuRetryAt = nowMs;
+    const fresh = MapGlBase.create();
+    if (!fresh) return;
+    gpu.dispose();
+    this.gpu = this.attachGpu(fresh);
+    this.uploadAllToGpu();
   }
 
   private drawTop(): void {

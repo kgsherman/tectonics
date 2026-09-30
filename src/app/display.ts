@@ -19,7 +19,16 @@ export function displaySettings(s: AppState): DisplaySettings {
     fullHeight: PAINT_FULL.h,
     previewWidth: PAINT_PREVIEW.w,
     previewHeight: PAINT_PREVIEW.h,
+    flowGlyphs: flowGlyphs(s),
   };
+}
+
+/**
+ * The currents layer draws its arrow streamlets unless current particles animate the same flow
+ * over it (white glyphs under white streaks read as noise).
+ */
+export function flowGlyphs(s: AppState): boolean {
+  return !(s.settings.view.layer === 'currents' && s.settings.view.particles === 'currents');
 }
 
 /** World settings minus the app-only mesh resolution. */

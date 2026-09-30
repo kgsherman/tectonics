@@ -59,6 +59,11 @@ export interface MonthForcing {
   substeps: Uint8Array;
   /** Per-cell gate threshold r0 − storm-track shift. */
   gateR0: Float32Array;
+  /**
+   * Per-cell condensation reference for cloud: the gate threshold without the storm-track shift
+   * (frontal cloud has its own regime in hydroCloud.ts).
+   */
+  cloudR0: Float32Array;
 }
 
 /** Scratch buffers reused across months. */
@@ -132,6 +137,7 @@ export function allocMonthForcing(n: number): MonthForcing {
     compression: f(),
     substeps: new Uint8Array(n),
     gateR0: f(),
+    cloudR0: f(),
   };
 }
 
@@ -308,6 +314,7 @@ export function computeMonthForcing(
       const icePhase = t.icePhaseGate > 0 && tCol < 0 ? 1 - t.icePhaseGate * (1 - iceToWaterSaturation(tCol)) : 1;
       const r0 = t.gateThreshold * icePhase - gateThresholdShift(lf, T + lapse - tRef, asc, baro, t);
       f.gateR0[i] = r0;
+      f.cloudR0[i] = t.gateThreshold * icePhase - gateThresholdShift(lf, T + lapse - tRef, asc, 0, t);
       f.substeps[i] = substepsFor(mult, invTauP, t.gateSteepness, r0, dt, t.sinkStiffnessBound, t.maxSinkSubsteps);
 
       // Bulk ocean evaporation coefficients on the open-water fraction.

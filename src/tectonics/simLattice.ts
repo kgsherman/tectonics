@@ -2,7 +2,7 @@ import { nearestCell } from '../core/sphereMesh';
 import { CRUST_OCEANIC } from '../core/types';
 import { oceanDepthForAge } from './draft';
 import { walkFrom } from './simMesh';
-import { slotBit, type PlateSlot, type SimState } from './simState';
+import { markOwned, markUnowned, slotBit, type PlateSlot, type SimState } from './simState';
 
 // Small helpers shared by the passes that edit plate lattices (gaps, specks, merges).
 
@@ -98,13 +98,13 @@ export function copyLatticeCell(from: PlateSlot, jf: number, to: PlateSlot, jt: 
 
 /** Take ownership of lattice cell j for plate P (its properties must be written by the caller). */
 export function claimCell(P: PlateSlot, j: number): void {
-  P.owned[j] = 1;
+  markOwned(P, j);
   P.ownedCount++;
 }
 
 /** Remove lattice cell j from plate P (transferred elsewhere, or consumed when `subducted`). */
 export function releaseCell(state: SimState, P: PlateSlot, j: number, subducted: boolean): void {
-  P.owned[j] = 0;
+  markUnowned(P, j);
   P.ownedCount--;
   if (subducted) state.counters.subductedCells++;
 }

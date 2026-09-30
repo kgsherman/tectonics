@@ -34,16 +34,26 @@ export const RIFT_BASIN_DROP = 150;
  * crustal column stacked onto the overriding plate is worth ≈ 35 km·(1 − ρc/ρm) ≈ 5 km of relief.
  */
 export const COLLISION_THICKNESS_PROXY = 4500;
-/** Subduction uplift rate at the kernel peak, m/Myr per km/Myr of convergence. */
-export const SUBDUCTION_UPLIFT_RATE = 1.4;
-/** Uplift factor of island arcs (oceanic overriding plate): arcs must build ~5 km of relief. */
-export const ARC_OCEANIC_FACTOR = 2.5;
+/**
+ * Subduction uplift rate at the kernel peak, m/Myr per km/Myr of convergence. With the erosion below an
+ * Andean margin converging at 50 km/Myr builds a ~3.6 km crest in 40 Myr and ~4.7 km in 60 Myr (100k cells).
+ */
+export const SUBDUCTION_UPLIFT_RATE = 2.1;
+/**
+ * Uplift factor of island arcs (oceanic overriding plate): arcs must build ~5 km of relief. The arc rate
+ * SUBDUCTION_UPLIFT_RATE × ARC_OCEANIC_FACTOR stays 3.5 m/Myr per km/Myr (arc growth and the juvenile
+ * crust budget are calibrated on it).
+ */
+export const ARC_OCEANIC_FACTOR = 3.5 / SUBDUCTION_UPLIFT_RATE;
 /** Arc crust rising above this converts to continental crust, m. */
 export const ARC_CONVERSION_ELEV = 0;
-/** Continental-margin (cordillera) kernel: peak distance / rise width / fall width / cutoff, km. */
+/**
+ * Continental-margin (cordillera) kernel: peak distance / rise width / fall width, km. A distinct range
+ * ~150–400 km inland rather than a broad swell (the back-arc beyond ~500 km stays low).
+ */
 export const CORDILLERA_PEAK_KM = 230;
-export const CORDILLERA_RISE_KM = 150;
-export const CORDILLERA_FALL_KM = 320;
+export const CORDILLERA_RISE_KM = 120;
+export const CORDILLERA_FALL_KM = 240;
 /** Island-arc kernel on oceanic overriding plates, km. */
 export const ARC_PEAK_KM = 160;
 export const ARC_RISE_KM = 90;
@@ -147,9 +157,14 @@ export const JUVENILE_AGE = 200;
 export const CRATON_AGE = 2000;
 /** Relaxation time of juvenile continental crust toward its freeboard, Myr. */
 export const TAU_JUVENILE = 50;
-/** Erosion e-folding times, Myr: whole continental excess, orogenic excess above +1 km. */
-export const TAU_CONTINENT = 250;
-export const TAU_OROGEN = 60;
+/**
+ * Erosion e-folding times, Myr: whole continental excess, orogenic excess above +1 km (SPEC: τ ≈ 150–300
+ * and ≈ 40–80 Myr). Together with the diffusion below (100k cells), an inactive ~4.7 km cordillera keeps
+ * ground above 2 km for ~80 Myr, is down to ~1.6 km after 100 Myr and to ~1 km hills after ~180 Myr;
+ * post-orogenic plains relax to the freeboard.
+ */
+export const TAU_CONTINENT = 160;
+export const TAU_OROGEN = 80;
 export const OROGEN_THRESHOLD = 1000;
 /** Submerged continental crust drifts toward a shelf depth, m, with this e-folding time, Myr. */
 export const SHELF_DEPTH = -200;
@@ -157,7 +172,7 @@ export const TAU_SHELF = 200;
 /** Oceanic islands above sea level are planed off by waves (guyots), Myr. */
 export const TAU_ISLAND = 15;
 /** Subaerial hillslope/fluvial diffusivity, km²/Myr, and the factor for the submarine part. */
-export const DIFFUSIVITY = 70;
+export const DIFFUSIVITY = 40;
 export const SUBMARINE_DIFFUSIVITY_FACTOR = 0.15;
 /** e-folding time of the orogeny field, Myr. */
 export const OROGENY_DECAY = 50;

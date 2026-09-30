@@ -91,7 +91,13 @@ export interface RuntimeState {
   meshN: number;
   worldSeed: number;
   playing: boolean;
+  /** Live simulation time (the sim worker's, which runs 1–3 steps ahead of the picture during playback). */
   time: number;
+  /**
+   * Time of the live state in the picture (the last frame shown), null until a frame of this world
+   * arrived. The timeline shows it so the counter advances with every frame and never runs ahead.
+   */
+  shownTime: number | null;
   steps: number;
   snapshotId: number;
   stats: TectonicStats | null;
@@ -152,7 +158,7 @@ export const EMPTY_CLIMATE: ClimateStatus = {
 
 export function initialRuntime(): RuntimeState {
   return {
-    worldLoaded: false, meshN: 0, worldSeed: 0, playing: false, time: 0, steps: 0, snapshotId: 0, stats: null,
+    worldLoaded: false, meshN: 0, worldSeed: 0, playing: false, time: 0, shownTime: null, steps: 0, snapshotId: 0, stats: null,
     perf: { stepsPerSec: 0, framesPerSec: 0, lastStepMs: 0, lastPaintMs: 0 }, month: -1, seasonsPlaying: false,
     climate: { ...EMPTY_CLIMATE }, keyframes: [], keyframeInterval: 0, viewingKeyframe: null, tasks: [], editorActive: false,
     worldParams: '',
@@ -184,6 +190,8 @@ export type Action =
   | { type: 'setSeasonsPlaying'; playing: boolean }
   | { type: 'worldLoaded'; meshN: number; seed: number; time: number; stats: TectonicStats; paramsKey?: string }
   | { type: 'status'; playing: boolean; time: number; steps: number; perf: PerfStats }
+  /** A frame of the live state (not a history keyframe) is on screen. */
+  | { type: 'frameShown'; time: number }
   | { type: 'snapshot'; snapshotId: number; stats: TectonicStats }
   | { type: 'history'; keyframes: KeyframeInfo[]; intervalMyr: number; viewing: number | null }
   | { type: 'climateStarted'; purpose: ClimatePurpose }
@@ -319,11 +327,13 @@ export function reduce(s: AppState, a: Action): AppState {
       return withRuntime(s, { seasonsPlaying: a.playing, month: a.playing && rt.month < 0 ? 0 : rt.month });
     case 'worldLoaded':
       return withRuntime(s, {
-        worldLoaded: true, meshN: a.meshN, worldSeed: a.seed, time: a.time, steps: a.stats.steps, stats: a.stats, playing: false,
+        worldLoaded: true, meshN: a.meshN, worldSeed: a.seed, time: a.time, shownTime: null, steps: a.stats.steps, stats: a.stats, playing: false,
         viewingKeyframe: null, worldParams: a.paramsKey ?? rt.worldParams,
       });
     case 'status':
       return withRuntime(s, { playing: a.playing, time: a.time, steps: a.steps, perf: a.perf });
+    case 'frameShown':
+      return rt.shownTime === a.time ? s : withRuntime(s, { shownTime: a.time });
     case 'snapshot':
       return withRuntime(s, { snapshotId: a.snapshotId, stats: a.stats });
     case 'history':
@@ -373,10 +383,10 @@ export function worldParamsKey(w: WorldSettings): string {
   return JSON.stringify([w.seed, w.meshN, w.plateCount, w.continentalFraction, w.continentMode, w.hotspotCount, w.plateSpeed, w.boundaryRoughness]);
 }
 
-/** Time of the state on screen: the keyframe being viewed, else the live simulation time. */
+/** Time of the state on screen: the keyframe being viewed, else the live frame shown (sim time before the first). */
 export function displayedTime(rt: RuntimeState): number {
   const k = rt.viewingKeyframe;
-  return k !== null && rt.keyframes[k] ? rt.keyframes[k].time : rt.time;
+  return k !== null && rt.keyframes[k] ? rt.keyframes[k].time : rt.shownTime ?? rt.time;
 }
 
 /** The world displayed is newer than the climate (climate computed for another state). */

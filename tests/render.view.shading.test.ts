@@ -4,7 +4,7 @@ import { DEG } from '../src/core/constants';
 import { GlobeSurface, LIGHT_RELIEF } from '../src/render/globeSurface';
 import { buildFloatMips } from '../src/render/globeTextures';
 import { SURFACE_FRAGMENT } from '../src/render/shadersSurface';
-import { applyShade, cloudAlpha, hillshade, nightShade } from '../src/render/mapShading';
+import { applyShade, hillshade, nightShade } from '../src/render/mapShading';
 import { HeightField } from '../src/render/viewHeight';
 import { PLANET_RADIUS_M, reliefDisplacement } from '../src/render/viewUtil';
 
@@ -44,7 +44,7 @@ describe('map hillshade', () => {
   });
 });
 
-describe('night shade and clouds', () => {
+describe('night shade', () => {
   it('is clear at the subsolar point and dark at the antipode', () => {
     const w = 72, h = 36;
     const img = nightShade(w, h, 20 * DEG, 30 * DEG);
@@ -56,17 +56,6 @@ describe('night shade and clouds', () => {
     expect(img[idx(-20, -150)]).toBeGreaterThan(220);
     // Northern summer: the north polar cap stays lit, the south one is dark.
     expect(img[idx(87, -150)]).toBeLessThan(img[idx(-87, 30)]);
-  });
-
-  it('cloud alpha covers roughly `cover` of the area and nothing at zero cover', () => {
-    const w = 256, h = 128;
-    const uni = Float32Array.from({ length: w * h }, (_, i) => ((i * 0.6180339887) % 1));
-    for (const cov of [0, 0.3, 0.7]) {
-      const img = cloudAlpha(new Float32Array(4).fill(cov), 2, 2, uni, w, h, 1);
-      let covered = 0;
-      for (let i = 3; i < img.length; i += 4) if (img[i] > 60) covered++;
-      expect(Math.abs(covered / (w * h) - cov)).toBeLessThan(0.08);
-    }
   });
 });
 

@@ -4,6 +4,7 @@
  * and bilinear point location with across-the-pole interpolation.
  */
 import { EARTH_RADIUS_KM } from '../core/constants';
+import { zonalPhase } from './numerics';
 
 export const EARTH_RADIUS_M = EARTH_RADIUS_KM * 1000;
 
@@ -92,7 +93,10 @@ export function blurSphere(g: HydroGrid, src: ArrayLike<number>, sigmaKm: number
   const tmp = new Float64Array(n);
   const sigmaM = sigmaKm * 1000;
   const halfW = w >> 1;
-  // Zonal pass.
+  // Zonal pass. Zonal wavenumbers 0 and 1 pass unchanged (a field smooth across the pole varies
+  // like a + b·cos(λ − λ₀) around a polar circle), so the wide kernels of the polar rows do not
+  // flatten them row by row into zonal bands.
+  const ph = zonalPhase(w);
   for (let r = 0; r < h; r++) {
     const dx = EARTH_RADIUS_M * Math.max(g.cosLat[r], 1e-6) * g.dLon;
     const sc = sigmaM / dx;
@@ -101,15 +105,28 @@ export function blurSphere(g: HydroGrid, src: ArrayLike<number>, sigmaKm: number
       for (let c = 0; c < w; c++) tmp[row + c] = src[row + c];
       continue;
     }
+    let a1 = 0;
+    let b1 = 0;
+    for (let c = 0; c < w; c++) {
+      a1 += src[row + c] * ph.cos[c];
+      b1 += src[row + c] * ph.sin[c];
+    }
+    a1 *= 2 / w;
+    b1 *= 2 / w;
     if (sc > w / 2) {
       let s = 0;
       for (let c = 0; c < w; c++) s += src[row + c];
       s /= w;
-      for (let c = 0; c < w; c++) tmp[row + c] = s;
+      for (let c = 0; c < w; c++) tmp[row + c] = s + a1 * ph.cos[c] + b1 * ph.sin[c];
       continue;
     }
     const k = gaussianKernel(sc, Math.floor((w - 1) / 2));
     const rad = (k.length - 1) >> 1;
+    // Kernel response to wavenumber 1 (symmetric kernel).
+    let resp = 0;
+    for (let j = -rad; j <= rad; j++) resp += k[j + rad] * Math.cos((2 * Math.PI * j) / w);
+    const ka = (1 - resp) * a1;
+    const kb = (1 - resp) * b1;
     for (let c = 0; c < w; c++) {
       let s = 0;
       for (let j = -rad; j <= rad; j++) {
@@ -118,7 +135,7 @@ export function blurSphere(g: HydroGrid, src: ArrayLike<number>, sigmaKm: number
         else if (cc >= w) cc -= w;
         s += k[j + rad] * src[row + cc];
       }
-      tmp[row + c] = s;
+      tmp[row + c] = s + ka * ph.cos[c] + kb * ph.sin[c];
     }
   }
   // Meridional pass.

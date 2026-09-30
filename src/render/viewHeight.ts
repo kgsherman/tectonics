@@ -3,6 +3,7 @@
  * particles/markers/arrows above the displaced surface and masking land for ocean-current particles.
  */
 import { sampleGrid } from '../core/grid';
+import { copyIfChanged } from './viewBuffers';
 import { reliefDisplacement } from './viewUtil';
 
 export class HeightField {
@@ -12,16 +13,20 @@ export class HeightField {
   /** Highest elevation in the map (m); −Infinity when empty. */
   maxElev = -Infinity;
 
-  set(height: Float32Array, w: number, h: number): void {
+  /** Copies the map; returns false when it is identical to the current one (same size and values). */
+  set(height: Float32Array, w: number, h: number): boolean {
     if (!(w > 0 && h > 0) || height.length < w * h) throw new Error(`HeightField: expected ${w}x${h} floats, got ${height.length}`);
+    const sameSize = this.data !== null && this.w === w && this.h === h;
     if (!this.data || this.data.length !== w * h) this.data = new Float32Array(w * h);
-    this.data.set(height.subarray(0, w * h));
+    const changed = copyIfChanged(height, this.data, w * h) || !sameSize;
     this.w = w;
     this.h = h;
+    if (!changed) return false;
     let mx = -Infinity;
     const d = this.data;
     for (let i = 0; i < d.length; i++) if (d[i] > mx) mx = d[i];
     this.maxElev = mx;
+    return true;
   }
 
   clear(): void {

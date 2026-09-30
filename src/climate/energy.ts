@@ -15,12 +15,20 @@
  * terrain is also coupled to the jet-mixed free troposphere (k_ft). Snow albedo is lagged one step,
  * ramped on the surface temperature, patchy on high terrain unless the cell is an ice sheet.
  *
+ * Land snow and ice (energyStep.ts, energyIce.ts): a mass M per land cell gains Clausius–Clapeyron
+ * scaled snowfall and loses melt (a snow or ice surface cannot warm above 0 °C; the surplus melts
+ * it). Perennial mass is glacier: ice-sheet albedo, and once a year an ice-flow budget feeds each
+ * sheet's ablation zone from its accumulation surplus and a plastic-ice profile raises its surface.
+ * Sea ice carries volume (−E) and area separately (Hibler 1979), with basal ocean heat.
+ *
  * State per cell:
  *  - T    : air temperature, sea-level reduced over land (the transported field),
- *  - E    : ocean enthalpy J/m² (E ≥ 0: mixed layer T_o = T_f + E/C_o; E < 0: sea ice with fraction
- *           a = min(1, −E/E_full), open water at T_f),
+ *  - E    : ocean enthalpy J/m² (E ≥ 0: mixed layer T_o = T_f + E/C_o; E < 0: sea-ice volume −E/L,
+ *           open water at T_f),
+ *  - Ai   : sea-ice area fraction,
  *  - Ti   : sea-ice surface temperature,
- *  - Tann : running annual-mean surface temperature (ice-sheet vs seasonal-snow memory).
+ *  - Tann : running annual-mean surface temperature,
+ *  - M    : land snow / ice mass, kg/m² water equivalent.
  *
  * This file holds the model setup and state; the time stepping lives in energyStep.ts. Each ~5-day
  * step is operator split, backward Euler throughout: (1) local implicit step for the air/land
@@ -43,8 +51,19 @@ export const SECONDS_PER_YEAR = 365.2422 * 86400;
 export interface EbmModel {
   g: LatLonGrid;
   land: Uint8Array;
-  /** Γ·(surface height above sea level) per land cell (K); 0 over ocean. */
+  /** Γ·(surface height above sea level) per land cell (K), including the ice-sheet raise; 0 over ocean. */
   lapse: Float64Array;
+  /** Bed (input) height above sea level per land cell (m); 0 over ocean. */
+  bedHeight: Float64Array;
+  /** Ice-sheet surface raise above the bed per land cell (m, energyIce.ts). */
+  iceRaise: Float64Array;
+  /** Ice flow budget (energyIce.ts): glacier mask at the start of the year, the year's snowfall and melt (kg/m²), years integrated. */
+  iceMask: Uint8Array;
+  accY: Float64Array;
+  ablY: Float64Array;
+  /** Smallest land snow/ice mass of the current year (kg/m²). */
+  minY: Float64Array;
+  iceYears: number;
   /**
    * Coupling (W/m²/K) of high-terrain land to the free troposphere: the air over high plateaus and
    * ranges is part of the jet-mixed free atmosphere, so its sea-level-reduced temperature is pulled
@@ -91,8 +110,15 @@ export interface EbmState {
    */
   Es: Float64Array;
   Ti: Float64Array;
-  /** Running annual mean of the surface temperature (1-year e-folding), °C: tells ice sheets from seasonal snow. */
+  /** Running annual mean of the surface temperature (1-year e-folding), °C. */
   Tann: Float64Array;
+  /** Sea-ice area fraction 0..1 of ocean cells (the volume is −E / iceLatent per cell area). */
+  Ai: Float64Array;
+  /**
+   * Land snow and ice mass, kg/m² water equivalent (0 over the ocean): seasonal snowpack below
+   * ebmTuning.glacierMassLow, glacier / ice sheet above (see glacierWeight).
+   */
+  M: Float64Array;
 }
 
 /** Pass-2 couplings. Stencils are per month; velocities are already scaled. */
@@ -127,6 +153,8 @@ export interface EbmMonthly {
   tAir: Float64Array;
   sst: Float64Array;
   ice: Float64Array;
+  /** n: smallest land snow/ice mass of the year (kg/m²): the perennial (glacier) part. */
+  mMin: Float64Array;
 }
 
 /** Scratch buffers of the integrator (energyStep.ts). */
@@ -142,6 +170,8 @@ export interface EbmWork {
   kS2: Float64Array;
   cEff: Float64Array;
   ice: Float64Array;
+  /** Melt coupling of the land snow/ice surface this step (W/m²/K). */
+  melt: Float64Array;
   ra: Float64Array;
   rb: Float64Array;
   rc: Float64Array;
@@ -183,7 +213,9 @@ export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Arr
   const stepsPerYear = 12 * stepsPerMonth;
   const lapse = new Float64Array(n);
   const freeTrop = new Float64Array(n);
+  const bedHeight = new Float64Array(n);
   for (let i = 0; i < n; i++) {
+    bedHeight[i] = land[i] ? Math.max(0, height[i]) : 0;
     lapse[i] = land[i] ? LAPSE_RATE * Math.max(0, height[i]) : 0;
     const x = land[i] ? Math.max(0, height[i]) / t.freeTropHeight : 0;
     freeTrop[i] = t.freeTropCoupling * Math.min(1, x * x);
@@ -276,13 +308,13 @@ export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Arr
   const work: EbmWork = {
     F: new Float64Array(n), dep: new Float64Array(n), To: new Float64Array(n), tAirMean: new Float64Array(n),
     stab: new Float64Array(n), kE2: new Float64Array(n), kN2: new Float64Array(n), kS2: new Float64Array(n),
-    cEff: new Float64Array(n), ice: new Float64Array(n),
+    cEff: new Float64Array(n), ice: new Float64Array(n), melt: new Float64Array(n),
     ra: new Float64Array(m), rb: new Float64Array(m), rc: new Float64Array(m), rd: new Float64Array(m), rx: new Float64Array(m),
     ca: new Float64Array(m), cb: new Float64Array(m), cc: new Float64Array(m), cd: new Float64Array(m), cx: new Float64Array(m),
     cp: new Float64Array(m), cyc: makeCyclicWork(nx),
   };
   return {
-    g, land, lapse, freeTrop, stepsPerMonth, stepsPerYear, dt: SECONDS_PER_YEAR / stepsPerYear,
+    g, land, lapse, bedHeight, iceRaise: new Float64Array(n), iceMask: new Uint8Array(n), accY: new Float64Array(n), ablY: new Float64Array(n), minY: new Float64Array(n), iceYears: 0, freeTrop, stepsPerMonth, stepsPerYear, dt: SECONDS_PER_YEAR / stepsPerYear,
     insol: insolationTable(g, stepsPerYear, params.axialTilt, params.solarMultiplier),
     albLand, albWater, cOcean, kE, kN, kS, oE, oN, oS, overturning: scaleOverturning(overturningHeating(g, land), params.oceanCurrents), eFull, eMax, work,
   };
@@ -295,15 +327,15 @@ function scaleOverturning(q: Float64Array | null, scale: number): Float64Array |
 }
 
 export function makeState(n: number): EbmState {
-  return { T: new Float64Array(n), E: new Float64Array(n), Es: new Float64Array(n), Ti: new Float64Array(n), Tann: new Float64Array(n) };
+  return { T: new Float64Array(n), E: new Float64Array(n), Es: new Float64Array(n), Ti: new Float64Array(n), Tann: new Float64Array(n), Ai: new Float64Array(n), M: new Float64Array(n) };
 }
 
 export function cloneState(s: EbmState): EbmState {
-  return { T: s.T.slice(), E: s.E.slice(), Es: s.Es.slice(), Ti: s.Ti.slice(), Tann: s.Tann.slice() };
+  return { T: s.T.slice(), E: s.E.slice(), Es: s.Es.slice(), Ti: s.Ti.slice(), Tann: s.Tann.slice(), Ai: s.Ai.slice(), M: s.M.slice() };
 }
 
 export function makeMonthly(n: number): EbmMonthly {
-  return { tAir: new Float64Array(12 * n), sst: new Float64Array(12 * n), ice: new Float64Array(12 * n) };
+  return { tAir: new Float64Array(12 * n), sst: new Float64Array(12 * n), ice: new Float64Array(12 * n), mMin: new Float64Array(n) };
 }
 
 /** Snow/ice albedo ramp weight (0 = snow-free, 1 = full snow) on surface temperature. */
@@ -315,13 +347,33 @@ export function snowWeight(ts: number): number {
 
 /**
  * Fraction of the snow albedo effect realized on land: seasonal snow on high terrain is patchy
- * (wind-scoured, sublimating, rock and forest exposed) unless the surface is frozen year-round
- * (ice sheets: annual-mean surface temperature well below 0 °C). Γh = lapse (K) of the cell.
+ * (wind-scoured, sublimating, rock and forest exposed) unless the surface is an ice sheet
+ * (`glacier` weight 0..1, see glacierWeight). Γh = lapse (K) of the cell.
  */
-export function snowCoverFactor(tAnnualSurface: number, lapseK: number): number {
+export function snowCoverFactor(glacier: number, lapseK: number): number {
   const t = ebmTuning;
   const x = lapseK / (LAPSE_RATE * t.snowPatchyHeight);
-  return Math.max(iceSheetWeight(tAnnualSurface), 1 / (1 + x * x));
+  return Math.max(glacier, 1 / (1 + x * x));
+}
+
+/** Glacier weight 0..1 of a land snow/ice mass M (kg/m² w.e.). */
+export function glacierWeight(M: number): number {
+  const t = ebmTuning;
+  const u = (M - t.glacierMassLow) / (t.glacierMassHigh - t.glacierMassLow);
+  return u <= 0 ? 0 : u >= 1 ? 1 : u * u * (3 - 2 * u);
+}
+
+/** Snow cover fraction of a land snow/ice mass M (kg/m² w.e.). */
+export function snowMassCover(M: number): number {
+  return M > 0 ? 1 - Math.exp(-M / ebmTuning.snowCoverMass) : 0;
+}
+
+/** Snowfall rate (kg/m²/s) for surface air temperature ts (°C): Clausius–Clapeyron-scaled precipitation × snow fraction. */
+export function snowfallRate(ts: number): number {
+  const t = ebmTuning;
+  const f = (t.snowfallWarm - ts) / (t.snowfallWarm - t.snowfallCold);
+  if (f <= 0) return 0;
+  return ((f >= 1 ? 1 : f) * t.snowfallRef * Math.exp(t.snowfallPerK * (ts < 0 ? ts : 0))) / SECONDS_PER_YEAR;
 }
 
 /** 0..1: how much a land cell with this annual-mean surface temperature behaves as an ice sheet. */
@@ -329,9 +381,30 @@ export function iceSheetWeight(tAnnualSurface: number): number {
   return Math.min(1, Math.max(0, (ebmTuning.snowPolarWarm - tAnnualSurface) / 10));
 }
 
-/** Sea-ice fraction for an ocean enthalpy. */
+/** Sea-ice fraction for an ocean enthalpy with a single ice thickness eFull / iceLatent (initial states). */
 export function iceFraction(E: number, eFull: number): number {
   return E >= 0 ? 0 : Math.min(1, -E / eFull);
+}
+
+/**
+ * Sea-ice area after the ocean enthalpy changed from eOld to eNew with area a before: new ice
+ * (from open water) has the lead-closing thickness; net melt removes the thin end of the thickness
+ * distribution (Hibler 1979: dA = (A/2h)·dV, h = V/A); growth under existing ice thickens it. The
+ * mean thickness of the ice part stays ≥ seaIceMinThickness.
+ */
+export function iceAreaAfter(eOld: number, eNew: number, a: number): number {
+  if (eNew >= 0) return 0;
+  const t = ebmTuning;
+  const vNew = -eNew / t.iceLatent;
+  let an: number;
+  if (eOld >= 0 || !(a > 0)) an = vNew / t.seaIceLeadThickness;
+  else {
+    const vOld = -eOld / t.iceLatent;
+    an = vNew < vOld ? a - ((a * a) / (2 * vOld)) * (vOld - vNew) : a;
+  }
+  const cap = vNew / t.seaIceMinThickness;
+  if (an > cap) an = cap;
+  return an > 1 ? 1 : an > 0 ? an : 0;
 }
 
 /** Surface warming (K) of the seasonal stratified layer holding heat Es (J/m²); 0 when disabled. */
@@ -342,7 +415,7 @@ export function stratTemperature(es: number): number {
 
 /** Set the ocean cells' air temperature to their surface temperature (initialization). */
 export function syncOceanAirT(M: EbmModel, S: EbmState): void {
-  const { g, land, cOcean, eFull } = M;
+  const { g, land, cOcean } = M;
   const Tf = ebmTuning.freezeT;
   for (let j = 0; j < g.ny; j++) {
     const Co = cOcean[j];
@@ -350,7 +423,7 @@ export function syncOceanAirT(M: EbmModel, S: EbmState): void {
       const i = j * g.nx + c;
       if (land[i]) continue;
       const E = S.E[i];
-      const a = iceFraction(E, eFull);
+      const a = E < 0 ? S.Ai[i] : 0;
       S.T[i] = (1 - a) * (Tf + Math.max(0, E) / Co + stratTemperature(S.Es[i])) + a * S.Ti[i];
     }
   }

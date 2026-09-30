@@ -1,19 +1,27 @@
 /**
  * CPU evaluation of the cloud field (pure, DOM-free): the same model as the globe shader
  * (shadersClouds.ts, whose constants come from here) without the time-varying flow map. Used by the
- * 2D map's static cloud layer, by tests and by headless previews.
+ * 2D map's static cloud layer (cloudsRaster.ts), by tests and by headless previews.
  *
  * Model (per point p on the unit sphere):
- *  1. cyclone templates (comma cloud: cold-front band, warm-conveyor shield, dry slot, cold sector)
- *     are evaluated in a swirled frame and the noise domain is swirled with them;
- *  2. domain-warped fbm from the tileable noise volume: a synoptic shape fetch and mesoscale detail
- *     fetches at scale ratios of ≈ 4 (two octaves each), anisotropic (stretched east–west), mixed per
- *     regime (deep convection clumps up, shallow cumulus thins out, stratocumulus flattens);
+ *  1. cyclone templates (comma cloud: cold-front band with a sharp trailing edge, warm-conveyor
+ *     shield, dry slot, cold sector) are evaluated in a swirled frame; they bias the coverage, add
+ *     cirrus over the head / warm conveyor and open cells in the cold sector, and swirl the noise;
+ *  2. noise: a large-scale domain warp and a synoptic shape fetch from the smooth volume (stretched
+ *     east–west), then 2–4 detail octaves (ratio 2.6) from the detail volume, each warped by the
+ *     previous one's gradient and shaped per regime between plain fbm, billows (soft |n|: cumulus,
+ *     convective cores, closed cells) and ridges (open cells), with a regime-dependent octave gain;
  *  3. the normalized noise z (≈ N(0,1)) plus the cyclone bias is compared with the coverage
  *     threshold z_thr = Φ⁻¹(1 − f): the cloudy area fraction follows the climate's coverage f, and the
- *     excess above the threshold sets a continuous optical depth (thin edges, bright cores).
+ *     excess above the threshold sets a continuous, log-normally textured optical depth (thin grey
+ *     edges, mottled mid-thick cloud, bright cores);
+ *  4. cirrus: an independent thin veil (patches from the shape fetch's B channel, fibres from a
+ *     strongly zonally stretched detail fetch).
  */
-import { CLOUD_NOISE_STD, sampleCloudNoise, sampleCloudNoiseR, type CloudNoiseVolume } from './cloudsNoise';
+import {
+  CLOUD_CELL_EDGE_RANGE, CLOUD_CELL_PERIOD, CLOUD_DETAIL_GRAD_K, CLOUD_DETAIL_PERIOD, CLOUD_NOISE_STD, cloudDetailVolume, sampleCloudNoise,
+  type CloudNoiseVolume,
+} from './cloudsNoise';
 import { CYCLONE_COUNT, CYCLONE_STRIDE } from './cloudsModel';
 
 /* Shared constants (interpolated into the GLSL source). */
@@ -23,24 +31,75 @@ export const WARP_SCALE = 0.5;
 export const WARP_AMP = 0.05;
 /** Tiles per unit length for the shape fetch (R: wavelengths ≈ 1000 / 500 km). */
 export const SHAPE_SCALE = 1.6;
-/** Frequency ratio between successive fetches (≈ 4 = two octaves; non-integer avoids tile alignment). */
-export const DETAIL_RATIO = 3.9;
-/** Amplitude ratio between successive fetches (two fbm octaves of CLOUD_NOISE_GAIN). */
-export const FETCH_GAIN = 0.6;
-/** Mesoscale detail amplitude relative to the synoptic shape (boosted near cloud edges). */
-export const DETAIL_AMP = 0.55;
-/** Small-scale warp of the detail fetch by the shape fetch's GBA channels (tile units per σ). */
+/** Detail amplitude relative to the synoptic shape (scaled per regime and near cloud edges). */
+export const DETAIL_AMP = 0.78;
+/** Warp of the first detail fetch by the shape fetch's GBA channels (tile units per σ). */
 export const DETAIL_WARP = 0.05;
 /** Optical depth per σ of noise excess above the coverage threshold. */
 export const TAU_PER_SIGMA = 0.85;
+/** Log-normal optical-depth variability per σ of detail noise (mottled mid-thick cloud). */
+export const TAU_TEXTURE = 0.55;
 /** Opacity of the thickest cloud (a little ground always shows through). */
 export const ALPHA_MAX = 0.95;
 /** Optical depth reached right past the cloud edge (crisp outlines instead of fuzzy blobs). */
 export const EDGE_TAU = 0.3;
 /** Fraction of the cyclone swirl applied to the noise domain (the rest only bends the template). */
 export const NOISE_SWIRL = 0.4;
-/** Noise-domain compression along the polar axis (features elongated east–west). */
+/** Noise-domain compression along the polar axis for the synoptic shape (zonally elongated weather). */
 export const ANISO = 1.8;
+/**
+ * Detail octaves (detail volume, CLOUD_DETAIL_PERIOD lattice cells per tile): tiles per unit of the
+ * noise domain, ratio 2.6 (lattice cells ≈ 0.020, 0.0077, 0.0030, 0.0011 rad ≈ 130, 49, 19, 7 km).
+ * Each fades in with zoom between 1.25 and 2.25 px per cell: at the default globe zoom the first two
+ * are resolved (the third on a high-DPI screen), all four in close-ups.
+ */
+export const DETAIL_SCALES = [3.1, 3.1 * 2.6, 3.1 * 2.6 ** 2, 3.1 * 2.6 ** 3];
+/**
+ * Octave band-limiting: an octave fades in between OCTAVE_FADE_PX[0] and [1] pixels per lattice cell
+ * (below ~1.25 px it would alias, and would still cost a full-rate fetch per flow phase).
+ */
+export const OCTAVE_FADE_PX = [1.25, 2.25];
+
+/** Footprint fade (0..1) of detail octave k for a pixel footprint of `px` radians. Mirrored in GLSL. */
+export function octaveFade(px: number, k: number): number {
+  const ppc = 1 / (px * DETAIL_SCALES[k] * CLOUD_DETAIL_PERIOD);
+  return smoothstep(OCTAVE_FADE_PX[0], OCTAVE_FADE_PX[1], ppc);
+}
+
+/** Default amplitude ratio between detail octaves (per-regime values in detailParams). */
+export const DETAIL_GAIN = 0.58;
+/** 1/√(Σ gain^2k) over the four detail octaves at DETAIL_GAIN. */
+export const DETAIL_NORM = 1 / Math.sqrt(1 + DETAIL_GAIN ** 2 + DETAIL_GAIN ** 4 + DETAIL_GAIN ** 6);
+/** Detail amplitude inside cloud (fraction of DETAIL_AMP) and its extra near the threshold. */
+export const DETAIL_FLOOR = 0.45;
+export const DETAIL_EDGE_BOOST = 1.0;
+/** Warp of each finer detail octave by the previous one's gradient (lattice cells per σ/cell). */
+export const DETAIL_GRAD_WARP = 0.2;
+/** Zonal stretch of the detail (1: isotropic; streaks only in cirrus). */
+export const DETAIL_ANISO = 1.0;
+/**
+ * Billows use a soft |n| = √(n² + ε²) (rounded creases: no pixel-sharp shading lines); its mean and
+ * 1/std for n ~ N(0,1) keep the shaping zero-mean, unit variance.
+ */
+export const BILLOW_EPS = 0.3;
+export const BILLOW_MEAN = 0.8869;
+export const BILLOW_INV_SD = 1 / 0.5508;
+/** Cirrus: zonal stretch (fibres), detail-volume tiles per unit, and peak opacity of the veil. */
+export const CIRRUS_ANISO = 3;
+export const CIRRUS_SCALE = 1.6;
+export const CIRRUS_TAU = 0.3;
+/** Cirrus fibre warp by the shape fetch's GBA channels (tile units per σ). */
+export const CIRRUS_WARP = 0.2;
+/**
+ * Mesoscale cellular convection (cell volume, CLOUD_CELL_PERIOD cells per tile): tiles per unit
+ * (cells ≈ 0.0072 rad ≈ 46 km: closed stratocumulus cells, open cells), the warp of the cell lattice
+ * by the shape fetch (tile units per σ: irregular cells), and the footprint fade (px per cell).
+ */
+export const CELL_SCALE = 17.3;
+export const CELL_WARP = 0.1;
+export const CELL_FADE_PX = [2.0, 4.0];
+/** Open cells are about twice as large as closed ones (scale factor on CELL_SCALE). */
+export const OPEN_CELL_SCALE = 0.5;
 /**
  * Autocorrelation of the noise at noise-domain separation d (fits of the measured statistics, see
  * tests/polish.clouds.test.ts): shape nb ≈ exp(−d²/L²), detail nd ≈ exp(−d/λ). The globe's two flow
@@ -49,24 +108,29 @@ export const ANISO = 1.8;
  * the cloud cover twice per flow cycle in calm air).
  */
 export const SHAPE_CORR_LENGTH = 0.13;
-export const DETAIL_CORR_LENGTH = 0.03;
+export const DETAIL_CORR_LENGTH = 0.022;
 
 const OFF_W = [0.31, 0.57, 0.13];
 const OFF_B = [0.71, 0.23, 0.47];
 const OFF_D = [0.19, 0.83, 0.61];
 const OFF_E = [0.53, 0.07, 0.89];
 const OFF_F = [0.97, 0.41, 0.29];
+const OFF_G = [0.37, 0.61, 0.79];
+const OFF_C = [0.83, 0.17, 0.33];
+const OFF_H = [0.11, 0.73, 0.52];
 /** Rotation applied between successive fetches (decorrelates the scales, hides the lattice). */
 const ROT = [0.0, 0.8, 0.6, -0.8, 0.36, -0.48, -0.6, -0.48, 0.64];
 
 export const FIELD_GLSL_CONSTANTS = {
-  OFF_W, OFF_B, OFF_D, OFF_E, OFF_F, ROT,
+  OFF_W, OFF_B, OFF_D, OFF_E, OFF_F, OFF_G, OFF_C, OFF_H, ROT,
 };
 
-/** Normalization of the detail sum n1 + g·n2 (+ g²·n3). */
-const DETAIL_NORM2 = 1 / Math.sqrt(1 + FETCH_GAIN * FETCH_GAIN);
-
 const INV_STD = 1 / CLOUD_NOISE_STD;
+/** Detail z scale relative to the (shape-anisotropic) noise domain. */
+const DANISO_Z = DETAIL_ANISO / ANISO;
+const CIRRUS_Z = CIRRUS_ANISO / ANISO;
+/** Gradient channel (byte/255 − 0.5) → next-octave warp in tile units. */
+const GRAD_WARP = DETAIL_GRAD_WARP / CLOUD_DETAIL_PERIOD / CLOUD_DETAIL_GRAD_K;
 
 function smoothstep(a: number, b: number, x: number): number {
   const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
@@ -76,14 +140,16 @@ function smoothstep(a: number, b: number, x: number): number {
 /**
  * Cyclone template in its own frame (x downstream, y poleward, units of the radius; low at the
  * origin): comma head poleward of the low, cold-front tail trailing equatorward and upstream from the
- * triple point, warm-conveyor cloud ahead of the front, dry slot intruding from the upstream side and
- * a clearer cold sector behind the front. The swirl then wraps the head and dry slot around the low.
- * Mirrored in GLSL.
+ * triple point (sharp on its cold, trailing side), warm-conveyor cloud ahead of the front, dry slot
+ * intruding from the upstream side and a clearer cold sector behind the front. The swirl then wraps
+ * the head and dry slot around the low. Returns the coverage bias (σ units); `aux` (optional)
+ * receives [cirrus, open cells]. Mirrored in GLSL.
  */
-export function cycloneTemplate(x: number, y: number): number {
+export function cycloneTemplate(x: number, y: number, aux?: Float64Array): number {
   const s = Math.max(0, 0.1 - y);
   const xc = 0.3 - 0.32 * s - 0.1 * s * s;
-  const bx = (x - xc) / (0.26 + 0.07 * s);
+  let bx = (x - xc) / (0.26 + 0.07 * s);
+  bx *= bx < 0 ? 1.6 : 0.8;
   const tail = Math.exp(-bx * bx) * smoothstep(-0.2, 0.2, 0.25 - y) * (1 - smoothstep(1.5, 2.5, s));
   const hx = (x - 0.15) / 0.95, hy = (y - 0.42) / 0.55;
   const head = Math.exp(-(hx * hx + hy * hy));
@@ -95,6 +161,12 @@ export function cycloneTemplate(x: number, y: number): number {
   const dry = Math.exp(-(du * du + dv * dv));
   const cx = (x + 1.4) / 1.1, cy = (y + 0.8) / 1.1;
   const cold = Math.exp(-(cx * cx + cy * cy));
+  if (aux) {
+    aux[0] = 0.6 * head + 0.8 * warm;
+    // Open cells: the core of the cold sector behind the front.
+    const ox = (x + 1.25) / 0.95, oy = (y + 0.95) / 0.95;
+    aux[1] = Math.exp(-(ox * ox + oy * oy));
+  }
   // The constant keeps the mean bias over the storm ~0 (cyclones organize cloud, not add it).
   return 1.9 * tail + 1.6 * head + 0.9 * warm - 1.8 * dry - 0.8 * cold - 0.16;
 }
@@ -105,31 +177,43 @@ export function swirlProfile(r: number): number {
 }
 
 export interface CloudSample {
-  /** Opacity 0..1 (ALPHA_MAX·(1 − exp(−τ))). */
+  /** Opacity 0..1 of low/mid cloud and cirrus combined. */
   alpha: number;
-  /** Optical depth. */
+  /** Optical depth of the low/mid cloud. */
   tau: number;
+  /** Opacity of the cirrus veil alone. */
+  cirrus: number;
 }
 
 export interface CloudFieldInputs {
   vol: CloudNoiseVolume;
+  /** Detail volume (defaults to the shared one). */
+  dvol?: CloudNoiseVolume;
+  /** Cell volume (none: no mesoscale cells). */
+  cvol?: CloudNoiseVolume;
+  /** Pixel footprint (radians) for the cell fade (default: resolved). */
+  px?: number;
   /** RGBA8 regime grid from buildCloudRegimeGrid. */
   grid: Uint8Array;
+  /** RGBA8 auxiliary grid (cirrus, open cells) from buildCloudGrids; none: no cirrus / open cells. */
+  aux?: Uint8Array;
   gw: number;
   gh: number;
   /** cycloneStates output (or null for none). */
   cyclones: Float32Array | null;
 }
 
+const scratchAux = new Float64Array(2);
+
 /**
  * Sum of the cyclone biases (σ units) at unit vector p → out[0], and (when `swirl`) the swirl
- * displacement of the noise domain → out[1..3]; `only` ≥ 0 evaluates that one cyclone. Mirrors
- * cyclones() in GLSL.
+ * displacement of the noise domain → out[1..3]; cirrus and open-cell contributions → out[4], out[5]
+ * (when out is long enough); `only` ≥ 0 evaluates that one cyclone. Mirrors cyclones() in GLSL.
  */
 export function cycloneEffect(
   cyc: Float32Array, px: number, py: number, pz: number, out: Float64Array, swirl = true, only = -1,
 ): Float64Array {
-  let bias = 0, qx = 0, qy = 0, qz = 0;
+  let bias = 0, qx = 0, qy = 0, qz = 0, ci = 0, op = 0;
   const k0 = only >= 0 ? only : 0, k1 = only >= 0 ? only + 1 : CYCLONE_COUNT;
   for (let k = k0; k < k1; k++) {
     const o = k * CYCLONE_STRIDE;
@@ -152,7 +236,9 @@ export function cycloneEffect(
     // Sample the template at the un-swirled position (rotate by −θ).
     const xs = cs * x + sn * y, ys = -sn * x + cs * y;
     const env = 1 - smoothstep(1.9, 2.6, r);
-    bias += inten * env * cycloneTemplate(xs, ys);
+    bias += inten * env * cycloneTemplate(xs, ys, scratchAux);
+    ci += inten * env * scratchAux[0];
+    op += inten * env * scratchAux[1];
     if (swirl) {
       const ddx = mx * (xs - x) * R * NOISE_SWIRL, ddy = my * (ys - y) * R * NOISE_SWIRL;
       qx += ddx * ex + ddy * nx;
@@ -164,14 +250,23 @@ export function cycloneEffect(
   out[1] = qx;
   out[2] = qy;
   out[3] = qz;
+  if (out.length >= 6) {
+    out[4] = ci;
+    out[5] = op;
+  }
   return out;
 }
+
+/** Floats written by shapeStage. */
+export const SHAPE_STAGE_SIZE = 9;
 
 /**
  * First stage of the cloud noise at noise-domain point q (unit sphere plus any swirl): anisotropy and
  * the globe's time-0 noise offset, the large-scale warp and the synoptic shape fetch. Writes
- * [wx, wy, wz, nb, gx, gy, gz] to out: warped coordinates, shape noise nb ≈ N(0,1) and the small warp
- * for the first detail fetch. All smooth at ≥ 500 km scales (safe to interpolate from a coarser grid).
+ * [wx, wy, wz, nb, gx, gy, gz, cp, va] to out (SHAPE_STAGE_SIZE floats): warped coordinates, shape
+ * noise nb ≈ N(0,1), the first detail fetch's warp (tile units), and the shape fetch's independent
+ * B and A channels (≈ N(0,1)): cirrus patches and the texture variation. All smooth at ≥ 500 km
+ * scales (safe to interpolate from a coarser grid).
  */
 export function shapeStage(vol: CloudNoiseVolume, qx: number, qy: number, qz: number, tmp: Float32Array, out: Float64Array): Float64Array {
   // Zonal anisotropy (weather is stretched along the westerlies / trades), then the same noise-space
@@ -194,47 +289,198 @@ export function shapeStage(vol: CloudNoiseVolume, qx: number, qy: number, qz: nu
   out[4] = (tmp[1] - 0.5) * k;
   out[5] = (tmp[2] - 0.5) * k;
   out[6] = (tmp[3] - 0.5) * k;
+  out[7] = (tmp[2] - 0.5) * INV_STD;
+  out[8] = (tmp[3] - 0.5) * INV_STD;
   return out;
 }
 
+const OFFS = [OFF_D, OFF_E, OFF_F, OFF_G];
+
 /**
- * Second stage: mesoscale detail nd ≈ N(0,1) from a shapeStage result — fetches rotated, 3.9× finer
- * and warped by the previous one. `fine` = false stops after the first detail fetch (the second's
- * 30–65 km features are sub-pixel on a 1024-wide map). Mirrors phaseDetail() in GLSL (without the
- * wind streaks).
+ * Raw detail octaves n1..n4 (σ units, unshaped) at a shapeStage point → out[0..octaves−1]: fetches
+ * rotated, 2.6× finer and warped by the previous one's gradient. Mirrors phaseDetail()'s fetches.
  */
-export function detailStage(vol: CloudNoiseVolume, st: Float64Array, tmp: Float32Array, fine = true): number {
-  const wx = st[0], wy = st[1], wz = st[2];
-  const s1 = SHAPE_SCALE * DETAIL_RATIO;
-  const ax = ROT[0] * wx + ROT[3] * wy + ROT[6] * wz;
-  const ay = ROT[1] * wx + ROT[4] * wy + ROT[7] * wz;
-  const az = ROT[2] * wx + ROT[5] * wy + ROT[8] * wz;
-  const dx = ax * s1 + st[4] + OFF_D[0], dy = ay * s1 + st[5] + OFF_D[1], dz = az * s1 + st[6] + OFF_D[2];
-  if (!fine) return (sampleCloudNoiseR(vol, dx, dy, dz) - 0.5) * INV_STD;
-  sampleCloudNoise(vol, dx, dy, dz, tmp);
-  const n1 = (tmp[0] - 0.5) * INV_STD;
-  const k = INV_STD * DETAIL_WARP;
-  const gx = (tmp[1] - 0.5) * k, gy = (tmp[2] - 0.5) * k, gz = (tmp[3] - 0.5) * k;
-  const s2 = s1 * DETAIL_RATIO;
+export function detailOctaves(
+  dvol: CloudNoiseVolume, st: Float64Array, tmp: Float32Array, out: Float64Array | Float32Array, octaves = 3,
+): void {
+  let ax = st[0], ay = st[1], az = st[2] * DANISO_Z;
+  let gx = st[4], gy = st[5], gz = st[6];
+  for (let k = 0; k < octaves; k++) {
+    const bx = ROT[0] * ax + ROT[3] * ay + ROT[6] * az;
+    const by = ROT[1] * ax + ROT[4] * ay + ROT[7] * az;
+    const bz = ROT[2] * ax + ROT[5] * ay + ROT[8] * az;
+    ax = bx;
+    ay = by;
+    az = bz;
+    const s = DETAIL_SCALES[k], o = OFFS[k];
+    sampleCloudNoise(dvol, ax * s + gx + o[0], ay * s + gy + o[1], az * s + gz + o[2], tmp);
+    out[k] = (tmp[0] - 0.5) * INV_STD;
+    gx = (tmp[1] - 0.5) * GRAD_WARP;
+    gy = (tmp[2] - 0.5) * GRAD_WARP;
+    gz = (tmp[3] - 0.5) * GRAD_WARP;
+  }
+}
+
+/** Raw cirrus fibre noise (σ units) at a shapeStage point (mirror of the shader's cirrus fetch). */
+export function cirrusFibre(dvol: CloudNoiseVolume, st: Float64Array, tmp: Float32Array): number {
+  const ax = st[0], ay = st[1], az = st[2] * CIRRUS_Z;
   const bx = ROT[0] * ax + ROT[3] * ay + ROT[6] * az;
   const by = ROT[1] * ax + ROT[4] * ay + ROT[7] * az;
   const bz = ROT[2] * ax + ROT[5] * ay + ROT[8] * az;
-  const n2 = (sampleCloudNoiseR(vol, bx * s2 + gx + OFF_E[0], by * s2 + gy + OFF_E[1], bz * s2 + gz + OFF_E[2]) - 0.5) * INV_STD;
-  return (n1 + FETCH_GAIN * n2) * DETAIL_NORM2;
+  // st[4..6] carry the shape fetch's GBA × INV_STD·DETAIL_WARP.
+  const k = CIRRUS_WARP / DETAIL_WARP;
+  sampleCloudNoise(
+    dvol, bx * CIRRUS_SCALE + st[4] * k + OFF_C[0], by * CIRRUS_SCALE + st[5] * k + OFF_C[1], bz * CIRRUS_SCALE + st[6] * k + OFF_C[2], tmp,
+  );
+  return (tmp[0] - 0.5) * INV_STD;
 }
 
-const scratchStage = new Float64Array(7);
+/**
+ * Cell-volume sample at a shapeStage point → out: [edge (distance to the cell border, cell units),
+ * id (0..1 per cell)]. Mirrors the shader's cell fetch (without the flow map).
+ */
+export function cellStage(cvol: CloudNoiseVolume, st: Float64Array, tmp: Float32Array, out: Float64Array | number[], scale = CELL_SCALE): void {
+  const ax = st[0], ay = st[1], az = st[2] * DANISO_Z;
+  const bx = ROT[0] * ax + ROT[3] * ay + ROT[6] * az;
+  const by = ROT[1] * ax + ROT[4] * ay + ROT[7] * az;
+  const bz = ROT[2] * ax + ROT[5] * ay + ROT[8] * az;
+  const k = CELL_WARP / DETAIL_WARP; // st[4..6] carry the shape GBA × INV_STD·DETAIL_WARP
+  sampleCloudNoise(cvol, bx * scale + st[4] * k + OFF_H[0], by * scale + st[5] * k + OFF_H[1], bz * scale + st[6] * k + OFF_H[2], tmp);
+  out[0] = tmp[0] * CLOUD_CELL_EDGE_RANGE;
+  out[1] = tmp[2];
+}
+
+/** Footprint fade of cells at `scale` (tiles per unit) for a pixel footprint of `px` radians. Mirrored in GLSL. */
+export function cellFade(px: number, scale = CELL_SCALE): number {
+  return smoothstep(CELL_FADE_PX[0], CELL_FADE_PX[1], 1 / (px * scale * CLOUD_CELL_PERIOD));
+}
 
 /**
- * Synoptic shape noise nb → out[0] and mesoscale detail nd → out[1] (both ≈ N(0,1)) at noise-domain
- * point q (see shapeStage / detailStage).
+ * Closed stratocumulus cells: optical-depth factor (dark borders, per-cell brightness variation),
+ * weighted by the stratocumulus regime `sc` and the footprint fade. Mirrored in GLSL.
+ */
+export function closedCells(edge: number, id: number, sc: number, fade: number): number {
+  const cell = (0.55 + 0.45 * smoothstep(0.02, 0.32, edge)) * (0.82 + 0.36 * id);
+  return 1 + sc * fade * (cell - 1);
+}
+
+/**
+ * Open cells: coverage excess (σ) added by cloudy rings along the cell borders around clear centres,
+ * weighted by the open-cell regime and the footprint fade; `soft` widens the ring edge (cell units)
+ * for antialiasing, the detail noise `nd` breaks the rings up. Mirrored in GLSL.
+ */
+export function openCells(edge: number, open: number, fade: number, soft = 0, nd = 0): number {
+  const ring = 1 - smoothstep(0.05, 0.3 + soft, edge);
+  // Lumpy, broken rings (cumulus along the cell walls), not a continuous net.
+  return open * fade * (1.3 * ring * (0.75 + 0.35 * Math.min(1.5, Math.max(-1.5, nd))) - 0.85);
+}
+
+/** Texture parameters of a regime mix (see detailParams). */
+export interface DetailShaping {
+  /** Linear / billow weights of the two coarse and the fine octaves (see shapeOctave). */
+  lc: number;
+  bc: number;
+  lf: number;
+  bf: number;
+  /** Octave amplitude ratio. */
+  gain: number;
+  /** Detail amplitude factor. */
+  amp: number;
+}
+
+export function newDetailShaping(): DetailShaping {
+  return { lc: 1, bc: 0, lf: 1, bf: 0, gain: DETAIL_GAIN, amp: 1 };
+}
+
+/** Linear and billow weights for shaping parameter beta (−1 ridges … 0 plain … +1 billows). */
+function shaping(beta: number, out: DetailShaping, fine: boolean): void {
+  const ab = Math.abs(beta);
+  const inv = 1 / Math.sqrt((1 - ab) * (1 - ab) + ab * ab);
+  if (fine) {
+    out.lf = (1 - ab) * inv;
+    out.bf = beta * BILLOW_INV_SD * inv;
+  } else {
+    out.lc = (1 - ab) * inv;
+    out.bc = beta * BILLOW_INV_SD * inv;
+  }
+}
+
+const clamp1 = (x: number): number => Math.min(1, Math.max(-1, x));
+
+/**
+ * Texture parameters per regime (mirror detailParams() in GLSL): billows for convection, cumulus and
+ * closed stratocumulus cells, ridges for open cells; clumpy (low gain) convection, speckled cumulus
+ * and finely cellular stratocumulus (high gain); `vary` (≈ N(0,1), the shape fetch's A channel)
+ * mixes smooth sheets and broken fields.
+ */
+export function detailParams(sc: number, cv: number, cu: number, open: number, vary: number, out: DetailShaping): DetailShaping {
+  shaping(clamp1(0.05 + 0.6 * cv + 0.45 * cu + 0.15 * sc - 0.5 * open), out, false);
+  shaping(clamp1(0.15 + 0.35 * cv + 0.65 * cu + 0.85 * sc - 1.6 * open), out, true);
+  out.gain = Math.min(0.8, Math.max(0.4, 0.55 - 0.12 * cv + 0.17 * cu + 0.2 * sc + 0.15 * open + 0.06 * vary));
+  out.amp = (1 - 0.1 * cv + 0.3 * cu - 0.2 * sc) * Math.min(1.5, Math.max(0.55, 1 + 0.3 * vary));
+  return out;
+}
+
+/** One shaped octave (zero mean, ~unit variance for n ~ N(0,1)). Mirrors shapeOctave() in GLSL. */
+export function shapeOctave(n: number, lin: number, bil: number): number {
+  return lin * n + bil * (Math.sqrt(n * n + BILLOW_EPS * BILLOW_EPS) - BILLOW_MEAN);
+}
+
+/**
+ * Detail noise nd ≈ N(0,1) from raw octaves (detailOctaves), shaped per regime, with per-octave
+ * footprint fades (1 = resolved; null: all resolved). Mirrors the sum in phaseDetail().
+ */
+export function detailSum(oct: ArrayLike<number>, octaves: number, sh: DetailShaping, fade: ArrayLike<number> | null = null): number {
+  const g = sh.gain;
+  let d = 0, a = 1;
+  for (let k = 0; k < octaves; k++) {
+    const f = fade ? fade[k] : 1;
+    const v = k < 2 ? shapeOctave(oct[k], sh.lc, sh.bc) : shapeOctave(oct[k], sh.lf, sh.bf);
+    d += a * f * v;
+    a *= g;
+  }
+  const g2 = g * g;
+  return d / Math.sqrt(1 + g2 * (1 + g2 * (1 + g2)));
+}
+
+/** Unshaped detail sum (same octaves and gain as detailSum): drives the optical-depth texture. */
+export function detailPlain(oct: ArrayLike<number>, octaves: number, gain: number, fade: ArrayLike<number> | null = null): number {
+  let d = 0, a = 1;
+  for (let k = 0; k < octaves; k++) {
+    d += a * (fade ? fade[k] : 1) * oct[k];
+    a *= gain;
+  }
+  const g2 = gain * gain;
+  return d / Math.sqrt(1 + g2 * (1 + g2 * (1 + g2)));
+}
+
+const plainShaping = newDetailShaping();
+const scratchOct = new Float64Array(4);
+
+/**
+ * Detail noise nd ≈ N(0,1) from a shapeStage result: `octaves` detail fetches, plain (unshaped) by
+ * default. Mirrors phaseDetail() in GLSL (without the flow map).
+ */
+export function detailStage(
+  dvol: CloudNoiseVolume, st: Float64Array, tmp: Float32Array, octaves = 3, sh: DetailShaping = plainShaping,
+): number {
+  detailOctaves(dvol, st, tmp, scratchOct, octaves);
+  return detailSum(scratchOct, octaves, sh);
+}
+
+const scratchStage = new Float64Array(SHAPE_STAGE_SIZE);
+
+/**
+ * Synoptic shape noise nb → out[0] and plain mesoscale detail nd → out[1] (both ≈ N(0,1)) at
+ * noise-domain point q (see shapeStage / detailStage).
  */
 export function cloudNoise(
-  vol: CloudNoiseVolume, qx: number, qy: number, qz: number, tmp: Float32Array, out: Float64Array, fine = true,
+  vol: CloudNoiseVolume, qx: number, qy: number, qz: number, tmp: Float32Array, out: Float64Array, octaves = 3,
+  dvol: CloudNoiseVolume = cloudDetailVolume(),
 ): Float64Array {
   const st = shapeStage(vol, qx, qy, qz, tmp, scratchStage);
   out[0] = st[3];
-  out[1] = detailStage(vol, st, tmp, fine);
+  out[1] = detailStage(dvol, st, tmp, octaves);
   return out;
 }
 
@@ -252,18 +498,21 @@ export function noiseDrift(k: number, out: number[] = [0, 0, 0]): number[] {
 /** At animation time 0 the globe shows only its second flow phase, at cycle −0.5 (no displacement). */
 const DRIFT0 = noiseDrift(-0.5);
 
-const scratchCyc = new Float64Array(4);
-const scratchNoise = new Float64Array(2);
+const scratchCyc = new Float64Array(6);
+const scratchCell = new Float64Array(2);
+const scratchSh = newDetailShaping();
 
 /**
  * Evaluates the cloud field at unit vector (px, py, pz) (SPEC axes: z north) with latitude `lat`
- * and longitude `lon` (radians, consistent with p). `tmp` is a 4-float scratch buffer.
+ * and longitude `lon` (radians, consistent with p). `tmp` is a 4-float scratch buffer. The first
+ * `octaves` detail octaves are taken as resolved (default 3).
  */
 export function cloudAt(
   inp: CloudFieldInputs, px: number, py: number, pz: number, lat: number, lon: number, tmp: Float32Array, out: CloudSample,
+  octaves = 3,
 ): CloudSample {
-  // Regime grid (bilinear, lon wraps).
-  const { gw, gh, grid } = inp;
+  // Regime grids (bilinear, lon wraps).
+  const { gw, gh, grid, aux } = inp;
   let fc = ((lon + Math.PI) / (2 * Math.PI)) * gw - 0.5;
   fc = ((fc % gw) + gw) % gw;
   const fr = Math.min(gh - 1, Math.max(0, ((Math.PI / 2 - lat) / Math.PI) * gh - 0.5));
@@ -272,15 +521,14 @@ export function cloudAt(
   const tc = fc - c0, tr = fr - r0;
   const i00 = 4 * (r0 * gw + c0), i01 = 4 * (r0 * gw + c1), i10 = 4 * (r1 * gw + c0), i11 = 4 * (r1 * gw + c1);
   const w00 = (1 - tc) * (1 - tr), w01 = tc * (1 - tr), w10 = (1 - tc) * tr, w11 = tc * tr;
-  const f = (w00 * grid[i00] + w01 * grid[i01] + w10 * grid[i10] + w11 * grid[i11]) / 255;
-  const sc = (w00 * grid[i00 + 1] + w01 * grid[i01 + 1] + w10 * grid[i10 + 1] + w11 * grid[i11 + 1]) / 255;
-  const cv = (w00 * grid[i00 + 2] + w01 * grid[i01 + 2] + w10 * grid[i10 + 2] + w11 * grid[i11 + 2]) / 255;
-  const cu = (w00 * grid[i00 + 3] + w01 * grid[i01 + 3] + w10 * grid[i10 + 3] + w11 * grid[i11 + 3]) / 255;
-  if (f < 0.004) {
-    out.alpha = 0;
-    out.tau = 0;
-    return out;
-  }
+  const at = (g: Uint8Array, ch: number): number => (w00 * g[i00 + ch] + w01 * g[i01 + ch] + w10 * g[i10 + ch] + w11 * g[i11 + ch]) / 255;
+  const f = at(grid, 0);
+  out.alpha = 0;
+  out.tau = 0;
+  out.cirrus = 0;
+  if (f < 0.004) return out;
+  const sc = at(grid, 1), cv = at(grid, 2), cu = at(grid, 3);
+  let cirrus = aux ? at(aux, 0) : 0, open = aux ? at(aux, 1) : 0;
   let bias = 0, qx = px, qy = py, qz = pz;
   if (inp.cyclones) {
     const e = cycloneEffect(inp.cyclones, px, py, pz, scratchCyc);
@@ -288,15 +536,54 @@ export function cloudAt(
     qx += e[1];
     qy += e[2];
     qz += e[3];
+    if (aux) {
+      cirrus = Math.min(1, cirrus + 0.5 * e[4]);
+      open = Math.min(1, open + e[5]);
+    }
   }
-  const nz = cloudNoise(inp.vol, qx, qy, qz, tmp, scratchNoise);
-  const nb = nz[0], nd = nz[1];
+  const dvol = inp.dvol ?? cloudDetailVolume();
+  const st = shapeStage(inp.vol, qx, qy, qz, tmp, scratchStage);
+  const nb = st[3];
   const zthr = coverageThreshold(f) - bias;
-  const ex = combineNoise(nb, nd, zthr, sc, cv, cu) - zthr;
-  const tau = opticalDepth(ex, sc, cv, cu, Math.abs(lat), nd);
+  let tau = 0, lowEx = nb - zthr;
+  if (nb > zthr - 2.8) {
+    const sh = detailParams(sc, cv, cu, open, st[8], scratchSh);
+    detailOctaves(dvol, st, tmp, scratchOct, octaves);
+    const nd = detailSum(scratchOct, octaves, sh);
+    let ex = combineNoise(nb, nd, zthr, sc, cv, cu, sh.amp, bias) - zthr;
+    let cellTau = 1;
+    if (inp.cvol && sc > 0.02 && ex > -1.5) {
+      cellStage(inp.cvol, st, tmp, scratchCell);
+      cellTau = closedCells(scratchCell[0], scratchCell[1], sc, inp.px ? cellFade(inp.px) : 1);
+    }
+    if (inp.cvol && open > 0.02 && ex > -1.5) {
+      cellStage(inp.cvol, st, tmp, scratchCell, CELL_SCALE * OPEN_CELL_SCALE);
+      ex += openCells(scratchCell[0], open, inp.px ? cellFade(inp.px, CELL_SCALE * OPEN_CELL_SCALE) : 1, 0, nd);
+    }
+    lowEx = ex;
+    tau = opticalDepth(ex, sc, cv, cu, Math.abs(lat), cellularTexture(detailPlain(scratchOct, octaves, sh.gain), nd, sc, open), bias, cellTau);
+  }
+  const low = ALPHA_MAX * (1 - Math.exp(-tau));
+  // Not over optically thick low cloud (as the shader: invisible there).
+  const ci = aux && lowEx < 1.6 ? cirrusAlpha(cirrus, st[7], cirrusFibre(dvol, st, tmp)) * (1 - smoothstep(1.1, 1.6, lowEx)) : 0;
   out.tau = tau;
-  out.alpha = ALPHA_MAX * (1 - Math.exp(-tau));
+  out.cirrus = ci;
+  out.alpha = ci + low * (1 - ci);
   return out;
+}
+
+/**
+ * Detail driving the optical-depth texture: the unshaped sum `plain`, blended toward the shaped
+ * `shaped` detail in cellular regimes (bright closed cells, open-cell rings). Mirrored in GLSL.
+ */
+export function cellularTexture(plain: number, shaped: number, sc: number, open: number): number {
+  const t = Math.min(1, Math.max(0, 0.8 * sc + 0.6 * open));
+  return plain + t * (shaped - plain);
+}
+
+/** Weight of organized frontal / comma cloud from the cyclone coverage bias (σ units). */
+export function organized(bias: number): number {
+  return smoothstep(0.3, 1.5, bias);
 }
 
 /** Noise threshold for a coverage fraction: Φ⁻¹(1 − f) (logistic approximation of the normal CDF). */
@@ -308,29 +595,46 @@ export function coverageThreshold(f: number): number {
 /**
  * Normalized cloud noise z from the shape (nb) and detail (nd) noise (both ≈ N(0,1)), for a threshold
  * zthr (already lowered by any cyclone bias). Detail is strongest near the threshold (fractal, eroded
- * edges; smooth interiors), stronger in deep convection (mesoscale clusters) and weaker in
- * stratocumulus (flat decks); shallow-cumulus regimes are biased clearer, stratocumulus and deep
- * convection cloudier. Mirrored in GLSL.
+ * edges) and weaker but present inside (textured tops); `am` is the regime's amplitude factor
+ * (detailParams), calmer in organized frontal cloud (strong positive cyclone `bias`); shallow-cumulus
+ * regimes are biased clearer, stratocumulus and deep convection cloudier. Mirrored in GLSL.
  */
-export function combineNoise(nb: number, nd: number, zthr: number, sc: number, cv: number, cu: number): number {
+export function combineNoise(nb: number, nd: number, zthr: number, sc: number, cv: number, cu: number, am = 1, bias = 0): number {
   const x2 = 2 * (nb - zthr) * (nb - zthr);
   // exp(−x2) via its rational Taylor bound (the CPU raster calls this per pixel; within 1e-2).
   const edge = 1 / (1 + x2 * (1 + x2 * (0.5 + x2 * (1 / 6))));
-  const a = DETAIL_AMP * (0.25 + 1.4 * edge) * (1 + 0.8 * cv) * (1 - 0.4 * sc);
+  const a = DETAIL_AMP * (DETAIL_FLOOR + DETAIL_EDGE_BOOST * edge) * am * (1 - 0.45 * organized(bias));
   return (nb + a * nd) / Math.sqrt(1 + a * a) - 0.5 * cu + 0.15 * sc + 0.2 * cv;
 }
 
 /**
  * Optical depth for a noise excess ex (σ units above the threshold; ≤ 0 → 0): a crisp edge step, then
- * growing super-linearly (thin veils, bright cores; more so in deep convection) and textured by the
- * detail noise nd; thinner in marine stratocumulus, shallow cumulus and polar regions. Mirrored in
- * GLSL (which adds billow texture).
+ * growing super-linearly (thin veils, bright cores; more so in deep convection) with log-normal
+ * texture from the unshaped detail noise nd (detailPlain: mottled cumulus / stratocumulus, gentle in
+ * stratiform and frontal cloud) and the closed-cell factor `cells` (closedCells); thinner in marine
+ * stratocumulus, shallow cumulus and polar regions. Mirrored in GLSL.
  */
-export function opticalDepth(ex: number, sc: number, cv: number, cu: number, absLat: number, nd: number): number {
+export function opticalDepth(ex: number, sc: number, cv: number, cu: number, absLat: number, nd: number, bias = 0, cells = 1): number {
   if (!(ex > 0)) return 0;
-  // Mesoscale texture inside the cloud (cells, billows): the detail noise also modulates thickness.
-  const texture = Math.min(1.4, Math.max(0.6, 1 + 0.12 * nd));
+  const texture = Math.exp(TAU_TEXTURE * (0.45 + 0.6 * cu + 0.5 * sc + 0.25 * cv) * (1 - 0.5 * organized(bias)) * nd);
   const thick = (1 - 0.45 * smoothstep(1.05, 1.4, absLat)) * (1 - 0.4 * sc - 0.65 * cu + 0.35 * cv);
   const k = 0.6 + 0.3 * cv;
-  return (TAU_PER_SIGMA * ex * (1 - k + k * ex) * texture + EDGE_TAU * smoothstep(0, 0.12, ex)) * thick;
+  return (TAU_PER_SIGMA * ex * (1 - k + k * ex) * texture * cells + EDGE_TAU * smoothstep(0, 0.12, ex)) * thick;
+}
+
+/**
+ * Cirrus veil opacity (mirror of the shader): coverage fraction `cirrus`, patch noise cp (shape
+ * fetch B channel) and fibre noise nc; `fade` is the fibres' footprint fade.
+ */
+export function cirrusAlpha(cirrus: number, cp: number, nc: number, fade = 1): number {
+  if (!(cirrus > 0.02)) return 0;
+  return cirrusAlphaThr(coverageThreshold(cirrus), cp, nc, fade);
+}
+
+/** cirrusAlpha for a precomputed coverage threshold (coverageThreshold of the cirrus fraction). */
+export function cirrusAlphaThr(thr: number, cp: number, nc: number, fade = 1): number {
+  const exP = 0.93 * cp - thr;
+  if (exP <= -0.6) return 0;
+  const n = nc * fade;
+  return CIRRUS_TAU * smoothstep(0.05, 1.2, exP + 0.2 * n) * (0.45 + 0.55 * smoothstep(-0.6, 1.4, n));
 }

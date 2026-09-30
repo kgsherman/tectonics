@@ -15,7 +15,7 @@
  * Relief normals are object-space from the height gradient with the 1/cosφ metric (no tangents).
  */
 import {
-  GLSL_BASIS, GLSL_CONSTANTS, GLSL_RELIEF_RESPONSE, GLSL_SRGB, GLSL_TERRAIN_DETAIL, GLSL_TERRAIN_RECON,
+  GLSL_BASIS, GLSL_CONSTANTS, GLSL_OVERLAY_SHARP, GLSL_RELIEF_RESPONSE, GLSL_SRGB, GLSL_TERRAIN_DETAIL, GLSL_TERRAIN_RECON,
 } from './shadersCommon';
 
 export const SURFACE_VERTEX = /* glsl */ `
@@ -53,11 +53,13 @@ ${GLSL_BASIS}
 ${GLSL_TERRAIN_RECON}
 ${GLSL_TERRAIN_DETAIL}
 ${GLSL_RELIEF_RESPONSE}
+${GLSL_OVERLAY_SHARP}
 uniform sampler2D uBase;
 uniform float uHasBase;
 uniform vec2 uBaseSize;
 uniform sampler2D uOverlay;
 uniform float uHasOverlay;
+uniform vec2 uOverlaySize;
 uniform sampler2D uHeight;
 uniform float uHasHeight;
 uniform vec2 uHeightTexel;
@@ -133,12 +135,23 @@ void main() {
   // Hardware-filtered height (uniform control flow: its derivative gives the coast AA width).
   float hLin = hasH ? textureGrad(uHeight, st, dsx, dsy).r : uSeaLevel - 1.0;
   float fwH = fwidth(hLin);
+  // Coarse (~8 texel / ≥ 4 px) mean height for the light-independent relief cue.
+  vec2 cg = max(8.0 * uHeightTexel, 4.0 * fwSt);
+  float hCoarse = hasH ? textureGrad(uHeight, st, vec2(cg.x, 0.0), vec2(0.0, cg.y)).r : uSeaLevel;
+  // Height texel angle; relief exaggeration grows as a pixel spans more of the map (at the default
+  // zoom a texel is ~1 px and footprint-filtered slopes flatten further out): ×1.6 at 1 texel/px
+  // (≈ ×1.5 at the default camera distance), up to ×2.2, fading to ×1 as texels magnify (the
+  // reconstruction path takes over).
+  float texRadH = PI / uHeightSize.y;
+  float footBoost = clamp(1.6 * sqrt(pxRad / texRadH), 1.0, 2.2);
 
   vec3 col = vec3(0.015, 0.02, 0.03);
   vec3 tilt = vec3(0.0);
   float land = 0.0;
   float detailAlbedo = 0.0;
   float rough = 0.0;
+  // Relief tilt without the procedural detail (drives the light-independent relief cue).
+  float baseTilt = 0.0;
 
   if (k < 1.0) {
     vec3 c = uHasBase > 0.5 ? textureGrad(uBase, st, dsx, dsy).rgb : col;
@@ -154,11 +167,12 @@ void main() {
       float gE = (hE - hW) / (2.0 * d.x * TWO_PI * cosLat);
       float gN = (hN - hS) / (2.0 * d.y * PI);
       // Seas render flat: the clamped gradient still rises toward the coast on the sea side.
-      t = uShadeScale * l * (gE * east + gN * north);
+      t = (uShadeScale * footBoost) * l * (gE * east + gN * north);
     }
     col = c;
     land = l;
     tilt = t;
+    baseTilt = length(t);
   }
 
   if (k > 0.0) {
@@ -168,9 +182,8 @@ void main() {
     // Fractal coast breakup by domain warping the lookup (≤ ~0.4 texel, tangent to the sphere).
     warp = uDetail * (warp - dot(warp, n0) * n0);
     vec2 stw = st + vec2(dot(warp, east) / (TWO_PI * cosLat), -dot(warp, north) / PI);
-    TerrainSample ts = reconstructTerrain(uHeight, uHeightSize, uBase, uBaseSize, uSameSize > 0.5, uHasBase > 0.5, stw, uSeaLevel);
-    // Height texel angle (the reconstruction works in height texels).
-    float texRadH = PI / uHeightSize.y;
+    TerrainSample ts = reconstructTerrain(
+      uHeight, uHeightSize, uBase, uBaseSize, uSameSize > 0.5, uHasBase > 0.5, stw, uSeaLevel, pxRad / texRadH);
     // Real (unexaggerated) slope and elevation drive how rugged the procedural detail is.
     float slopeReal = length(ts.g) / (texRadH * 6371000.0);
     float above = max(ts.h - uSeaLevel, 0.0);
@@ -185,6 +198,7 @@ void main() {
       float gE = gt.x * uHeightSize.x / (TWO_PI * cosLat);
       float gN = -gt.y * uHeightSize.y / PI;
       t = uShadeScale * l * (gE * east + gN * north);
+      baseTilt = mix(baseTilt, length(t), k);
       vec3 dg = det.yzw - dot(det.yzw, n0) * n0;
       t += (uDetail * l * (0.04 + 0.3 * r)) * dg;
     }
@@ -202,8 +216,10 @@ void main() {
   float nv = max(dot(n0, V), 0.0);
   float overlayLight = 1.0;
   if (lit) {
-    // Albedo detail (lit modes only: flat mode keeps exact legend colors).
+    // Albedo detail and the light-independent relief cue (lit modes only: flat mode keeps exact
+    // legend colors).
     col *= 1.0 + uDetail * (0.14 + 0.06 * rough) * detailAlbedo;
+    col *= reliefCue(baseTilt, land * (max(hLin, uSeaLevel) - max(hCoarse, uSeaLevel)));
   }
   if (uLightMode == 1) {
     // Hillshade with the light 35° above the local horizon toward screen up-left, evaluated per
@@ -242,6 +258,10 @@ void main() {
 
   if (uHasOverlay > 0.5) {
     vec4 o = textureGrad(uOverlay, st, dsx, dsy);
+    // Magnified (an overlay texel ≥ 1.5–3 px): crisp lines instead of a zoom-wide blur.
+    float ovTex = pxRad * uOverlaySize.y / PI;
+    float ko = smoothstep(0.67, 0.33, ovTex);
+    if (ko > 0.0) o = mix(o, overlaySharp(uOverlay, uOverlaySize, st, ovTex), ko);
     if (o.a > 0.003) col = mix(col, srgbToLinear(o.rgb / o.a) * overlayLight, o.a);
   }
 

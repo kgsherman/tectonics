@@ -45,8 +45,13 @@ export class Viewport {
   readonly toolbar = h('div', { class: 'wg-toolbar' });
   readonly perf = h('div', { class: 'wg-view-perf wg-float', attrs: { hidden: true } });
   private readonly cover = h('div', { class: 'wg-view-cover' });
+  /** Announced (polite live region) only when the task changes, never per percent. */
   private readonly renderingLabel = h('span', { text: 'Rendering…' });
-  private readonly rendering = h('div', { class: 'wg-view-render wg-float', attrs: { role: 'status', 'aria-live': 'polite' } }, h('span', { class: 'wg-spinner' }), this.renderingLabel);
+  private readonly renderingDetail = h('span', { class: 'wg-view-render-detail', attrs: { 'aria-hidden': 'true' } });
+  private readonly rendering = h('div', { class: 'wg-view-render wg-float' },
+    h('span', { class: 'wg-spinner', attrs: { 'aria-hidden': 'true' } }),
+    h('span', { attrs: { role: 'status', 'aria-live': 'polite', 'aria-atomic': 'true' } }, this.renderingLabel),
+    this.renderingDetail);
 
   private current: AppView | null = null;
   private currentKind: ViewKind | null = null;
@@ -217,10 +222,16 @@ export class Viewport {
       ));
   }
 
-  /** Busy badge over the view ("Rendering…", "Computing climate… 40%"). */
-  setRendering(on: boolean, label = 'Rendering…'): void {
+  /**
+   * Busy badge over the view ("Rendering…", "Computing climate…" + "40%"). Only `label` is in the
+   * live region, so a screen reader hears the task once, not every percent; `detail` (the progress
+   * readout) changes silently. The hidden badge is out of the accessibility tree (CSS visibility).
+   */
+  setRendering(on: boolean, label = 'Rendering…', detail = ''): void {
     toggleClass(this.rendering, 'is-visible', on);
-    if (on) setText(this.renderingLabel, label);
+    if (!on) return;
+    setText(this.renderingLabel, label);
+    setText(this.renderingDetail, detail);
   }
 
   setPerf(text: string | null, detail?: string): void {
