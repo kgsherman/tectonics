@@ -62,6 +62,14 @@ const NH_SUMMER = [false, false, false, true, true, true, true, true, true, fals
  */
 export function classifyKoppen(temp: ArrayLike<number>, precip: ArrayLike<number>, southern: boolean, opts?: KoppenOptions): number {
   const cd = opts?.cdBoundary ?? 0;
+  // Summer = the warmer of AMJJAS / ONDJFM (Peel et al. 2007); hemisphere flag only breaks near-ties.
+  let tAMJJAS = 0, tONDJFM = 0;
+  for (let m = 0; m < 12; m++) {
+    const t = Number.isFinite(temp[m]) ? temp[m] : 0;
+    if (NH_SUMMER[m]) tAMJJAS += t;
+    else tONDJFM += t;
+  }
+  const southHalf = Math.abs(tAMJJAS - tONDJFM) < 0.6 ? southern : tONDJFM > tAMJJAS;
   let tSum = 0, pSum = 0, tMin = Infinity, tMax = -Infinity, pMin = Infinity, warm10 = 0;
   let pSummer = 0, sMin = Infinity, sMax = -Infinity, wMin = Infinity, wMax = -Infinity;
   for (let m = 0; m < 12; m++) {
@@ -73,7 +81,7 @@ export function classifyKoppen(temp: ArrayLike<number>, precip: ArrayLike<number
     if (t > tMax) tMax = t;
     if (p < pMin) pMin = p;
     if (t > 10) warm10++;
-    const summer = southern ? !NH_SUMMER[m] : NH_SUMMER[m];
+    const summer = southHalf ? !NH_SUMMER[m] : NH_SUMMER[m];
     if (summer) {
       pSummer += p;
       if (p < sMin) sMin = p;

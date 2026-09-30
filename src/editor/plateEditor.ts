@@ -1,4 +1,4 @@
-import type { SphereMesh, WorldDraft, WorldView } from '../core/types';
+import type { GenerateParams, SphereMesh, WorldDraft, WorldView } from '../core/types';
 
 // CONTRACT STUB — implemented by the editor owner. Keep the exported signatures.
 const NI = (): never => {
@@ -15,8 +15,15 @@ export interface PlateEditorOptions {
   onDraftChange?: (draft: WorldDraft) => void;
   /** User pressed "Simulate this world": the app should load the draft into the simulation. */
   onApply: (draft: WorldDraft) => void;
+  /**
+   * Obtain a starting draft: 'blank' (one ocean plate), 'random' (generator; may run in a worker),
+   * or 'current' (the running simulation's state). The editor shows a busy state while pending.
+   */
+  requestDraft: (source: 'blank' | 'random' | 'current', gen?: Partial<GenerateParams>) => Promise<WorldDraft>;
   /** Display sea level used for preview rendering (m). */
   seaLevel?: number;
+  /** Plate cap (default MAX_PLATES). */
+  maxPlates?: number;
 }
 
 /**

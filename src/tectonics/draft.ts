@@ -1,7 +1,9 @@
-import { EARTH_RADIUS_KM } from '../core/constants';
+import { EARTH_RADIUS_KM, MAX_PLATES } from '../core/constants';
 import { createNoise3, fbm3 } from '../core/noise';
 import { Rng } from '../core/rng';
-import type { PlateInfo, PlateSpec, RGB, SphereMesh, Vec3, WorldDraft, WorldSnapshot } from '../core/types';
+import { nearestCell } from '../core/sphereMesh';
+import { latLonToVec } from '../core/math3';
+import type { Hotspot, PlateInfo, PlateSpec, Quat, RGB, SphereMesh, Vec3, WorldDraft, WorldSnapshot } from '../core/types';
 import {
   BOUNDARY_CONVERGENT, BOUNDARY_DIVERGENT, BOUNDARY_NONE, BOUNDARY_TRANSFORM, CRUST_CONTINENTAL, CRUST_OCEANIC,
 } from '../core/types';
@@ -71,11 +73,14 @@ export function computePlateInfos(mesh: SphereMesh, plate: Int16Array, crust: Ui
     const vx = w[1] * c[2] - w[2] * c[1];
     const vy = w[2] * c[0] - w[0] * c[2];
     const vz = w[0] * c[1] - w[1] * c[0];
+    const fr: Quat = p.frame ? [p.frame[0], p.frame[1], p.frame[2], p.frame[3]] : [0, 0, 0, 1];
     return {
       id: p.id,
       name: p.name,
       color: [p.color[0], p.color[1], p.color[2]] as RGB,
       omega: [w[0], w[1], w[2]] as Vec3,
+      frame: [fr[0], fr[1], fr[2], fr[3]] as Quat,
+      rotation: fr,
       centroid: c,
       area: count[k] / n,
       continentalFraction: count[k] > 0 ? cont[k] / count[k] : 0,
@@ -134,8 +139,13 @@ export function classifyBoundaries(mesh: SphereMesh, plate: Int16Array, plates: 
 }
 
 /** Build a WorldSnapshot view of a draft (orogeny = 0, boundaries classified) for rendering in the editor. */
+let snapshotCounter = 0;
+
 export function snapshotFromDraft(mesh: SphereMesh, draft: WorldDraft): WorldSnapshot {
+  snapshotCounter = (snapshotCounter + 1) % 0x40000000;
   return {
+    // Negative ids never collide with sim ids (sim ids are positive).
+    id: -(snapshotCounter + 1),
     time: draft.time,
     n: draft.n,
     plate: draft.plate.slice(),
@@ -143,7 +153,7 @@ export function snapshotFromDraft(mesh: SphereMesh, draft: WorldDraft): WorldSna
     crust: draft.crust.slice(),
     age: draft.age.slice(),
     boundary: classifyBoundaries(mesh, draft.plate, draft.plates),
-    orogeny: new Float32Array(draft.n),
+    orogeny: draft.orogeny ? draft.orogeny.slice() : new Float32Array(draft.n),
     plates: computePlateInfos(mesh, draft.plate, draft.crust, draft.plates),
     hotspots: draft.hotspots.map((h) => ({ pos: [...h.pos] as Vec3, strength: h.strength, radius: h.radius })),
   };
@@ -163,6 +173,9 @@ export function blankDraft(mesh: SphereMesh, seed = 1): WorldDraft {
     hotspots: [],
     time: 0,
     seed,
+    nextPlateId: 2,
+    stepIndex: 0,
+    revision: 0,
   };
 }
 
@@ -174,16 +187,30 @@ export function cloneDraft(draft: WorldDraft): WorldDraft {
     crust: draft.crust.slice(),
     elev: draft.elev.slice(),
     age: draft.age.slice(),
-    plates: draft.plates.map((p) => ({
-      id: p.id,
-      name: p.name,
-      color: [p.color[0], p.color[1], p.color[2]] as RGB,
-      omega: [p.omega[0], p.omega[1], p.omega[2]] as Vec3,
-    })),
-    hotspots: draft.hotspots.map((h) => ({ pos: [h.pos[0], h.pos[1], h.pos[2]] as Vec3, strength: h.strength, radius: h.radius })),
+    orogeny: draft.orogeny ? draft.orogeny.slice() : undefined,
+    plates: draft.plates.map(clonePlateSpec),
+    hotspots: draft.hotspots.map(cloneHotspot),
     time: draft.time,
     seed: draft.seed,
+    nextPlateId: Math.max(draft.nextPlateId ?? 0, ...draft.plates.map((p) => p.id + 1), 1),
+    stepIndex: draft.stepIndex,
+    revision: draft.revision,
   };
+}
+
+export function clonePlateSpec(p: PlateSpec): PlateSpec {
+  const o: PlateSpec = {
+    id: p.id,
+    name: p.name,
+    color: [p.color[0], p.color[1], p.color[2]] as RGB,
+    omega: [p.omega[0], p.omega[1], p.omega[2]] as Vec3,
+  };
+  if (p.frame) o.frame = [p.frame[0], p.frame[1], p.frame[2], p.frame[3]];
+  return o;
+}
+
+function cloneHotspot(h: Hotspot): Hotspot {
+  return { pos: [h.pos[0], h.pos[1], h.pos[2]] as Vec3, strength: h.strength, radius: h.radius };
 }
 
 /**
@@ -192,6 +219,7 @@ export function cloneDraft(draft: WorldDraft): WorldDraft {
  * (smaller disconnected fragments are absorbed by their neighbors).
  */
 export function voronoiPlates(mesh: SphereMesh, seeds: Vec3[], roughness: number, seed: number): Int16Array {
+  if (seeds.length > MAX_PLATES) throw new Error(`voronoiPlates: at most ${MAX_PLATES} seeds`);
   const { n, xyz } = mesh;
   const out = new Int16Array(n).fill(-1);
   if (seeds.length === 0) return out.fill(0);
@@ -332,4 +360,83 @@ export function compactDraft(draft: WorldDraft): WorldDraft {
   }
   d.plates = plates;
   return d;
+}
+
+/**
+ * World-frame draft from a snapshot (e.g. a history keyframe) so the sim can resume from it.
+ * Plate frames (PlateInfo.rotation) are carried into PlateSpec.frame; orogeny is kept.
+ */
+export function draftFromSnapshot(s: WorldSnapshot, seed: number, stepIndex = 0): WorldDraft {
+  const plates: PlateSpec[] = s.plates.map((p) =>
+    clonePlateSpec({ id: p.id, name: p.name, color: p.color, omega: p.omega, frame: p.rotation }),
+  );
+  return {
+    n: s.n,
+    plate: s.plate.slice(),
+    crust: s.crust.slice(),
+    elev: s.elev.slice(),
+    age: s.age.slice(),
+    orogeny: s.orogeny.slice(),
+    plates,
+    hotspots: s.hotspots.map(cloneHotspot),
+    time: s.time,
+    seed,
+    nextPlateId: Math.max(1, ...plates.map((p) => p.id + 1)),
+    stepIndex,
+    revision: 0,
+  };
+}
+
+export interface CellSample {
+  cell: number;
+  plateIndex: number;
+  plate: PlateInfo | null;
+  elev: number;
+  crust: number;
+  age: number;
+  boundary: number;
+  orogeny: number;
+}
+
+/** Nearest-cell sample of a snapshot at (lat, lon) radians (hover inspector). */
+export function sampleSnapshotAt(mesh: SphereMesh, s: WorldSnapshot, lat: number, lon: number, hint?: number): CellSample {
+  const v = latLonToVec(lat, lon);
+  const cell = nearestCell(mesh, v[0], v[1], v[2], hint);
+  const k = s.plate[cell];
+  return {
+    cell,
+    plateIndex: k,
+    plate: k >= 0 && k < s.plates.length ? s.plates[k] : null,
+    elev: s.elev[cell],
+    crust: s.crust[cell],
+    age: s.age[cell],
+    boundary: s.boundary[cell],
+    orogeny: s.orogeny[cell],
+  };
+}
+
+const NI = (): never => {
+  throw new Error('not implemented');
+};
+
+/**
+ * CONTRACT STUB (tectonics-generate owner): make a hand-edited draft simulation-ready. Compacts
+ * plates, splits disconnected plate components into separate plates (fragments < ~20 cells merge into
+ * a neighbour), gives zero-motion plates a random default motion, synthesizes oceanic crust age from
+ * distance to the divergent boundaries of the current motions and sets ocean depth with
+ * oceanDepthForAge (except cells flagged in `keepElevation`), and adds continental shelves / coastal
+ * slopes. Reuses generator code. Returns a new draft (input unmodified).
+ */
+export function finalizeDraft(mesh: SphereMesh, draft: WorldDraft, seed: number, keepElevation?: Uint8Array): WorldDraft {
+  void mesh; void draft; void seed; void keepElevation;
+  return NI();
+}
+
+/**
+ * CONTRACT STUB (tectonics-generate owner): carry a draft to a mesh of another resolution
+ * (nearest cell for plate/crust, barycentric for elev/age/orogeny, then compaction + connectivity cleanup).
+ */
+export function resampleDraft(from: SphereMesh, to: SphereMesh, draft: WorldDraft): WorldDraft {
+  void from; void to; void draft;
+  return NI();
 }

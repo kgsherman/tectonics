@@ -29,6 +29,16 @@ export function lonToCol(w: number, lon: number): number {
   return c;
 }
 
+/** Index of the grid cell containing (lat, lon) radians (nearest cell center). */
+export function gridIndexAt(w: number, h: number, lat: number, lon: number): number {
+  let r = Math.round(latToRow(h, lat));
+  if (r < 0) r = 0;
+  else if (r >= h) r = h - 1;
+  let c = Math.round(lonToCol(w, lon));
+  if (c >= w) c -= w;
+  return r * w + c;
+}
+
 /** Precompute barycentric (Delaunay-triangle) + nearest mappings from mesh cells to a w x h grid. */
 export function buildMeshGridMap(mesh: SphereMesh, w: number, h: number): MeshGridMap {
   const npx = w * h;

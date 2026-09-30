@@ -11,3 +11,10 @@ export const SOLAR_CONSTANT = 1361;
 export const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const;
 /** Default mesh resolution (cells). Presets offered in UI: 40k / 100k / 160k. */
 export const DEFAULT_MESH_N = 100_000;
+/**
+ * Hard cap on simultaneous plates (bitmask slots). Plate indices in drafts/snapshots are in
+ * [0, MAX_PLATES). Use `(mask >>> k) & 1` for bit tests (JS shifts are mod 32; 1<<31 is negative).
+ */
+export const MAX_PLATES = 32;
+/** Environmental lapse rate, °C per meter (positive = cooling with height). */
+export const LAPSE_RATE = 0.0065;
