@@ -19,6 +19,8 @@ export const ARROW_RAD_PER_KM_MYR = 0.3 * DEG;
  * quantity the simulation clamps, so drawn motions reach the simulation unscaled.
  */
 export const MAX_PLATE_SPEED = 150;
+/** Plates slower than this (km/Myr, |ω|·R) count as motionless: "Simulate" gives them a default motion. */
+export const ZERO_MOTION_KM_MYR = 0.5;
 /** Default motion for new plates / "Randomize motions", km/Myr. */
 export const DEFAULT_SPEED_RANGE: readonly [number, number] = [30, 60];
 

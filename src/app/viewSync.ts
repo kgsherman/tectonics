@@ -21,6 +21,10 @@ export interface WorldData {
 }
 
 export class ViewSync {
+  /** What the view last received: rebuilding clouds or particles costs main-thread time, skip repeats. */
+  private cloudKey = '';
+  private fieldKey = '';
+
   constructor(
     private readonly store: Store<AppState, Action>,
     private readonly viewport: Viewport,
@@ -33,20 +37,35 @@ export class ViewSync {
     const s = this.store.getState();
     const v = s.settings.view;
     this.viewport.setSeaLevel(s.settings.seaLevel);
-    this.viewport.setLighting(resolveLighting(v.lighting, v.layer, s.runtime.month, s.settings.climate.axialTilt));
+    this.viewport.setLighting(resolveLighting(v.lighting, v.layer, s.runtime.month, s.settings.climate.axialTilt, this.viewport.kind ?? v.view));
     this.viewport.setReliefScale(v.reliefScale);
     this.viewport.setGraticule(v.overlays.graticule);
+    this.viewport.setSurfaceDetail(Math.min(1, Math.max(0, v.detail)));
   }
 
-  /** Particles and clouds for the current climate and month (clouds only over the satellite layer). */
+  /**
+   * Particles and clouds for the current climate and month (clouds only over the satellite layer).
+   * Only what changed is rebuilt: a cloud layer costs the view tens of milliseconds to set up, and
+   * this runs for every related setting (particle count, layer, month, a new climate).
+   */
   weather(): void {
     const s = this.store.getState();
     const c = this.data.climate();
     const v = s.settings.view;
     const m = s.runtime.month;
     this.viewport.setParticleCount(v.particleCount);
-    this.viewport.setVectorField(!c || v.particles === 'off' ? null : v.particles === 'wind' ? windFieldSpec(c, m) : currentFieldSpec(c, m));
-    this.viewport.setClouds(c && v.clouds && v.layer === 'satellite' ? cloudSpec(c, m, v.cloudDensity) : null);
+    const field = !c || v.particles === 'off' ? null : v.particles;
+    const fieldKey = field && c ? `${c.id}|${m}|${field}` : '';
+    if (fieldKey !== this.fieldKey || !field) {
+      this.fieldKey = fieldKey;
+      this.viewport.setVectorField(!c || !field ? null : field === 'wind' ? windFieldSpec(c, m) : currentFieldSpec(c, m));
+    }
+    const clouds = !!c && v.clouds && v.layer === 'satellite';
+    const cloudKey = clouds && c ? `${c.id}|${m}|${v.cloudDensity}` : '';
+    if (cloudKey !== this.cloudKey) {
+      this.cloudKey = cloudKey;
+      this.viewport.setClouds(clouds && c ? cloudSpec(c, m, v.cloudDensity) : null);
+    }
   }
 
   legend(): void {

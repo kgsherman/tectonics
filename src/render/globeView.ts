@@ -11,6 +11,7 @@ import { GlobeSky } from './globeSky';
 import { GlobeSurface, LIGHT_FLAT, LIGHT_RELIEF, LIGHT_SUN, type SharedUniforms } from './globeSurface';
 import { copyVectorField, DEFAULT_PARTICLE_COUNT, ParticleSystem } from './particles';
 import { GlobeParticles } from './particlesGlobe';
+import { DetailFader, heightSignature } from './viewDetail';
 import { HeightField } from './viewHeight';
 import { PointerHub } from './viewPointer';
 import {
@@ -49,6 +50,13 @@ export class GlobeView implements WorldView {
   private readonly pointers = new PointerHub();
   private readonly input: GlobeInput;
   private readonly resizeObserver: ResizeObserver;
+  private readonly detailFader = new DetailFader();
+  /** User scale on the procedural zoom detail (0 disables it). */
+  private detailAmount = 1;
+  /** Size (CSS px) and DPR last applied to the renderer; 0 = never (canvas still at its default size). */
+  private appliedW = 0;
+  private appliedH = 0;
+  private appliedDpr = 0;
 
   private particles: ParticleSystem | null = null;
   private particleCount = DEFAULT_PARTICLE_COUNT;
@@ -116,8 +124,13 @@ export class GlobeView implements WorldView {
       pick: (x, y) => this.pick(x, y),
     });
 
+    // Size tracking never relies on a single signal: the ResizeObserver (not delivered while the page
+    // is hidden), visibility/window resizes, and a per-frame / per-screenshot size check. A view
+    // created inside a zero-size or hidden container picks up its real size as soon as it has one.
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(this.root);
+    document.addEventListener('visibilitychange', this.onVisibility);
+    window.addEventListener('resize', this.onVisibility);
     this.resize();
     this.raf = requestAnimationFrame(this.frame);
   }
@@ -132,8 +145,13 @@ export class GlobeView implements WorldView {
   }
 
   setHeightMap(height: Float32Array | null, width: number, height_: number): void {
-    if (height) this.heights.set(height, width, height_);
-    else this.heights.clear();
+    if (height) {
+      this.heights.set(height, width, height_);
+      this.detailFader.noteHeights(heightSignature(height, width * height_), performance.now());
+    } else {
+      this.heights.clear();
+      this.detailFader.reset();
+    }
     this.surface.setHeight(height, width, height_);
     this.applyRelief();
   }
@@ -225,6 +243,15 @@ export class GlobeView implements WorldView {
     this.invalidate();
   }
 
+  /**
+   * Strength of the procedural close-up detail (micro-relief, albedo variation, coast breakup) that
+   * fades in when zoomed past the base texture's resolution. 0 disables it; default 1.
+   */
+  setSurfaceDetail(amount: number): void {
+    this.detailAmount = Math.max(0, Math.min(1, Number.isFinite(amount) ? amount : 0));
+    this.invalidate();
+  }
+
   /** Fixes the subsolar longitude (radians) in 'sun' lighting; null = follow the camera. */
   setSunLongitude(lon: number | null): void {
     this.fixedSunLon = lon;
@@ -306,20 +333,11 @@ export class GlobeView implements WorldView {
   }
 
   resize(): void {
-    if (this.disposed) return;
-    const w = this.root.clientWidth, h = this.root.clientHeight;
-    if (w === 0 || h === 0) return;
-    const dpr = this.dpr();
-    this.renderer.setPixelRatio(dpr);
-    this.renderer.setSize(w, h, false);
-    this.sky.setDpr(dpr);
-    this.markers.setDpr(dpr);
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
-    this.invalidate();
+    this.syncSize();
   }
 
   toDataURL(): string {
+    this.syncSize();
     this.renderNow(0);
     return this.canvas.toDataURL('image/png');
   }
@@ -329,6 +347,8 @@ export class GlobeView implements WorldView {
     this.disposed = true;
     cancelAnimationFrame(this.raf);
     this.resizeObserver.disconnect();
+    document.removeEventListener('visibilitychange', this.onVisibility);
+    window.removeEventListener('resize', this.onVisibility);
     this.input.dispose();
     this.controls.orbit.removeEventListener('change', this.onControlsChange);
     this.controls.dispose();
@@ -352,6 +372,34 @@ export class GlobeView implements WorldView {
   private dpr(): number {
     return Math.min(2, window.devicePixelRatio || 1);
   }
+
+  /**
+   * Applies the container size to the renderer when it changed (cheap to call every frame). Returns
+   * false while the container has no area (nothing to draw).
+   */
+  private syncSize(): boolean {
+    if (this.disposed) return false;
+    const w = this.root.clientWidth, h = this.root.clientHeight;
+    if (w === 0 || h === 0) return false;
+    const dpr = this.dpr();
+    if (w === this.appliedW && h === this.appliedH && dpr === this.appliedDpr) return true;
+    this.appliedW = w;
+    this.appliedH = h;
+    this.appliedDpr = dpr;
+    this.renderer.setPixelRatio(dpr);
+    this.renderer.setSize(w, h, false);
+    this.sky.setDpr(dpr);
+    this.markers.setDpr(dpr);
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    this.invalidate();
+    return true;
+  }
+
+  private readonly onVisibility = (): void => {
+    this.syncSize();
+    this.invalidate();
+  };
 
   private invalidate(): void {
     this.needsRender = true;
@@ -396,11 +444,19 @@ export class GlobeView implements WorldView {
     this.raf = requestAnimationFrame(this.frame);
     const dt = this.lastFrameMs < 0 ? 0 : Math.min(0.1, Math.max(0, (t - this.lastFrameMs) / 1000));
     this.lastFrameMs = t;
-    if (this.root.clientWidth === 0 || this.root.clientHeight === 0) return;
+    if (!this.syncSize()) return;
     const moved = this.controls.update(dt);
     const animating = this.particles !== null || this.clouds.active;
-    if (moved || animating || this.needsRender) this.renderNow(animating ? dt : 0);
+    // Re-render for the detail fade only while its value moves (it is constant 0 through the hold,
+    // i.e. during the whole playback: no extra full-rate renders between streamed frames), up to and
+    // including the settled value.
+    const fading = this.detailValue(performance.now()) !== this.surface.detail;
+    if (moved || animating || this.needsRender || fading) this.renderNow(animating ? dt : 0);
   };
+
+  private detailValue(nowMs: number): number {
+    return this.detailAmount * this.detailFader.value(nowMs);
+  }
 
   /** Updates per-frame uniforms and animated layers, then renders. */
   private renderNow(dt: number): void {
@@ -423,6 +479,7 @@ export class GlobeView implements WorldView {
     const pxPerRad = this.root.clientHeight / (2 * Math.tan((FOV * Math.PI) / 360) * Math.max(1e-3, dist - 1));
     this.arrows.setPixelScale(pxPerRad);
     this.clouds.setTime(this.clock);
+    this.surface.setDetail(this.detailValue(performance.now()));
 
     if (this.particles) {
       // Roughly constant on-screen speed across zoom levels.

@@ -25,6 +25,11 @@ export interface HydroTuning {
   /** Gate threshold r0 (column relative humidity at which the gate saturates at 1). */
   gateThreshold: number;
   /**
+   * Weight of the ice-phase onset: below 0 °C (column temperature) r0 is scaled by
+   * 1 − w·(1 − e_si/e_sw) (precipitation starts at ice saturation). 0 disables.
+   */
+  icePhaseGate: number;
+  /**
    * Storm-track lowering of r0: r0 − stormGateShift · clamp(Baro / baroclinicForMaxGateShift, 0, 1).
    * The gate is a relation for instantaneous column RH; synoptic RH variance σ² in storm tracks
    * turns its monthly mean into exp(a (r̄ − r0 + a σ²/2)), so rain falls at lower mean RH
@@ -148,6 +153,12 @@ export interface HydroTuning {
   divergenceMax: number;
   /** Eddy diffusivity (m²/s): K = min + (max − min) · clamp(Baro / baroForMaxK, 0, 1). */
   eddyDiffusivityMin: number;
+  /**
+   * Terrain blocking of eddy moisture diffusion: each face's diffusivity × exp(−|Δh⁺|/this) (m) with
+   * Δh⁺ the smoothed-height step between the two cells (the moist layer cannot mix across a ridge:
+   * rain shadows). 0 disables.
+   */
+  diffusionBlockHeight: number;
   eddyDiffusivityMax: number;
   baroclinicForMaxDiffusivity: number;
 
@@ -207,6 +218,16 @@ export interface HydroTuning {
   /** Marine stratocumulus over cold, stable water: cloudStratusWeight · clamp(stab / cloudStratusRefK). */
   cloudStratusWeight: number;
   cloudStratusRefK: number;
+  /** Stratocumulus thickening per unit of normalized subsidence (the trapping inversion). */
+  cloudStratusSubsidence: number;
+  /** RH-driven layer cloud × max(0, 1 − this · subsidence) (dry descending air of the subtropical highs). */
+  cloudSubsidenceThinning: number;
+  /** Frontal cloud of the storm tracks per unit of the normalized storm-track (baroclinic) index. */
+  cloudStormWeight: number;
+  /** Polar low cloud (summer stratus over open water / melting ice). */
+  cloudPolarWeight: number;
+  /** Shallow-cumulus base cover over open water. */
+  cloudMarineBase: number;
 }
 
 export const HYDRO_TUNING: HydroTuning = {
@@ -215,22 +236,23 @@ export const HYDRO_TUNING: HydroTuning = {
   referenceLandWeight: 0.1,
 
   gateSteepness: 15,
-  gateThreshold: 0.78,
-  stormGateShift: 0.25,
+  gateThreshold: 0.83,
+  icePhaseGate: 1,
+  stormGateShift: 0.4,
   baroclinicForMaxGateShift: 1.5,
   landGateShift: 0.25,
   landConvectionGateShift: 0.15,
   landConvectionRefK: 8,
-  subsidenceCapping: 1.2,
-  subsidenceCappingLand: 0.3,
+  subsidenceCapping: 3,
+  subsidenceCappingLand: 1.8,
   gateShiftMax: 0.5,
   precipTimescaleDays: 4,
   condensationTimescaleHours: 2,
 
   ascentWeight: 1.0,
-  subsidenceWeight: 0.6,
+  subsidenceWeight: 0.4,
   baroclinicWeight: 0.6,
-  orographicWeight: 0.6,
+  orographicWeight: 0.8,
   stabilityWeight: 0.15,
   multiplierMin: 0.05,
   multiplierMax: 12,
@@ -247,10 +269,10 @@ export const HYDRO_TUNING: HydroTuning = {
   stabilityMax: 12,
 
   airDensity: 1.2,
-  evapTransferCoeff: 0.95e-3,
+  evapTransferCoeff: 7e-4,
   gustiness: 4.5,
 
-  etRecycling: 0.65,
+  etRecycling: 0.5,
   etMemoryWeight: 0.5,
   etMemoryMonths: 1.5,
   petRampTemp: 2,
@@ -264,8 +286,9 @@ export const HYDRO_TUNING: HydroTuning = {
   departureIterations: 2,
   divergenceWeight: 0.5,
   divergenceMax: 4e-5,
-  eddyDiffusivityMin: 1.0e6,
-  eddyDiffusivityMax: 1.5e6,
+  eddyDiffusivityMin: 5e5,
+  diffusionBlockHeight: 1500,
+  eddyDiffusivityMax: 8e6,
   baroclinicForMaxDiffusivity: 1,
 
   convergenceTolerance: 0.01,
@@ -291,13 +314,18 @@ export const HYDRO_TUNING: HydroTuning = {
   sweMax: 5000,
   snowSpinupYears: 3,
 
-  cloudRhLow: 0.2,
+  cloudRhLow: 0.25,
   cloudRhHigh: 0.75,
-  cloudRhWeight: 0.75,
-  cloudPrecipWeight: 0.35,
-  cloudPrecipRefMmDay: 3,
-  cloudStratusWeight: 0.35,
-  cloudStratusRefK: 4,
+  cloudRhWeight: 0.6,
+  cloudPrecipWeight: 0.6,
+  cloudPrecipRefMmDay: 4,
+  cloudStratusWeight: 0.45,
+  cloudStratusRefK: 3,
+  cloudStratusSubsidence: 0.5,
+  cloudSubsidenceThinning: 0.9,
+  cloudStormWeight: 0.5,
+  cloudPolarWeight: 0.6,
+  cloudMarineBase: 0.15,
 };
 
 /** Defaults merged with an optional partial override. */

@@ -1,10 +1,14 @@
 /**
- * Main-thread client of the sim/paint worker: request/reply promises keyed by reqId, typed event
- * subscriptions, and worker-crash handling (pending requests reject, an 'error' event fires).
+ * Main-thread client of the sim and paint workers, presented as one endpoint: request/reply promises
+ * keyed by reqId (one id space; each request goes to the worker that owns it, `requestTarget`),
+ * typed event subscriptions over both workers' events, and worker-crash handling (pending requests
+ * reject, crash handlers fire). With a paint worker, the constructor also links the two workers with
+ * a MessageChannel; without one, the single worker must handle every request (an InlinePipeline).
  */
 import {
-  errorMessage, type SimEvent, type SimReplyMap, type SimRequest, type SimRequestType,
+  errorMessage, requestTarget, type SimEvent, type SimReplyMap, type SimRequest, type SimRequestType,
 } from '../worker/protocol';
+import type { PortPair } from './climateClient';
 
 /** The part of Worker the clients use (tests substitute an in-process fake). */
 export interface WorkerLike {
@@ -34,16 +38,30 @@ export class SimClient {
   private disposed = false;
   private crashed = false;
 
-  constructor(private readonly worker: WorkerLike) {
-    worker.onmessage = (e: MessageEvent) => this.receive(e.data as SimEvent);
-    worker.onerror = (e: ErrorEvent) => {
+  constructor(
+    private readonly worker: WorkerLike,
+    private readonly paintWorker: WorkerLike | null = null,
+    createChannel: () => PortPair = () => new MessageChannel(),
+  ) {
+    this.listen(worker, 'simulation');
+    if (paintWorker) {
+      this.listen(paintWorker, 'paint');
+      const ch = createChannel();
+      this.send({ type: 'connectPaint', epoch: 0, port: ch.port1 }, [ch.port1]);
+      this.send({ type: 'connectSim', epoch: 0, port: ch.port2 }, [ch.port2]);
+    }
+  }
+
+  private listen(w: WorkerLike, name: string): void {
+    w.onmessage = (e: MessageEvent) => this.receive(e.data as SimEvent);
+    w.onerror = (e: ErrorEvent) => {
       e.preventDefault?.();
-      const msg = e.message || 'the simulation worker failed to start or crashed';
+      const msg = e.message || `the ${name} worker failed to start or crashed`;
       this.crashed = true;
       this.failAll(new Error(msg));
       for (const h of [...this.crashHandlers]) h(msg);
     };
-    worker.onmessageerror = () => this.emit({ type: 'error', reqId: 0, message: 'a worker message could not be deserialized' });
+    w.onmessageerror = () => this.emit({ type: 'error', reqId: 0, message: 'a worker message could not be deserialized' });
   }
 
   /** Send a request and await its typed reply. */
@@ -95,15 +113,19 @@ export class SimClient {
     if (this.disposed) return;
     this.disposed = true;
     this.failAll(new Error('simulation worker disposed'));
-    this.worker.onmessage = null;
-    this.worker.onerror = null;
-    this.worker.terminate();
+    for (const w of [this.worker, this.paintWorker]) {
+      if (!w) continue;
+      w.onmessage = null;
+      w.onerror = null;
+      w.terminate();
+    }
   }
 
   private post(msg: SimRequest, transfer: Transferable[] | undefined, awaitedId: number): void {
     if (this.disposed) return;
+    const target = this.paintWorker && requestTarget(msg.type) === 'paint' ? this.paintWorker : this.worker;
     try {
-      this.worker.postMessage(msg, transfer ?? []);
+      target.postMessage(msg, transfer ?? []);
     } catch (e) {
       const p = awaitedId ? this.pending.get(awaitedId) : undefined;
       if (p) {

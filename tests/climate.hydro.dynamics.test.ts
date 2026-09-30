@@ -80,14 +80,25 @@ describe.each([false, true])('idealized continent with real dynamics (south=%s)'
     expect(cs / codes.length).toBeGreaterThanOrEqual(0.5);
   });
 
-  it('west coast 45–60° is fully humid; oceanic (Cfb/Cfc) where winters are maritime (45–51°)', () => {
-    // Poleward of ~52° the dynamics' coldest month drops below 0 °C (D/E by temperature); the
-    // hydrology's part is the fully humid, no-dry-season regime.
+  it('west coast 45–60° is fully humid; oceanic (Cfb/Cfc) where winters are maritime (45–48°)', () => {
+    // Poleward of ~48° the dynamics' coldest month nears 0 °C on this ocean world without a gyre- or
+    // overturning-warmed eastern ocean (the C/D boundary), but the coast stays far milder than the
+    // interior at the same latitude; the hydrology's part is the fully humid, no-dry-season regime.
     for (const i of cells(45, 60, ...WEST, south)) {
       const k = code(i);
       expect(k[0] === 'E' || k[1] === 'f').toBe(true);
     }
-    for (const i of cells(45, 51, ...WEST, south)) expect(['Cfb', 'Cfc']).toContain(code(i));
+    for (const i of cells(45, 48, ...WEST, south)) expect(['Cfb', 'Cfc']).toContain(code(i));
+    const coldest = (i: number): number => {
+      let t = Infinity;
+      for (let m = 0; m < 12; m++) t = Math.min(t, dyn.temp[m * N + i]);
+      return t;
+    };
+    const coast = cells(48, 52, ...WEST, south);
+    const interior = cells(48, 52, -2, 6, south);
+    const mean = (xs: number[]): number => xs.reduce((s, i) => s + coldest(i), 0) / xs.length;
+    for (const i of coast) expect(coldest(i)).toBeGreaterThan(-3);
+    expect(mean(coast)).toBeGreaterThan(mean(interior) + 3);
   });
 
   it('interior 45–50° (≥ 1500 km inland) gets ≤ 0.5× the west coast', () => {

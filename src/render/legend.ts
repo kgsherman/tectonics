@@ -2,9 +2,10 @@
 import type { LayerId, LegendSpec, PaintOptions, PaintSources, RGB } from '../core/types';
 import { KOPPEN_CLASSES } from '../climate/koppen';
 import {
-  CM_AGE, CM_BATHY, CM_CURRENT, CM_HYPSO, CM_PRECIP_LOG, CM_PRESSURE, CM_SST, CM_TEMP, CM_WIND, cmapColor, encodeSrgb,
+  CM_AGE, CM_BATHY, CM_HYPSO, CM_PRECIP_LOG, CM_PRESSURE, CM_SST, CM_TEMP, CM_WIND, CURRENT_LUT, cmapColor, currentIndex, encodeSrgb,
 } from './colormaps';
 import type { Colormap } from './colormaps';
+import { ISOBAR_BOLD_HPA, ISOBAR_HPA } from './layersClimate';
 import { BOUNDARY_COLORS } from './overlay';
 import { PAL } from './satelliteBiome';
 import { COLD_DESERT, DEPTH_MAX, DEPTH_N, HOT_DESERT, OCEAN_WARM, ROCK_DRY, SEA_ICE, SNOW, TUNDRA_DRY } from './satellitePalette';
@@ -14,6 +15,11 @@ type Stop = { value: number; color: RGB; label?: string };
 
 function stopsOf(cm: Colormap, values: number[], fmt: (v: number) => string, map: (v: number) => number = (v) => v): Stop[] {
   return values.map((v) => ({ value: v, color: cmapColor(cm, map(v)), label: fmt(v) }));
+}
+
+/** Compact mm label (1.2k style above 10 000). */
+function fmtMm(v: number): string {
+  return v >= 10000 ? `${Math.round(v / 1000)}k` : `${v}`;
 }
 
 const enc = (lin: ArrayLike<number>): RGB => [encodeSrgb(lin[0]), encodeSrgb(lin[1]), encodeSrgb(lin[2])];
@@ -81,41 +87,55 @@ export function buildLegend(layer: LayerId, src: PaintSources, opts: PaintOption
         ],
       };
     case 'crustAge':
-      return { kind: 'gradient', title: 'Ocean crust age', unit: 'Myr', stops: stopsOf(CM_AGE, [0, 20, 40, 70, 100, 140, 180, 250], (v) => `${v}`) };
+      return {
+        kind: 'gradient', title: 'Ocean crust age (isochrons every 20 Myr; grey = continental)', unit: 'Myr',
+        stops: stopsOf(CM_AGE, [0, 20, 40, 70, 100, 140, 180, 250], (v) => `${v}`),
+      };
     case 'temperature':
       return {
         kind: 'gradient',
-        title: annual ? 'Annual mean temperature' : 'Temperature',
+        title: annual ? 'Annual mean temperature (line = 0 °C)' : 'Temperature (line = 0 °C isotherm)',
         unit: '°C',
-        stops: stopsOf(CM_TEMP, [-45, -30, -15, 0, 10, 20, 30, 40, 50], (v) => `${v}`),
+        stops: stopsOf(CM_TEMP, [-50, -40, -30, -20, -10, 0, 10, 20, 30, 40, 50], (v) => `${v}`),
       };
     case 'precipitation': {
-      const mm = annual ? [12, 120, 380, 1200, 3000, 7500, 19000, 48000] : [1, 10, 32, 100, 250, 630, 1600, 4000];
+      // Stops at the colormap's own (log-spaced) stops so the evenly spaced legend bar is faithful.
+      const mm = [1, 3, 10, 30, 100, 300, 1000, 4000];
       return {
         kind: 'gradient',
         title: annual ? 'Annual precipitation (log scale)' : 'Precipitation (log scale)',
         unit: annual ? 'mm/yr' : 'mm/month',
-        stops: stopsOf(CM_PRECIP_LOG, mm, (v) => `${v}`, (v) => Math.log10(annual ? v / 12 : v)),
+        stops: mm.map((m) => ({ value: annual ? 12 * m : m, color: cmapColor(CM_PRECIP_LOG, Math.log10(m)), label: fmtMm(annual ? 12 * m : m) })),
       };
     }
     case 'pressure':
       return {
         kind: 'gradient',
-        title: 'Sea-level pressure (isobars every 4 hPa)',
+        title: `Sea-level pressure (isobars every ${ISOBAR_HPA} hPa, bold every ${ISOBAR_BOLD_HPA}; H / L centres)`,
         unit: 'hPa',
-        stops: stopsOf(CM_PRESSURE, [973, 993, 1005, 1013, 1021, 1033, 1053], (v) => `${v}`, (v) => v - 1013),
+        stops: stopsOf(CM_PRESSURE, [981, 989, 997, 1005, 1013, 1021, 1029, 1037, 1045], (v) => `${v}`, (v) => v - 1013),
       };
     case 'sst':
-      return { kind: 'gradient', title: 'Sea-surface temperature', unit: '°C', stops: stopsOf(CM_SST, [-2, 4, 10, 16, 22, 27, 32], (v) => `${v}`) };
+      return {
+        kind: 'gradient', title: 'Sea-surface temperature (white = sea ice)', unit: '°C',
+        stops: stopsOf(CM_SST, [-2, 4, 10, 16, 22, 27, 32], (v) => `${v}`),
+      };
     case 'wind':
-      return { kind: 'gradient', title: 'Wind speed', unit: 'm/s', stops: stopsOf(CM_WIND, [0, 2, 4, 6, 8, 10, 13, 16, 20], (v) => `${v}`) };
-    case 'currents':
+      return { kind: 'gradient', title: annual ? 'Annual mean wind speed' : 'Wind speed', unit: 'm/s', stops: stopsOf(CM_WIND, [0, 2, 4, 6, 8, 10, 13, 16, 20], (v) => `${v}`) };
+    case 'currents': {
+      // Colour = SST anomaly vs the zonal ocean mean (at a typical current speed); brightness and
+      // streamlet length = speed.
+      const anoms = [-3, -2, -1, 0, 1, 2, 3];
       return {
         kind: 'gradient',
-        title: 'Ocean current speed (red tint = warm, blue tint = cold vs zonal mean)',
-        unit: 'm/s',
-        stops: stopsOf(CM_CURRENT, [0, 0.05, 0.15, 0.3, 0.6, 1.2], (v) => `${v}`),
+        title: 'Ocean currents: colour = SST anomaly vs zonal mean (blue cold, red warm); brightness & arrows = speed',
+        unit: '°C',
+        stops: anoms.map((a) => {
+          const i = currentIndex(0.45, a);
+          return { value: a, color: [CURRENT_LUT[i], CURRENT_LUT[i + 1], CURRENT_LUT[i + 2]] as RGB, label: a > 0 ? `+${a}` : `${a}` };
+        }),
       };
+    }
     case 'koppen': {
       const c = src.climate;
       let ids = KOPPEN_CLASSES.slice(1).map((k) => k.id);

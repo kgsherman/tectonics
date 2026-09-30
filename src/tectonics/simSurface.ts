@@ -1,11 +1,12 @@
 import { CRUST_CONTINENTAL, CRUST_OCEANIC } from '../core/types';
 import { oceanDepthForAge } from './draft';
 import {
-  ARC_CONVERSION_ELEV, CRATON_AGE, DIFFUSIVITY, ELEVATION_MAX, FREEBOARD_CRATON, FREEBOARD_JUVENILE, FREEBOARD_YOUNG,
+  ARC_CONVERSION_ELEV, ARC_JUVENILE_UPLIFT, CRATON_AGE, DIFFUSIVITY, ELEVATION_MAX, FREEBOARD_CRATON, FREEBOARD_JUVENILE, FREEBOARD_YOUNG,
   JUVENILE_AGE, OCEAN_FLOOR_MIN, OROGENY_DECAY, OROGEN_THRESHOLD, SHELF_DEPTH, SUBMARINE_DIFFUSIVITY_FACTOR,
-  TAU_CONTINENT, TAU_ISLAND, TAU_JUVENILE, TAU_OROGEN, TAU_SHELF,
+  SEDIMENT_ACTIVE_EFFICIENCY, SEDIMENT_EFFICIENCY, TAU_CONTINENT, TAU_ISLAND, TAU_JUVENILE, TAU_OROGEN, TAU_SHELF,
 } from './simConstants';
 import { saturate } from './simFields';
+import { hash01 } from './simHash';
 import type { StepScratch } from './simScratch';
 import type { SimState } from './simState';
 
@@ -54,55 +55,6 @@ export function computeDiffusion(state: SimState, sc: StepScratch, dt: number): 
   for (let i = 0; i < n; i++) out[i] = cur[i] - wElev[i];
 }
 
-/**
- * Gather the intensive world fields into plate cells through the push map (each surface plate cell
- * takes exactly one sample): tectonic uplift saturated at the cell's own height + hotspot uplift +
- * diffusion; orogeny grows by the uplift. Oceanic arc crust rising above ARC_CONVERSION_ELEV becomes
- * continental.
- */
-export function gatherFields(state: SimState, sc: StepScratch): void {
-  const { n, top, slots, counters } = state;
-  const { adjOffset, adj } = state.sm;
-  const { uplift, hotspotUp, diffusion, arcMask } = sc;
-  for (let k = 0; k < slots.length; k++) {
-    const P = slots[k];
-    if (!P) continue;
-    const { owned, owned4, hint, elev, orogeny, crust, age } = P;
-    for (let j = 0; j < n; j++) {
-      if ((j & 3) === 0 && owned4[j >> 2] === 0) {
-        j += 3;
-        continue;
-      }
-      if (!owned[j]) continue;
-      let i = hint[j];
-      if (top[i] !== k) {
-        // Edge alias (pushed onto the neighbouring plate): sample a ring cell where k is on top, so
-        // cells still shown at the plate edge get the same uplift as their neighbours (no pits).
-        const h = i;
-        i = -1;
-        for (let q = adjOffset[h], e = adjOffset[h + 1]; q < e; q++) {
-          if (top[adj[q]] === k) {
-            i = adj[q];
-            break;
-          }
-        }
-        if (i < 0) continue;
-      }
-      const raw = uplift[i];
-      const up = (raw > 0 ? saturate(raw, elev[j]) : 0) + hotspotUp[i];
-      elev[j] += up + diffusion[i];
-      orogeny[j] += up;
-      if (arcMask[i] && crust[j] === CRUST_OCEANIC && elev[j] > ARC_CONVERSION_ELEV) {
-        // Juvenile arc crust: continental from now on, its age restarts.
-        crust[j] = CRUST_CONTINENTAL;
-        age[j] = 0;
-        counters.continentalCreated++;
-        counters.arcConversions++;
-      }
-    }
-  }
-}
-
 /** Ocean depth vs age lookup (0.25 Myr steps up to 600 Myr) for the per-cell subsidence increments. */
 const DEPTH_STEP = 0.25;
 const DEPTH_MAX_AGE = 600;
@@ -130,12 +82,21 @@ function freeboard(age: number): number {
 }
 
 /**
- * G. Per owned plate cell: oceanic aging + thermal subsidence (features subside too), wave planation
- * of oceanic islands; continental aging + erosion toward an isostatic freeboard (orogenic excess
- * faster; juvenile crust relaxes faster), submerged continental crust toward shelf depth; orogeny decay.
+ * G. One pass over every owned plate cell:
+ *  1. Gather the intensive world fields through the push map (each surface plate cell takes exactly
+ *     one sample): tectonic uplift saturated at the cell's own height + hotspot uplift + diffusion;
+ *     orogeny grows by the uplift. Oceanic arc crust rising above ARC_CONVERSION_ELEV becomes
+ *     continental.
+ *  2. Surface processes: oceanic aging + thermal subsidence (features subside too), wave planation of
+ *     oceanic islands; continental aging + erosion toward an isostatic freeboard (orogenic excess
+ *     faster; juvenile crust relaxes faster), submerged continental crust toward shelf depth; orogeny
+ *     decay.
  */
-export function surfaceProcesses(state: SimState, dt: number): void {
-  const n = state.n;
+export function gatherAndErode(state: SimState, sc: StepScratch, dt: number): void {
+  const { n, top, slots, counters } = state;
+  const { adjOffset, adj } = state.sm;
+  const { uplift, hotspotUp, diffusion, arcMask, subMask } = sc;
+  const seed = state.params.seed, step = state.stepIndex;
   const er = Math.max(0, state.params.erosion);
   const fSlow = Math.exp((-dt * er) / TAU_CONTINENT);
   const fJuvenile = Math.exp((-dt * er) / TAU_JUVENILE);
@@ -143,15 +104,53 @@ export function surfaceProcesses(state: SimState, dt: number): void {
   const fShelf = Math.exp((-dt * er) / TAU_SHELF);
   const fIsland = Math.exp((-dt * er) / TAU_ISLAND);
   const fOro = Math.exp(-dt / OROGENY_DECAY);
-  for (const P of state.slots) {
+  let eroded = 0;
+  for (let k = 0; k < slots.length; k++) {
+    const P = slots[k];
     if (!P) continue;
-    const { owned, owned4, crust, elev, age, orogeny } = P;
+    const { owned, owned4, hint, elev, orogeny, crust, age } = P;
     for (let j = 0; j < n; j++) {
       if ((j & 3) === 0 && owned4[j >> 2] === 0) {
         j += 3;
         continue;
       }
       if (!owned[j]) continue;
+      // 1. Gather.
+      let active = false;
+      let i = hint[j];
+      if (top[i] !== k) {
+        // Edge alias (pushed onto the neighbouring plate): sample a ring cell where k is on top, so
+        // cells still shown at the plate edge get the same uplift as their neighbours (no pits).
+        const h0 = i;
+        i = -1;
+        for (let q = adjOffset[h0], e = adjOffset[h0 + 1]; q < e; q++) {
+          if (top[adj[q]] === k) {
+            i = adj[q];
+            break;
+          }
+        }
+      }
+      if (i >= 0) {
+        const raw = uplift[i];
+        active = subMask[i] !== 0;
+        const tect = raw > 0 ? saturate(raw, elev[j]) : 0;
+        // Collisional thickening beyond what the surface can take (the soft cap) spreads sideways
+        // (orogenic collapse): that volume returns to the margins like eroded sediment.
+        if (!active && raw > tect) eroded += SEDIMENT_EFFICIENCY * (raw - tect);
+        const up = tect + hotspotUp[i];
+        elev[j] += up + diffusion[i];
+        orogeny[j] += up;
+        if (arcMask[i] && crust[j] === CRUST_OCEANIC && elev[j] > ARC_CONVERSION_ELEV && raw > 0 &&
+            hash01(seed, step, j, k) * ARC_JUVENILE_UPLIFT < raw) {
+          // Emergent arc crust matures into juvenile continental crust at a rate set by the arc's
+          // magmatic addition (∝ arc uplift, see ARC_JUVENILE_UPLIFT); its age restarts.
+          crust[j] = CRUST_CONTINENTAL;
+          age[j] = 0;
+          counters.continentalCreated++;
+          counters.arcConversions++;
+        }
+      }
+      // 2. Surface processes.
       const a0 = age[j];
       const a1 = a0 + dt;
       age[j] = a1;
@@ -169,9 +168,15 @@ export function surfaceProcesses(state: SimState, dt: number): void {
           // Land erodes toward its freeboard; juvenile crust relaxes faster (factors blended by maturity).
           const fBase = am < JUVENILE_AGE ? fJuvenile + ((fSlow - fJuvenile) * am) / JUVENILE_AGE : fSlow;
           const e = h - base;
+          const h0 = h;
           h = e > OROGEN_THRESHOLD
             ? base + OROGEN_THRESHOLD * fBase + (e - OROGEN_THRESHOLD) * fFast
             : base + e * fBase;
+          // The eroded continental volume goes to the margins (accreteMargins) — except where the
+          // cell is being uplifted above a subducting slab: that sediment ends in the trench and is
+          // subducted (sediment subduction), the recycling half of the arc budget. Collision belts
+          // shed theirs into foreland basins and margins.
+          if (h0 > h) eroded += active ? SEDIMENT_ACTIVE_EFFICIENCY * (h0 - h) : SEDIMENT_EFFICIENCY * (h0 - h);
         } else {
           // Submerged continental crust drifts toward shelf depth (deeper for low-standing juvenile crust).
           const target = base < SHELF_DEPTH ? base : SHELF_DEPTH;
@@ -182,4 +187,5 @@ export function surfaceProcesses(state: SimState, dt: number): void {
       orogeny[j] *= fOro;
     }
   }
+  state.sediment += eroded;
 }

@@ -4,16 +4,20 @@
  * and depth-indexed ocean ramps.
  */
 import type { RGB } from '../core/types';
-import { SRGB_TO_LINEAR, toLinear } from './colormaps';
+import { SRGB_TO_LINEAR, encodeSrgb, toLinear } from './colormaps';
 
 const L = (c: RGB) => toLinear(c);
 export const SNOW = L([236, 240, 246]);
+/** Snow in shade (valleys, pole-facing slopes): slightly bluer and darker. */
+export const SNOW_SHADE = L([208, 218, 234]);
 /** Tundra / alpine meadow: brown-olive when dry, mossy green-olive when humid. */
 export const TUNDRA_DRY = L([126, 116, 88]);
 export const TUNDRA_WET = L([98, 110, 72]);
 export const ROCK_DRY = L([122, 108, 94]);
 export const ROCK_WET = L([92, 92, 90]);
 export const SEA_ICE = L([226, 232, 240]);
+/** Thin / young sea ice (nilas, grey ice): translucent grey-blue. */
+export const SEA_ICE_THIN = L([150, 166, 182]);
 /** Lagoons / small enclosed water: warm (greener) and cold. */
 export const LAGOON_WARM = L([30, 76, 88]);
 export const LAGOON_COLD = L([26, 58, 72]);
@@ -73,3 +77,34 @@ export const OCEAN_COLD = depthRamp([
   [0, [38, 86, 98]], [15, [32, 78, 98]], [60, [23, 64, 94]], [200, [15, 47, 84]], [1000, [10, 33, 68]],
   [3000, [9, 26, 56]], [6000, [7, 21, 47]],
 ]);
+
+/** Warmth levels of OCEAN_SRGB. */
+export const OCEAN_WARM_N = 64;
+/**
+ * Open-ocean colours pre-encoded to sRGB: index 3·(depthIndex·OCEAN_WARM_N + warmLevel) (depth index
+ * as for OCEAN_WARM / OCEAN_COLD, warmth 0 = cold ramp … OCEAN_WARM_N − 1 = warm ramp).
+ */
+export const OCEAN_SRGB = (() => {
+  const out = new Uint8Array(3 * DEPTH_N * OCEAN_WARM_N);
+  for (let d = 0; d < DEPTH_N; d++) {
+    for (let k = 0; k < OCEAN_WARM_N; k++) {
+      const t = k / (OCEAN_WARM_N - 1);
+      const o = 3 * (d * OCEAN_WARM_N + k);
+      for (let q = 0; q < 3; q++) out[o + q] = encodeSrgb(OCEAN_COLD[3 * d + q] + (OCEAN_WARM[3 * d + q] - OCEAN_COLD[3 * d + q]) * t);
+    }
+  }
+  return out;
+})();
+
+/** Depth step (m) of DEPTH_INDEX. */
+export const DEPTH_LUT_STEP = 2;
+/** Depth ramp index (∝ sqrt(d / DEPTH_MAX)) per DEPTH_LUT_STEP metres of depth, up to DEPTH_MAX. */
+export const DEPTH_INDEX = (() => {
+  const n = Math.ceil(DEPTH_MAX / DEPTH_LUT_STEP) + 1;
+  const out = new Uint16Array(n);
+  for (let i = 0; i < n; i++) {
+    const d = Math.min(DEPTH_MAX, (i + 0.5) * DEPTH_LUT_STEP);
+    out[i] = Math.min(DEPTH_N - 1, Math.round(Math.sqrt(d / DEPTH_MAX) * (DEPTH_N - 1)));
+  }
+  return out;
+})();

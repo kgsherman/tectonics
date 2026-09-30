@@ -8,6 +8,8 @@ import type { ArrowSpec, BrushCursor, MarkerSpec, RGB, SphereMesh, Vec3, WorldPo
 import { plateColor } from '../tectonics/draft';
 import type { EditorCore } from './editorCore';
 import type { FullRenderFn, FullRenderResult } from './fullRender';
+import type { MotionReadout } from './interaction';
+import { PerfRing } from './perf';
 import { fibonacciPoints, plateArrow, velocityFieldArrows } from './motion';
 import type { PreviewSource, PreviewStyle } from './preview';
 import { PreviewRaster } from './preview';
@@ -61,7 +63,13 @@ export class EditorRenderer {
   private overlaysDirty = true;
   private seenRevision = -1;
   private motionDragPlate: number | null = null;
+  private hoverArrowPlate: number | null = null;
+  private hoverSeedIndex: number | null = null;
+  private readout: MotionReadout | null = null;
+  private cursorCss: string | null = null;
   private readonly fieldSamples = fibonacciPoints(FIELD_SAMPLES);
+  /** Wall-clock cost of each preview frame (drain + recolour + push), ms. */
+  readonly frameTimes = new PerfRing(240);
 
   constructor(
     private readonly mesh: SphereMesh,
@@ -92,6 +100,7 @@ export class EditorRenderer {
     this.viewRef = view;
     this.unsubscribe = view.onPointer(onPointer);
     view.setInteractionMode(toolInfo(this.ctx.tool()).paint ? 'paint' : 'navigate');
+    this.applyCursor();
     view.setLighting({ mode: 'flat' });
     view.setReliefScale(0);
     view.setSeaLevel(this.ctx.seaLevel());
@@ -125,6 +134,7 @@ export class EditorRenderer {
     v.setBrushCursor(null);
     v.setArrows([]);
     v.setMarkers([]);
+    delete v.element.dataset.peCursor;
     if (clear) {
       v.setOverlayImage(null, this.sizes.preview[0], this.sizes.preview[1]);
       v.setInteractionMode('navigate');
@@ -137,6 +147,39 @@ export class EditorRenderer {
 
   setCursor(c: BrushCursor | null): void {
     this.viewRef?.setBrushCursor(c);
+  }
+
+  /** CSS cursor override for the view (null: the view's own cursor for its mode). */
+  setPointerCursor(css: string | null): void {
+    this.cursorCss = css;
+    this.applyCursor();
+  }
+
+  private applyCursor(): void {
+    const v = this.viewRef;
+    if (!v) return;
+    if (this.cursorCss) v.element.dataset.peCursor = this.cursorCss;
+    else delete v.element.dataset.peCursor;
+  }
+
+  /** Highlight the motion arrow of plate index k (grabbable under the pointer); null clears. */
+  setHoverArrow(k: number | null): void {
+    if (k === this.hoverArrowPlate) return;
+    this.hoverArrowPlate = k;
+    this.invalidateOverlays();
+  }
+
+  /** Highlight seed marker k (under the pointer); null clears. */
+  setHoverSeed(k: number | null): void {
+    if (k === this.hoverSeedIndex) return;
+    this.hoverSeedIndex = k;
+    this.invalidateOverlays();
+  }
+
+  /** Live motion readout next to the dragged arrow head; null clears. */
+  setMotionReadout(r: MotionReadout | null): void {
+    this.readout = r;
+    this.invalidateOverlays();
   }
 
   setSeaLevel(seaLevel: number): void {
@@ -223,6 +266,12 @@ export class EditorRenderer {
     const view = this.viewRef;
     const raster = this.raster;
     if (!view || !raster) return;
+    const t0 = performance.now();
+    this.flushInner(view, raster);
+    this.frameTimes.push(performance.now() - t0);
+  }
+
+  private flushInner(view: WorldView, raster: PreviewRaster): void {
     const core = this.ctx.core;
     const ch = core.drainChanges();
     const src = this.previewSource();
@@ -260,26 +309,38 @@ export class EditorRenderer {
     const anchors = core.anchors();
     const sel = this.ctx.selectedIndex();
     const arrows: ArrowSpec[] = [];
+    const anchorsMarks: MarkerSpec[] = [];
     core.plates.forEach((p, k) => {
       const a = anchors[k];
       if (!a) return;
       // The selected plate's arrow is brighter; the view's heavy "highlighted" outline marks the
       // arrow being dragged.
       const dragged = k === this.motionDragPlate;
-      const s = plateArrow(a, p.omega, tint(p.color, dragged ? 0.3 : k === sel ? 0.9 : 0.55), p.id, dragged);
+      const hot = dragged || (k === this.hoverArrowPlate && this.motionDragPlate === null);
+      const s = plateArrow(a, p.omega, tint(p.color, dragged ? 0.3 : hot ? 0.7 : k === sel ? 0.9 : 0.55), p.id, hot);
       if (s) arrows.push(s);
+      else if (k === sel && this.ctx.tool() === 'motion') {
+        // A stationary selected plate: mark its anchor so the user sees where arrows start.
+        const { lat, lon } = vecToLatLon(a[0], a[1], a[2]);
+        anchorsMarks.push({ lat, lon, color: tint(p.color, 0.9), radiusPx: 4, label: 'stationary — drag to set motion' });
+      }
     });
     if (this.motionDragPlate !== null) {
       const d = core.draft;
       arrows.push(...velocityFieldArrows(this.mesh, d.plate, d.plates, this.fieldSamples, FIELD_SCALE, this.motionDragPlate));
     }
     view.setArrows(arrows);
-    const markers: MarkerSpec[] = [];
+    const markers: MarkerSpec[] = [...anchorsMarks];
     if (this.ctx.tool() === 'seeds') {
       this.ctx.seeds().forEach((s, k) => {
         const { lat, lon } = vecToLatLon(s[0], s[1], s[2]);
-        markers.push({ lat, lon, color: plateColor(k), radiusPx: 7, id: k, label: String(k + 1) });
+        markers.push({ lat, lon, color: plateColor(k), radiusPx: 7, id: k, label: String(k + 1), highlighted: k === this.hoverSeedIndex });
       });
+    }
+    const r = this.readout;
+    if (r && r.plate < core.plates.length) {
+      const { lat, lon } = vecToLatLon(r.head[0], r.head[1], r.head[2]);
+      markers.push({ lat, lon, color: tint(core.plates[r.plate].color, 0.5), radiusPx: 1, label: r.label });
     }
     view.setMarkers(markers);
   }

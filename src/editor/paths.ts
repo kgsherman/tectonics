@@ -159,3 +159,76 @@ export function cellsInsidePolygon(mesh: SphereMesh, poly: ReadonlyArray<Vec3>):
   }
   return out;
 }
+
+/**
+ * Straight-line continuation of a split cut: each end of the drawn polyline that lies inside the
+ * plate being cut (the plate most of the cut's cells belong to) is extended along its great circle
+ * until it leaves that plate or runs into the cut itself. So a short line in the middle of a plate
+ * still splits it edge to edge, and a line on a plate that covers the whole sphere closes into a
+ * loop and cuts it in two. Returns the extended polyline (the input when nothing extends).
+ */
+export function extendCut(mesh: SphereMesh, plate: Int16Array, points: ReadonlyArray<Vec3 | null>): Array<Vec3 | null> {
+  const pts = points.filter((p): p is Vec3 => p !== null);
+  if (pts.length < 2) return [...points];
+  const cells = pathCells(mesh, points, false);
+  if (cells.length < 2) return [...points];
+  // Target plate: the one the cut runs through the most.
+  const tally = new Map<number, number>();
+  for (const c of cells) tally.set(plate[c], (tally.get(plate[c]) ?? 0) + 1);
+  let target = -1, best = 0;
+  for (const [k, v] of tally) {
+    if (v > best) {
+      best = v;
+      target = k;
+    }
+  }
+  const onCut = new Set(cells);
+  const step = 0.5 * mesh.spacing;
+  const minTravel = 3 * mesh.spacing;
+  /** Point `back` radians before `end` along the drawn path (for a stable end direction). */
+  const directionFrom = (seq: Vec3[]): Vec3 | null => {
+    const end = seq[seq.length - 1];
+    for (let k = seq.length - 2; k >= 0; k--) if (angleBetween(seq[k], end) >= 0.75 * mesh.spacing) return seq[k];
+    return seq.length >= 2 && angleBetween(seq[0], end) > 1e-6 ? seq[0] : null;
+  };
+  const touchesCut = (c: number): boolean => {
+    if (onCut.has(c)) return true;
+    for (let e = mesh.adjOffset[c]; e < mesh.adjOffset[c + 1]; e++) if (onCut.has(mesh.adj[e])) return true;
+    return false;
+  };
+  let closed = false;
+  const extend = (seq: Vec3[]): Vec3[] => {
+    const end = seq[seq.length - 1];
+    const endCell = nearestCell(mesh, end[0], end[1], end[2]);
+    if (plate[endCell] !== target) return [];
+    const prev = directionFrom(seq);
+    if (!prev) return [];
+    // Forward tangent at `end` of the great circle prev → end.
+    const ax = [prev[1] * end[2] - prev[2] * end[1], prev[2] * end[0] - prev[0] * end[2], prev[0] * end[1] - prev[1] * end[0]];
+    const al = Math.hypot(ax[0], ax[1], ax[2]);
+    if (al < 1e-12) return [];
+    const k = [ax[0] / al, ax[1] / al, ax[2] / al];
+    const t: Vec3 = [k[1] * end[2] - k[2] * end[1], k[2] * end[0] - k[0] * end[2], k[0] * end[1] - k[1] * end[0]];
+    const out: Vec3[] = [];
+    let hint = endCell;
+    for (let s = step; s < 2 * Math.PI; s += step) {
+      const c = Math.cos(s), sn = Math.sin(s);
+      const q: Vec3 = [end[0] * c + t[0] * sn, end[1] * c + t[1] * sn, end[2] * c + t[2] * sn];
+      hint = nearestCell(mesh, q[0], q[1], q[2], hint);
+      out.push(q);
+      if (plate[hint] !== target) break; // reached the plate's edge (one cell beyond it)
+      if (s > minTravel && touchesCut(hint)) {
+        closed = true; // ran into the cut: the loop is closed
+        break;
+      }
+    }
+    for (const q of out) onCut.add(nearestCell(mesh, q[0], q[1], q[2]));
+    return out;
+  };
+  const tail = extend(pts);
+  // A tail that closed a loop already separates the plate: extending the other end too would only
+  // cut the loop's inside once more.
+  const head = closed ? [] : extend([...pts].reverse());
+  if (!tail.length && !head.length) return [...points];
+  return [...head.reverse(), ...points, ...tail];
+}

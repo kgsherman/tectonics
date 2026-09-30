@@ -16,7 +16,7 @@ const cntAge = new Float64Array(MAX_PLATES);
  * plate's oceanic crust within POLARITY_BAND_KM of its boundaries (ring BFS inside each plate from
  * its boundary cells), plus a bonus for continent-dominated plates. Requires fresh world fields.
  */
-function computeScores(state: SimState): Float64Array {
+function computeScores(state: SimState, deep: Uint8Array | null = null): Float64Array {
   const sc = stepScratch(state);
   const { n, top, wCrust, slots } = state;
   const { adjOffset, adj, spacingKm } = state.sm;
@@ -25,6 +25,7 @@ function computeScores(state: SimState): Float64Array {
   ring.fill(-1);
   let tail = 0;
   for (let i = 0; i < n; i++) {
+    if (deep !== null && deep[i] === 0) continue;
     const t = top[i];
     for (let q = adjOffset[i], e = adjOffset[i + 1]; q < e; q++) {
       if (top[adj[q]] !== t) {
@@ -79,12 +80,12 @@ export function initPolarity(state: SimState): void {
  * ≥ POLARITY_FLIP_TIME Myr. A per-plate total order has no cycles at triple junctions and no
  * per-cell polarity zippers.
  */
-export function updatePolarity(state: SimState, dt: number): void {
+export function updatePolarity(state: SimState, dt: number, deep: Uint8Array | null = null): void {
   state.polarityClock += dt;
   if (state.polarityClock < POLARITY_INTERVAL) return;
   const elapsed = state.polarityClock;
   state.polarityClock = 0;
-  const s = computeScores(state);
+  const s = computeScores(state, deep);
   const order = state.rankOrder;
   for (let p = 0; p + 1 < order.length; p++) {
     const lo = order[p], hi = order[p + 1];

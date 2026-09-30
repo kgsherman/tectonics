@@ -17,6 +17,10 @@ export interface PlateRow {
   bearing: number;
   /** rad/Myr about the anchor. */
   spin: number;
+  /** Connected pieces on the map (0 when empty). */
+  pieces?: number;
+  /** Detached pieces under MIN_FRAGMENT_CELLS (merged into neighbours when simulated). */
+  tinyPieces?: number;
 }
 
 export interface PlateListActions {
@@ -33,6 +37,7 @@ interface RowEls {
   swatch: HTMLLabelElement;
   color: HTMLInputElement;
   name: HTMLInputElement;
+  badge: HTMLSpanElement;
   area: HTMLSpanElement;
   speed: HTMLSpanElement;
   arrow: HTMLSpanElement;
@@ -44,7 +49,15 @@ interface RowEls {
   fSpin: HTMLInputElement | null;
 }
 
-const fmtArea = (a: number) => (a <= 0 ? '—' : a < 0.001 ? '<0.1%' : `${(a * 100).toFixed(1)}%`);
+const fmtArea = (a: number) => (a <= 0 ? 'empty' : a < 0.001 ? '<0.1%' : `${(a * 100).toFixed(1)}%`);
+
+/** Badge text and tooltip for a plate in several pieces. */
+export function piecesBadge(pieces: number, tiny: number): { text: string; title: string } | null {
+  if (pieces <= 1) return null;
+  let title = `This plate is in ${pieces} separate pieces. They keep its colour and move together as one rigid plate when simulated.`;
+  if (tiny > 0) title += ` ${tiny === 1 ? 'One small piece' : `${tiny} small pieces`} (under 20 cells) will merge into the surrounding plate${tiny === 1 ? '' : 's'} when simulated.`;
+  return { text: `${pieces} pieces`, title };
+}
 
 export class PlateListView {
   private rows = new Map<number, RowEls>();
@@ -92,6 +105,9 @@ export class PlateListView {
     const color = el('input', null, { type: 'color', title: 'Plate color', 'aria-label': 'Plate color' });
     const swatch = el('label', 'pe-swatch', null, color);
     const name = el('input', 'pe-name', { type: 'text', maxlength: 48, spellcheck: 'false', 'aria-label': 'Plate name' });
+    const badge = el('span', 'pe-badge');
+    badge.hidden = true;
+    const nameWrap = el('div', 'pe-name-wrap', null, name, badge);
     const area = el('span', 'pe-area', { title: 'Share of the planet surface' });
     const arrow = el('span', null, null);
     arrow.innerHTML = BEARING_ARROW;
@@ -100,7 +116,7 @@ export class PlateListView {
     const speed = el('span', 'pe-speed', { title: 'Speed and direction at the plate centre' }, arrow, speedText);
     const del = el('button', 'pe-del', { type: 'button', title: 'Delete plate (merges into its largest neighbour)', 'aria-label': 'Delete plate' });
     del.append(iconEl(ICONS.close));
-    root.append(swatch, name, area, speed, del);
+    root.append(swatch, nameWrap, area, speed, del);
 
     root.addEventListener('pointerdown', (e) => {
       if (e.target instanceof HTMLInputElement && e.target !== name) return;
@@ -133,7 +149,7 @@ export class PlateListView {
       e.stopPropagation();
       this.actions.remove(id);
     });
-    return { root, swatch, color, name, area, speed, arrow, speedText, del, detail: null, fSpeed: null, fDir: null, fSpin: null };
+    return { root, swatch, color, name, badge, area, speed, arrow, speedText, del, detail: null, fSpeed: null, fDir: null, fSpin: null };
   }
 
   private patchRow(r: RowEls, d: PlateRow, selected: boolean, canDelete: boolean): void {
@@ -146,9 +162,18 @@ export class PlateListView {
     if (document.activeElement !== r.name && r.name.value !== d.name) r.name.value = d.name;
     r.name.title = d.name;
     setText(r.area, fmtArea(d.area));
+    r.root.classList.toggle('pe-empty', d.cells === 0);
+    r.area.title = d.cells === 0 ? 'No cells on the map: paint it back, or delete it' : 'Share of the planet surface';
+    const badge = piecesBadge(d.pieces ?? 1, d.tinyPieces ?? 0);
+    r.badge.hidden = !badge;
+    if (badge) {
+      setText(r.badge, badge.text);
+      r.badge.title = badge.title;
+    }
     if (d.speed === null) {
-      setText(r.speedText, 'unplaced');
+      setText(r.speedText, '—');
       r.arrow.style.visibility = 'hidden';
+      r.speed.title = 'Not on the map';
     } else {
       setText(r.speedText, `${(d.speed / 10).toFixed(1)} cm/yr`);
       r.arrow.style.visibility = d.speed > 0.05 ? 'visible' : 'hidden';
@@ -173,7 +198,7 @@ export class PlateListView {
     }
     if (!r.detail) {
       if (wantEmpty) {
-        r.detail = el('div', 'pe-empty-note', null, 'Not on the map yet — paint it with the plate brush, fill or lasso.');
+        r.detail = el('div', 'pe-empty-note', null, 'Not on the map — paint it with the plate brush (B), Fill (F) or Lasso (L), or delete it.');
       } else {
         const mk = (label: string, title: string, step: string, min?: string, max?: string) => {
           const input = el('input', null, { type: 'number', step, min, max, title, 'aria-label': title });

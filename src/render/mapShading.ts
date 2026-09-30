@@ -24,6 +24,17 @@ for (let i = 0; i <= LIN_LUT_SIZE; i++) {
 }
 
 /**
+ * Relief shade response for rel = n·L / sin(altitude) (1 on flat ground): linear shadows rolling off
+ * smoothly into a 0.3 floor, highlights at 0.45× saturating toward 1.35. Same curve as the GLSL
+ * reliefShade (globe surface and GPU map).
+ */
+export function reliefShade(rel: number): number {
+  if (rel >= 1) return 1 + 0.35 * (1 - Math.exp(-1.2857 * (rel - 1)));
+  const s = 1 - 0.85 * (1 - rel);
+  return s >= 0.5 ? s : 0.3 + 0.2 * Math.exp((s - 0.5) * 5);
+}
+
+/**
  * Per-pixel relief shade factor (1 = flat) for a w×h row-0-north height map. Heights below
  * `seaLevel` are clamped to it so seas render flat.
  */
@@ -53,8 +64,7 @@ export function hillshade(height: Float32Array, w: number, h: number, seaLevel: 
       const gx = (hc[row + ce] - hc[row + cw]) * kx;
       const gy = (hc[rowN + c] - hc[rowS + c]) * ky;
       const rel = (1 - gx * lx - gy * ly) / Math.sqrt(gx * gx + gy * gy + 1);
-      // Same response as the globe shader: full shadows, compressed highlights.
-      out[row + c] = rel < 1 ? Math.max(0.28, 1 + 0.85 * (rel - 1)) : Math.min(1.35, 1 + 0.45 * (rel - 1));
+      out[row + c] = reliefShade(rel);
     }
   }
   return out;

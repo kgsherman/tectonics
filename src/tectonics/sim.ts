@@ -2,15 +2,19 @@ import { Rng } from '../core/rng';
 import type { SphereMesh, TectonicParams, TectonicStats, Vec3, WorldDraft, WorldSnapshot } from '../core/types';
 import { clampSpeeds, plateDynamics } from './simDynamics';
 import { computeFields, trenchField } from './simFields';
+import { tectonicErosion } from './simErosion';
 import { buildWorldFields, detectFronts } from './simFronts';
 import { housekeeping } from './simHousekeeping';
 import { maybeInitiateSubduction } from './simInitiation';
-import { runSubstep, settleTops, substepCount } from './simKinematics';
+import { accreteMargins } from './simMargins';
+import { markDeepInterior, runSubstep, settleTops, substepCount } from './simKinematics';
 import { initPolarity, updatePolarity } from './simPolarity';
 import { maybeRift } from './simRifting';
+import { profLap, profStart } from './simProfile';
 import { buildDraft, buildSnapshot, buildStats } from './simSnapshot';
 import { createSimState, type SimState } from './simState';
-import { computeDiffusion, gatherFields, surfaceProcesses } from './simSurface';
+import { computeDiffusion, gatherAndErode } from './simSurface';
+import { dockTerranes } from './simTerranes';
 
 export const DEFAULT_TECTONIC_PARAMS: TectonicParams = {
   dt: 1,
@@ -148,21 +152,41 @@ export class TectonicSim {
       state.warnedSubstepCap = true;
       console.warn(`TectonicSim: plates move more than ${count} substeps allow; displacement per substep exceeds one cell`);
     }
-    for (let s = 0; s < count; s++) runSubstep(state, dt / count);
+    // Deep plate interiors only need the last substep (bit-identical result, see markDeepInterior).
+    let t = profStart();
+    const deep = markDeepInterior(state, dt, count);
+    t = profLap('A0.interior', t);
+    for (let s = 0; s < count; s++) runSubstep(state, dt / count, s < count - 1 ? deep : null);
 
     // E–J once per step.
+    t = profStart();
     buildWorldFields(state);
-    const sc = detectFronts(state);
+    t = profLap('E0.worldFields', t);
+    const sc = detectFronts(state, deep);
+    t = profLap('E1.fronts', t);
     computeFields(state, sc, dt);
-    updatePolarity(state, dt);
+    t = profLap('E2.fields', t);
+    updatePolarity(state, dt, deep);
+    t = profLap('F.polarity', t);
     computeDiffusion(state, sc, dt);
-    gatherFields(state, sc);
-    surfaceProcesses(state, dt);
+    t = profLap('G0.diffusion', t);
+    gatherAndErode(state, sc, dt);
+    t = profLap('G1.surface', t);
+    dockTerranes(state, sc);
+    t = profLap('G2.terranes', t);
     plateDynamics(state, sc, dt);
+    t = profLap('H.dynamics', t);
     // At most one plate-creating event per step (both read this step's world fields).
     if (!maybeRift(state, rng, dt)) maybeInitiateSubduction(state, rng, dt);
+    t = profLap('I.rift', t);
     housekeeping(state);
-    settleTops(state);
+    t = profLap('J.housekeeping', t);
+    tectonicErosion(state, sc, dt);
+    accreteMargins(state, dt);
+    t = profLap('J1.budget', t);
+    // Incremental unless plates were created or removed this step (those request a full scan).
+    settleTops(state, false);
+    profLap('J2.settle', t);
     state.time += dt;
     state.stepIndex++;
     this.memo = null;

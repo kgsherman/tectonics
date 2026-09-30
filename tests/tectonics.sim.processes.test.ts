@@ -114,10 +114,22 @@ describe('tectonic processes', () => {
   it('builds per-mesh neighbourhood tables consistently', () => {
     const sm = simMeshOf(mesh);
     expect(simMeshOf(mesh)).toBe(sm);
+    // The sim works in an internal, spatially renumbered cell order: toExt / toInt are inverse
+    // permutations and the internal mesh is the caller's mesh relabelled.
+    expect(sm.ext).toBe(mesh);
+    for (let k = 0; k < n; k++) expect(sm.toInt[sm.toExt[k]]).toBe(k);
+    for (const k of [0, 17, 5000, n - 1]) {
+      const e = sm.toExt[k];
+      for (let c = 0; c < 3; c++) expect(sm.mesh.xyz[3 * k + c]).toBe(mesh.xyz[3 * e + c]);
+      const extNbrs = Array.from(mesh.adj.subarray(mesh.adjOffset[e], mesh.adjOffset[e + 1]), (a) => sm.toInt[a]).sort((a, b) => a - b);
+      const intNbrs = Array.from(sm.adj.subarray(sm.adjOffset[k], sm.adjOffset[k + 1])).sort((a, b) => a - b);
+      expect(intNbrs).toEqual(extNbrs);
+    }
+    // Neighbourhood disks (internal numbering) contain the first ring and not the cell itself.
     for (const i of [0, 17, 5000, n - 1]) {
       const ring = new Set(Array.from(sm.disk.subarray(sm.diskOffset[i], sm.diskOffset[i + 1])));
       expect(ring.has(i)).toBe(false);
-      for (let q = mesh.adjOffset[i]; q < mesh.adjOffset[i + 1]; q++) expect(ring.has(mesh.adj[q])).toBe(true);
+      for (let q = sm.adjOffset[i]; q < sm.adjOffset[i + 1]; q++) expect(ring.has(sm.adj[q])).toBe(true);
       expect(sm.ring2End[i]).toBeGreaterThan(sm.diskOffset[i]);
       expect(sm.ring2End[i]).toBeLessThan(sm.diskOffset[i + 1]);
       for (let q = sm.diskOffset[i]; q < sm.diskOffset[i + 1]; q++) {

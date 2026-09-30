@@ -1,7 +1,7 @@
 import { nearestCell } from '../core/sphereMesh';
 import { CRUST_OCEANIC } from '../core/types';
 import { oceanDepthForAge } from './draft';
-import { walkNearest } from './simMesh';
+import { walkFrom } from './simMesh';
 import { slotBit, type PlateSlot, type SimState } from './simState';
 
 // Small helpers shared by the passes that edit plate lattices (gaps, specks, merges).
@@ -9,7 +9,8 @@ import { slotBit, type PlateSlot, type SimState } from './simState';
 /** Nearest lattice cell of plate k to world cell i, using the freshest push data as a hint. */
 export function pullLattice(state: SimState, k: number, i: number): number {
   const P = state.slots[k] as PlateSlot;
-  const { xyz, adjOffset, adj, mesh } = state.sm;
+  const sm = state.sm;
+  const { xyz, adjOffset, adj, mesh } = sm;
   const x = xyz[3 * i], y = xyz[3 * i + 1], z = xyz[3 * i + 2];
   const m = P.m;
   const lx = m[0] * x + m[3] * y + m[6] * z;
@@ -27,7 +28,7 @@ export function pullLattice(state: SimState, k: number, i: number): number {
       }
     }
   }
-  return h >= 0 ? walkNearest(xyz, adjOffset, adj, lx, ly, lz, h) : nearestCell(mesh, lx, ly, lz);
+  return h >= 0 ? walkFrom(sm, lx, ly, lz, h) : nearestCell(mesh, lx, ly, lz);
 }
 
 /** Plate-frame coordinates of world cell i in plate P, written to out[0..2]. */

@@ -3,7 +3,7 @@ import { quatIdentity, quatMul } from '../core/math3';
 import type { Hotspot, PlateSpec, Quat, TectonicStats, Vec3, WorldDraft, WorldSnapshot } from '../core/types';
 import { CRUST_CONTINENTAL } from '../core/types';
 import { classifyBoundaries, clonePlateSpec, computePlateInfos } from './draft';
-import { walkNearest, type SimMesh } from './simMesh';
+import { walkFrom, type SimMesh } from './simMesh';
 import type { PlateSlot, SimState } from './simState';
 
 /** Live slots in ascending order and slot → compact index. */
@@ -85,7 +85,7 @@ function containingTriangle(sm: SimMesh, j: number, x: number, y: number, z: num
  */
 function interpolateFields(state: SimState, elev: Float32Array, age: Float32Array, orogeny: Float32Array): void {
   const { n, top, src, slots, trench } = state;
-  const { xyz, adjOffset, adj } = state.sm;
+  const { xyz, toExt } = state.sm;
   for (let i = 0; i < n; i++) {
     const P = slots[top[i]] as PlateSlot;
     const j = src[i];
@@ -95,7 +95,7 @@ function interpolateFields(state: SimState, elev: Float32Array, age: Float32Arra
     const ly = m[1] * x + m[4] * y + m[7] * z;
     const lz = m[2] * x + m[5] * y + m[8] * z;
     let e = P.elev[j], a = P.age[j], o = P.orogeny[j];
-    if (containingTriangle(state.sm, walkNearest(xyz, adjOffset, adj, lx, ly, lz, j), lx, ly, lz)) {
+    if (containingTriangle(state.sm, walkFrom(state.sm, lx, ly, lz, j), lx, ly, lz)) {
       let ws = 0, se = 0, sa = 0, so = 0;
       for (let c = 0; c < 3; c++) {
         const v = triV[c];
@@ -112,21 +112,25 @@ function interpolateFields(state: SimState, elev: Float32Array, age: Float32Arra
         o = so / ws;
       }
     }
-    elev[i] = e + trench[i];
-    age[i] = a;
-    orogeny[i] = o;
+    const out = toExt[i];
+    elev[out] = e + trench[i];
+    age[out] = a;
+    orogeny[out] = o;
   }
 }
 
 /** World-frame snapshot of the current state (freshly allocated arrays). */
 export function buildSnapshot(state: SimState, id: number): WorldSnapshot {
   const { n, top, src, slots } = state;
+  const { toExt, ext } = state.sm;
   const { order, index } = compactSlots(state);
+  // Output arrays use the caller's (external) cell numbering.
   const plate = new Int16Array(n);
   const crust = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
-    plate[i] = index[top[i]];
-    crust[i] = (slots[top[i]] as PlateSlot).crust[src[i]];
+    const e = toExt[i];
+    plate[e] = index[top[i]];
+    crust[e] = (slots[top[i]] as PlateSlot).crust[src[i]];
   }
   const elev = new Float32Array(n);
   const age = new Float32Array(n);
@@ -141,9 +145,9 @@ export function buildSnapshot(state: SimState, id: number): WorldSnapshot {
     elev,
     crust,
     age,
-    boundary: classifyBoundaries(state.sm.mesh, plate, specs),
+    boundary: classifyBoundaries(ext, plate, specs),
     orogeny,
-    plates: computePlateInfos(state.sm.mesh, plate, crust, specs),
+    plates: computePlateInfos(ext, plate, crust, specs),
     hotspots: cloneHotspots(state.hotspots),
   };
 }
@@ -157,14 +161,16 @@ export function buildDraft(state: SimState): WorldDraft {
   const elev = new Float32Array(n);
   const age = new Float32Array(n);
   const orogeny = new Float32Array(n);
+  const toExt = state.sm.toExt;
   for (let i = 0; i < n; i++) {
     const P = slots[top[i]] as PlateSlot;
     const j = src[i];
-    plate[i] = index[top[i]];
-    crust[i] = P.crust[j];
-    elev[i] = P.elev[j];
-    age[i] = P.age[j];
-    orogeny[i] = P.orogeny[j];
+    const e = toExt[i];
+    plate[e] = index[top[i]];
+    crust[e] = P.crust[j];
+    elev[e] = P.elev[j];
+    age[e] = P.age[j];
+    orogeny[e] = P.orogeny[j];
   }
   return {
     n,

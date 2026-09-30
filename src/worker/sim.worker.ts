@@ -1,25 +1,14 @@
 /// <reference lib="webworker" />
-/** Sim/paint worker entry (SPEC.md §10). Logic lives in SimHost. */
+/** Sim worker entry (SPEC.md §10): tectonics, history, climate inputs. Logic lives in SimHost. */
 import { errorMessage, type SimEvent, type SimRequest } from './protocol';
+import { macrotaskScheduler } from './schedule';
 import { SimHost } from './simHost';
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 
-/** Macrotask scheduling via a private MessageChannel (setTimeout(0) is clamped to ≥ 4 ms when nested). */
-const channel = new MessageChannel();
-const queue: Array<() => void> = [];
-channel.port1.onmessage = () => {
-  const fn = queue.shift();
-  fn?.();
-};
-function schedule(fn: () => void): void {
-  queue.push(fn);
-  channel.port2.postMessage(0);
-}
-
 const host = new SimHost({
   post: (msg: SimEvent, transfer?: Transferable[]) => scope.postMessage(msg, transfer ?? []),
-  schedule,
+  schedule: macrotaskScheduler(),
   now: () => performance.now(),
 });
 

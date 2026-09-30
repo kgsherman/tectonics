@@ -4,7 +4,7 @@
  * add/delete, motions), keeps plate topology valid (auto-split / merge), tracks changed cells for
  * the incremental preview and records undo/redo as sparse diffs.
  */
-import { MAX_PLATES } from '../core/constants';
+import { EARTH_RADIUS_KM, MAX_PLATES } from '../core/constants';
 import { nearestCell } from '../core/sphereMesh';
 import type { PlateSpec, RGB, SphereMesh, Vec3, WorldDraft } from '../core/types';
 import { cloneDraft, finalizeDraft } from '../tectonics/draft';
@@ -13,16 +13,19 @@ import type { StrokeTool } from './brushOps';
 import { applyDab } from './brushOps';
 import type { DraftSource, EditState } from './editState';
 import { keepElevationMask, stateFromDraft } from './editState';
-import { CONTINENT_EDGE_ROUGHNESS, RAISE_DEFAULT_M } from './editorConstants';
+import { CONTINENT_EDGE_ROUGHNESS, MIN_FRAGMENT_CELLS, RAISE_DEFAULT_M, ZERO_MOTION_KM_MYR } from './editorConstants';
+import { rejoinPlatePieces, simulationLabels } from './finalize';
+import { continentHygiene, hygieneLimits } from './coastHygiene';
 import { applyEntry, ChangeRecorder, fullEntry, History } from './history';
 import type { PlateMotion } from './motion';
-import { motionAt, randomMotion } from './motion';
+import { formatMotion, motionAt, randomMotion } from './motion';
 import type { OpResult } from './opResult';
 import { ok, refuse } from './opResult';
-import { pathCells } from './paths';
-import type { Mutator, TopologyResult } from './plateOps';
+import { extendCut, pathCells } from './paths';
+import type { Mutator, PlatePieces, TidyOptions, TopologyResult } from './plateOps';
 import {
-  appendPlate, boundaryCellsOf, continentalFractions, normalizeTopology, opRng, removeEmptyPlate, smoothLabels,
+  appendPlate, boundaryCellsOf, continentalFractions, opRng, platePieces, removeEmptyPlate, removeEmptyPlates, smoothLabels,
+  tidyFragments,
 } from './plateOps';
 import { lassoCells, regionStats, replaceWithSeedPlates, splitAlongCut } from './regionOps';
 import { plateOceanAges, ReliefModel } from './relief';
@@ -75,6 +78,8 @@ interface ActiveStroke {
   oceanAges: Float64Array | null;
   rough: DabRoughness | null;
   painted: number;
+  /** Continent brush: cells turned continental by this stroke. */
+  paintMask: Uint8Array | null;
 }
 
 /** Throws on drafts the editor cannot hold (wrong sizes, invalid plate indices, too many plates). */
@@ -122,6 +127,7 @@ export class EditorCore {
   // Caches (invalidated when plate membership changes).
   private anchorCache: Array<Vec3 | null> | null = null;
   private countCache: Int32Array | null = null;
+  private piecesCache: { revision: number; value: PlatePieces } | null = null;
 
   private stroke: ActiveStroke | null = null;
   private motionEdit: number | null = null;
@@ -236,6 +242,18 @@ export class EditorCore {
     return this.anchorCache;
   }
 
+  /**
+   * Connected pieces per plate index (cached per revision). Plates may be in several pieces while
+   * editing; "Simulate" keeps them as one plate and merges only tiny detached pieces.
+   */
+  pieces(): PlatePieces {
+    const c = this.piecesCache;
+    if (c && c.revision === this.rev && c.value.pieces.length === this.st.draft.plates.length) return c.value;
+    const value = platePieces(this.mesh, this.st.draft.plate, this.st.draft.plates.length);
+    this.piecesCache = { revision: this.rev, value };
+    return value;
+  }
+
   /** Motion of plate k at its anchor, or null if it has no cells. */
   plateMotion(k: number): PlateMotion | null {
     const a = this.anchors()[k];
@@ -264,9 +282,37 @@ export class EditorCore {
     return keepElevationMask(this.st);
   }
 
-  /** "Simulate this world": finalizeDraft on a copy with the keep-elevation mask. */
+  /**
+   * "Simulate this world": finalizeDraft on a copy with the keep-elevation mask, keeping the user's
+   * plates as drawn — a plate in several pieces stays ONE plate (same id, name, colour and motion);
+   * only detached pieces smaller than MIN_FRAGMENT_CELLS merge into their neighbours. Empty plates
+   * are dropped.
+   */
   finalize(seed: number): WorldDraft {
-    return finalizeDraft(this.mesh, cloneDraft(this.st.draft), seed, keepElevationMask(this.st));
+    return this.finalizeWithReport(seed).draft;
+  }
+
+  /** finalize() plus what it tidied (for the status line). */
+  finalizeWithReport(seed: number): { draft: WorldDraft; mergedPieces: number; droppedEmpty: number } {
+    const src = cloneDraft(this.st.draft);
+    // Motionless plates get their default motion here (as the editor would give them) so that all
+    // pieces of a plate share it (finalizeDraft would draw a separate motion for every piece).
+    const anchors = this.anchors();
+    const counts = this.counts();
+    const cf = continentalFractions(this.st);
+    src.plates.forEach((p, k) => {
+      const a = anchors[k];
+      if (!a || counts[k] === 0 || Math.hypot(p.omega[0], p.omega[1], p.omega[2]) * EARTH_RADIUS_KM >= ZERO_MOTION_KM_MYR) return;
+      p.omega = randomMotion(opRng(seed, 0, p.id), a, cf[k]);
+    });
+    const droppedEmpty = counts.reduce((acc, v) => acc + (v === 0 ? 1 : 0), 0);
+    // Tiny detached pieces merge here (not in finalizeDraft, which would also flood whole pieces
+    // into their surroundings once splitting them reaches MAX_PLATES); every other piece is given
+    // back its drawn plate after finalizeDraft.
+    const labels = simulationLabels(this.mesh, src.plate, src.plates.length);
+    src.plate = labels.plate;
+    const fin = finalizeDraft(this.mesh, src, seed, keepElevationMask(this.st));
+    return { draft: rejoinPlatePieces(src, fin, labels.loose), mergedPieces: labels.merged, droppedEmpty };
   }
 
   /* ------------------------------------------------------------------ */
@@ -481,6 +527,7 @@ export class EditorCore {
       oceanAges: tool === 'ocean' ? plateOceanAges(this.st) : null,
       rough,
       painted: 0,
+      paintMask: tool === 'continent' ? new Uint8Array(this.mesh.n) : null,
     };
   }
 
@@ -527,17 +574,44 @@ export class EditorCore {
     if (s.tool === 'plate' || s.tool === 'smooth') {
       this.invalidate();
       try {
-        topo = normalizeTopology(this.mut, s.countsBefore);
+        topo = this.tidy(s.countsBefore, { keep: s.tool === 'plate' ? s.plate : undefined });
       } catch (err) {
         // Never leave the editor stuck mid-stroke (every later edit would be refused).
         this.cancel();
         throw err;
       }
     }
+    if (s.tool === 'continent' && s.paintMask && s.painted > 0) {
+      const t = this.recorder.touchedCells();
+      const near = t ? Array.from(t.cells.subarray(0, t.count)) : [];
+      const h = continentHygiene(this.mut, near, s.paintMask, plateOceanAges(this.st), hygieneLimits(s.radius, this.mesh.spacing));
+      if (h.cells.length) {
+        const xyz = this.mesh.xyz;
+        this.updateReliefAround(h.cells.map((i): Vec3 => [xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2]]), this.mesh.spacing);
+      }
+    }
     this.stroke = null;
     this.commit();
     const what = STROKE_LABELS[s.tool];
-    return ok(s.painted > 0 || s.tool === 'smooth' ? what : `${what}: nothing changed`, topo);
+    const res = ok(s.painted > 0 || s.tool === 'smooth' ? what : `${what}: nothing changed`, topo);
+    return this.withEmptied(res, topo);
+  }
+
+  /** tidyFragments around the cells the current recording touched. */
+  private tidy(countsBefore: Int32Array, opts: TidyOptions = {}): TopologyResult {
+    const t = this.recorder.touchedCells();
+    return tidyFragments(this.mut, countsBefore, { ...opts, near: t ? t.cells.subarray(0, t.count) : null });
+  }
+
+  /** Mention plates an edit left empty (they stay in the list until deleted or painted back). */
+  private withEmptied(res: OpResult, topo?: TopologyResult): OpResult {
+    const ids = topo?.emptied ?? [];
+    if (!res.ok || ids.length === 0) return res;
+    const names = ids.map((id) => this.plates.find((p) => p.id === id)?.name).filter((x): x is string => !!x);
+    if (!names.length) return res;
+    const one = names.length === 1;
+    const who = one ? names[0] : `${names.length} plates`;
+    return { ...res, message: `${res.message} · ${who} ${one ? 'is' : 'are'} now empty (paint ${one ? 'it' : 'them'} back or delete)` };
   }
 
   /** Abandon the current stroke or motion drag, restoring the state before it. */
@@ -579,7 +653,7 @@ export class EditorCore {
     this.plateDirtyIdx[k] = 1;
     this.commit();
     const m = this.plateMotion(k);
-    return ok(m ? `${this.plates[k].name}: ${(m.speed / 10).toFixed(1)} cm/yr toward ${Math.round(m.bearing)}°` : 'Motion set');
+    return ok(m ? `${this.plates[k].name}: ${formatMotion(m.speed, m.bearing)}` : 'Motion set');
   }
 
   /** Set a plate's angular velocity (numeric edit) as one undo step. */
@@ -590,7 +664,9 @@ export class EditorCore {
       this.plates[k].omega = [omega[0], omega[1], omega[2]];
       this.plateDirtyIdx[k] = 1;
       this.motionDirty.add(k);
-      return ok('Motion set');
+      const a = this.anchors()[k];
+      const m = a ? motionAt(this.plates[k].omega, a) : null;
+      return ok(m ? `${this.plates[k].name}: ${formatMotion(m.speed, m.bearing)}` : 'Motion set');
     });
   }
 
@@ -683,29 +759,61 @@ export class EditorCore {
       const before = this.counts().slice();
       const region = floodRegion(this.mesh, d.plate, start);
       for (const i of region) this.setPlate(i, target);
-      const topo = normalizeTopology(this.mut, before);
-      return ok(`Filled ${region.length.toLocaleString('en-US')} cells`, topo);
+      const topo = this.tidy(before, { keep: target });
+      return this.withEmptied(ok(`Filled ${region.length.toLocaleString('en-US')} cells with ${d.plates[target].name}`, topo), topo);
     });
   }
 
   /**
    * Split every plate the cut crosses from edge to edge. The largest side keeps the plate; each
    * other side of at least MIN_FRAGMENT_CELLS becomes a new plate with the same motion. Cut cells
-   * join the side most of their neighbours are on.
+   * join the side most of their neighbours are on. Unless `extend` is false, ends of the line inside
+   * the plate being cut continue straight (great circle) to its edge — see extendCut — so a short
+   * line splits a plate and a line on a whole-sphere plate cuts it into two.
    */
-  split(path: ReadonlyArray<Vec3 | null>): OpResult {
+  split(path: ReadonlyArray<Vec3 | null>, opts: { extend?: boolean } = {}): OpResult {
     return this.run('Split plate', () => {
-      const cut = pathCells(this.mesh, path, false);
+      const line = opts.extend === false ? path : extendCut(this.mesh, this.st.draft.plate, path);
+      const cut = pathCells(this.mesh, line, false);
       if (cut.length < 2) return refuse('Drag a line across a plate to split it');
       const before = this.counts().slice();
       const { created, capped } = splitAlongCut(this.mut, cut);
       if (created.length === 0) {
         return refuse(capped ? `Plate limit reached (${this.cap})` : 'The cut must cross a plate from edge to edge');
       }
-      const topo = normalizeTopology(this.mut, before);
+      // The plates actually cut (each lost a whole piece, >= MIN_FRAGMENT_CELLS, to a new plate), not
+      // the neighbours the line's ends brush against: only those and the new pieces may receive a
+      // default motion.
+      const d = this.st.draft;
+      const after = plateCounts(d.plate, d.plates.length);
+      const cutIds = new Set<number>(created);
+      for (let k = 0; k < before.length; k++) if (before[k] - after[k] >= MIN_FRAGMENT_CELLS) cutIds.add(d.plates[k].id);
+      const topo = this.tidy(before);
+      this.giveMotionlessPlatesMotion(cutIds);
       const msg = `Split into ${created.length + 1} plates` + (capped ? ` (plate limit ${this.cap} reached)` : '');
       return ok(msg, topo, created);
     });
+  }
+
+  /**
+   * Plates of `ids` that have no motion (the pieces of a split motionless plate, e.g. the single
+   * plate of a blank world) get distinct default motions, so the new boundaries show real
+   * convergence / divergence at once.
+   */
+  private giveMotionlessPlatesMotion(ids: ReadonlySet<number>): void {
+    const d = this.st.draft;
+    this.invalidate();
+    const anchors = this.anchors();
+    const cf = continentalFractions(this.st);
+    let any = false;
+    d.plates.forEach((p, k) => {
+      const a = anchors[k];
+      if (!ids.has(p.id) || !a || p.omega[0] !== 0 || p.omega[1] !== 0 || p.omega[2] !== 0) return;
+      p.omega = randomMotion(this.mut.rng(p.id + 7919), a, cf[k]);
+      this.plateDirtyIdx[k] = 1;
+      any = true;
+    });
+    if (any) this.markAll();
   }
 
   /**
@@ -736,8 +844,9 @@ export class EditorCore {
         moved++;
       }
       if (moved === 0) return refuse(`That region already belongs to ${name}`);
-      const topo = normalizeTopology(this.mut, before);
-      return target === 'new' ? ok(`Created ${name}`, topo, [id]) : ok(`Added ${moved.toLocaleString('en-US')} cells to ${name}`, topo);
+      const topo = this.tidy(before, { keep: k });
+      const res = target === 'new' ? ok(`Created ${name}`, topo, [id]) : ok(`Added ${moved.toLocaleString('en-US')} cells to ${name}`, topo);
+      return this.withEmptied(res, topo);
     });
   }
 
@@ -749,8 +858,10 @@ export class EditorCore {
       const noiseSeed = (this.st.draft.seed * 977 + this.rev * 31 + 7) >>> 0;
       replaceWithSeedPlates(this.mut, seeds, roughness, noiseSeed);
       this.invalidate();
-      // Seeds swallowed by their neighbours' regions leave empty plates: remove them.
-      const topo = normalizeTopology(this.mut, new Int32Array(this.plates.length).fill(1));
+      // Seeds swallowed by their neighbours' regions leave empty plates: remove them (this tool
+      // regenerates the whole plate list anyway), then tidy stray slivers of the warped regions.
+      removeEmptyPlates(this.mut);
+      const topo = tidyFragments(this.mut, new Int32Array(this.plates.length).fill(1));
       return ok(`Generated ${this.plates.length} plates from seeds`, topo);
     });
   }
@@ -761,8 +872,20 @@ export class EditorCore {
       const before = this.counts().slice();
       const cells = boundaryCellsOf(this.mesh, this.st.draft.plate);
       smoothLabels(this.mut, cells);
-      const topo = normalizeTopology(this.mut, before);
-      return ok('Smoothed all plate boundaries', topo);
+      const topo = this.tidy(before);
+      return this.withEmptied(ok('Smoothed all plate boundaries', topo), topo);
+    });
+  }
+
+  /** Delete every plate that has no cells (explicit clean-up; strokes never remove plates). */
+  removeEmptyPlates(): OpResult {
+    return this.run('Remove empty plates', () => {
+      const counts = this.counts();
+      const empty = counts.reduce((acc, v) => acc + (v === 0 ? 1 : 0), 0);
+      if (empty === 0) return refuse('No empty plates');
+      const removed = removeEmptyPlates(this.mut);
+      this.markAll();
+      return { ok: true, message: `Removed ${removed.length} empty plate${removed.length > 1 ? 's' : ''}`, created: [], removed };
     });
   }
 }

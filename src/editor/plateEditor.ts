@@ -1,6 +1,7 @@
 import { DEG, EARTH_RADIUS_KM } from '../core/constants';
 import { createSphereMesh } from '../core/sphereMesh';
-import type { GenerateParams, SphereMesh, Vec3, WorldDraft, WorldView } from '../core/types';
+import type { GenerateParams, SphereMesh, Vec3, WorldDraft, WorldPointerEvent, WorldView } from '../core/types';
+import { CRUST_CONTINENTAL } from '../core/types';
 import { blankDraft, resampleDraft } from '../tectonics/draft';
 import type { DraftSource } from './editState';
 import type { OpResult } from './editorCore';
@@ -12,6 +13,8 @@ import { WorkerFullRenderer } from './fullRender';
 import type { InteractionHost, ToolSettings } from './interaction';
 import { PointerInteraction } from './interaction';
 import { omegaFromMotion } from './motion';
+import type { PerfSummary } from './perf';
+import { PerfRing } from './perf';
 import type { ToolId } from './tools';
 import { keyAction, stepBrushKm } from './tools';
 import { plateCounts } from './topology';
@@ -49,6 +52,9 @@ export interface PlateEditorOptions {
   /** Full-quality preview size (default 2048×1024). */
   fullSize?: [number, number];
 }
+
+/** Colour of the single ocean plate of a blank world. */
+const BLANK_PLATE_COLOR: readonly [number, number, number] = [58, 120, 196];
 
 /** onDraftChange throttle, ms. */
 const DRAFT_CHANGE_THROTTLE = 300;
@@ -98,7 +104,18 @@ export class PlateEditor {
   private listDirty = true;
   private loading = false;
   private applying = false;
+  /** Show the "Draw your own world" checklist (blank starts). */
+  private guideActive = true;
+  private contCache: { revision: number; cells: number; moving: boolean } | null = null;
+  private lastPieces: { pieces: Int32Array; tiny: Int32Array } | null = null;
+  /** Pointer-event handling cost (strokes, drags, hover), ms. */
+  private readonly eventTimes = new PerfRing(240);
   private readonly onKeyDown = (e: KeyboardEvent) => this.handleKey(e);
+  private readonly onPointer = (e: WorldPointerEvent) => {
+    const t0 = performance.now();
+    this.interaction.handle(e);
+    if (e.type === 'move' || e.type === 'down') this.eventTimes.push(performance.now() - t0);
+  };
 
   constructor(opts: PlateEditorOptions) {
     this.opts = opts;
@@ -147,6 +164,13 @@ export class PlateEditor {
       motionDrag: (k) => this.renderer.setMotionDrag(k),
       setCursor: (c) => this.renderer.setCursor(c),
       hover: (t) => this.panel.setHover(t),
+      pointerCursor: (css) => this.renderer.setPointerCursor(css),
+      hoverArrow: (k) => this.renderer.setHoverArrow(k),
+      hoverSeed: (k) => this.renderer.setHoverSeed(k),
+      motionReadout: (r) => {
+        this.renderer.setMotionReadout(r);
+        if (r) this.panel.setStatus(r.text, 'info', 2500);
+      },
     };
     this.interaction = new PointerInteraction(host);
     this.refreshPanel();
@@ -164,6 +188,8 @@ export class PlateEditor {
   setDraft(draft: WorldDraft, source: DraftSource = 'unknown'): void {
     this.interaction.cancel();
     this.core.reset(this.onEditorMesh(draft), source);
+    const d = this.core.draft;
+    this.guideActive = source === 'blank' || (d.plates.length === 1 && !d.crust.includes(CRUST_CONTINENTAL));
     this.afterLoad();
   }
 
@@ -187,7 +213,7 @@ export class PlateEditor {
         this.panel.setStatus(`Full-quality preview unavailable (${errorText(err)}); showing the fast preview.`, 'warn', 8000);
       }
     }
-    this.renderer.bind(this.opts.getView(), (e) => this.interaction.handle(e));
+    this.renderer.bind(this.opts.getView(), this.onPointer);
     window.addEventListener('keydown', this.onKeyDown, true);
     this.listDirty = true;
     this.refreshPanel();
@@ -214,7 +240,7 @@ export class PlateEditor {
     if (!this.active) return;
     this.interaction.cancel();
     this.renderer.unbind(false);
-    this.renderer.bind(this.opts.getView(), (e) => this.interaction.handle(e));
+    this.renderer.bind(this.opts.getView(), this.onPointer);
   }
 
   dispose(): void {
@@ -241,6 +267,20 @@ export class PlateEditor {
   /** Current tool (for app-level UI). */
   get tool(): ToolId {
     return this.settings.tool;
+  }
+
+  /**
+   * Interactive cost so far (ms): `frame` = one preview update (recolour changed cells, boundaries,
+   * push to the view), `event` = handling one pointer down/move (brush dabs, relief, drags).
+   */
+  perfStats(): { frame: PerfSummary; event: PerfSummary } {
+    return { frame: this.renderer.frameTimes.summary(), event: this.eventTimes.summary() };
+  }
+
+  /** Forget the collected timings. */
+  resetPerfStats(): void {
+    this.renderer.frameTimes.clear();
+    this.eventTimes.clear();
   }
 
   /* ------------------------------------------------------------------ */
@@ -355,6 +395,7 @@ export class PlateEditor {
 
   private afterLoad(): void {
     this.selectedId = this.core.plates[0].id;
+    this.lastPieces = null;
     this.interaction.refreshHover();
     this.listDirty = true;
     this.refreshPanel();
@@ -377,9 +418,21 @@ export class PlateEditor {
       const gen: Partial<GenerateParams> | undefined = src === 'random' ? { seed: (Math.random() * 0x7fffffff) >>> 0 } : undefined;
       const draft = this.onEditorMesh(await this.opts.requestDraft(src, gen));
       if (this.disposed) return;
+      // A blank world is one ocean plate: give it a calm ocean blue rather than palette colour #1.
+      if (src === 'blank' && draft.plates.length === 1) draft.plates[0] = { ...draft.plates[0], color: [...BLANK_PLATE_COLOR] };
       const res = this.core.load(draft, src, label);
+      this.guideActive = src === 'blank';
       this.afterLoad();
-      this.panel.setStatus(`${res.message}. Undo to go back.`, 'ok');
+      if (src === 'blank') {
+        // A blank world is one ocean plate: have the continent brush ready and show relief, so the
+        // first strokes read as land and sea (plate boundaries are still drawn).
+        this.setTool('continent');
+        if (this.settings.style !== 'relief') {
+          this.settings.style = 'relief';
+          this.renderer.invalidateAll();
+        }
+        this.panel.setStatus('Blank world: one ocean plate. Paint continents, then cut it into plates. Undo to go back.', 'ok', 8000);
+      } else this.panel.setStatus(`${res.message}. Undo to go back.`, 'ok');
     } catch (err) {
       console.error('[plate editor] requestDraft failed', err);
       this.panel.setStatus(`Could not load ${label.toLowerCase()}: ${errorText(err)}`, 'error', 8000);
@@ -401,9 +454,12 @@ export class PlateEditor {
         return;
       }
       try {
-        const fin = this.core.finalize(this.core.draft.seed);
+        const { draft: fin, mergedPieces, droppedEmpty } = this.core.finalizeWithReport(this.core.draft.seed);
         this.opts.onApply(fin);
-        this.panel.setStatus(`Simulating ${fin.plates.length} plates.`, 'ok');
+        const extras: string[] = [];
+        if (mergedPieces) extras.push(`${mergedPieces} tiny piece${mergedPieces > 1 ? 's' : ''} merged into neighbours`);
+        if (droppedEmpty) extras.push(`${droppedEmpty} empty plate${droppedEmpty > 1 ? 's' : ''} left out`);
+        this.panel.setStatus(`Simulating ${fin.plates.length} plate${fin.plates.length > 1 ? 's' : ''}${extras.length ? ` (${extras.join(', ')})` : ''}.`, 'ok', 6000);
       } catch (err) {
         console.error('[plate editor] apply failed', err);
         this.panel.setStatus(`Could not start the simulation: ${errorText(err)}`, 'error', 8000);
@@ -452,6 +508,14 @@ export class PlateEditor {
         this.seeds.length = 0;
         this.refreshPanel();
         this.renderer.invalidateOverlays();
+      },
+      dismissGuide: () => {
+        this.guideActive = false;
+        this.refreshPanel();
+      },
+      removeEmpty: () => {
+        this.interaction.cancel();
+        this.opDone(this.core.removeEmptyPlates());
       },
       smoothAll: () => this.opDone(this.core.smoothAll()),
       randomizeMotions: () => {
@@ -512,6 +576,9 @@ export class PlateEditor {
     const d = core.draft;
     // Live counts (cheap) so areas update while painting; motions use the committed anchors.
     const counts = plateCounts(d.plate, d.plates.length);
+    // Pieces need a full component labelling: refresh them between edits, not on every dab.
+    if (!core.busy || !this.lastPieces || this.lastPieces.pieces.length !== d.plates.length) this.lastPieces = core.pieces();
+    const pieces = this.lastPieces;
     const rows: PlateRow[] = d.plates.map((p, k) => {
       const m = counts[k] > 0 ? core.plateMotion(k) : null;
       return {
@@ -523,16 +590,103 @@ export class PlateEditor {
         speed: m ? m.speed : null,
         bearing: m ? m.bearing : 0,
         spin: m ? m.spin : 0,
+        pieces: counts[k] > 0 ? pieces.pieces[k] : 0,
+        tinyPieces: counts[k] > 0 ? pieces.tiny[k] : 0,
       };
     });
     this.panel.updatePlates(rows, this.selectedId);
     this.panel.update(this.panelState());
   }
 
+  /** Continental cell count and whether every placed plate moves (cached per revision). */
+  private worldSummary(): { cells: number; moving: boolean } {
+    const core = this.core;
+    const c = this.contCache;
+    if (c && c.revision === core.revision) return c;
+    const d = core.draft;
+    let cells = 0;
+    for (let i = 0; i < d.n; i++) if (d.crust[i] === CRUST_CONTINENTAL) cells++;
+    const counts = core.counts();
+    let moving = true;
+    for (let k = 0; k < d.plates.length; k++) {
+      if (counts[k] === 0) continue;
+      const w = d.plates[k].omega;
+      if (Math.hypot(w[0], w[1], w[2]) * EARTH_RADIUS_KM < 0.5) moving = false;
+    }
+    this.contCache = { revision: core.revision, cells, moving };
+    return this.contCache;
+  }
+
+  /** Usage hint for the current tool, with the live context (selected plate, cap, seeds). */
+  private toolHint(): { hint: string; warn: boolean } {
+    const core = this.core;
+    const sel = this.selectedIndex();
+    const name = sel >= 0 ? core.plates[sel].name : 'the selected plate';
+    const atCap = core.plates.length >= core.cap;
+    const counts = core.counts();
+    let empty = 0;
+    for (let k = 0; k < counts.length; k++) if (counts[k] === 0) empty++;
+    const free = empty > 0 ? `Remove the ${empty} empty plate${empty > 1 ? 's' : ''} or delete one` : 'Delete or merge a plate';
+    const s = this.settings;
+    switch (s.tool) {
+      case 'select':
+        return { hint: 'Click a plate to select it. Drag to turn the view.', warn: false };
+      case 'plate':
+        return { hint: `Paints ${name} — detached islands included. Ctrl+click picks a plate · [ ] size.`, warn: false };
+      case 'continent':
+        return {
+          hint: s.continentMode === 'land'
+            ? 'Paint land: shelves, coastal plains and uplands come automatically. Shift paints ocean · X swaps · [ ] size.'
+            : 'Paint ocean floor (carve seas and bays). Shift paints land · X swaps · [ ] size.',
+          warn: false,
+        };
+      case 'raise':
+        return { hint: `Drag to ${s.raiseMode === 'raise' ? 'raise' : 'lower'} terrain (Shift inverts). Sculpted relief is kept when you simulate.`, warn: false };
+      case 'fill':
+        return { hint: `Click a region to give it to ${name}.`, warn: false };
+      case 'split':
+        return atCap
+          ? { hint: `Plate limit reached (${core.cap}). ${free} to split again.`, warn: true }
+          : { hint: 'Drag a line on a plate: it continues straight to the plate\'s edges, and each side becomes its own plate.', warn: false };
+      case 'lasso':
+        if (s.lassoTarget === 'new') {
+          return atCap
+            ? { hint: `Plate limit reached (${core.cap}). Lasso into the selected plate instead, or ${free.toLowerCase()}.`, warn: true }
+            : { hint: 'Draw a loop: the region inside becomes a new plate.', warn: false };
+        }
+        return { hint: `Draw a loop: the region inside joins ${name}.`, warn: false };
+      case 'seeds':
+        return {
+          hint: `Click to place seeds (${this.seeds.length}/${core.cap}), drag to move, Shift+click removes. Enter replaces all plates with regions around them.`,
+          warn: false,
+        };
+      case 'motion':
+        return { hint: 'Drag an arrow to change speed and heading, or drag from anywhere on a plate to draw a new arrow. Shift snaps to 15° / 0.5 cm/yr.', warn: false };
+      case 'smooth':
+        return { hint: 'Brush over jagged plate boundaries to straighten them.', warn: false };
+    }
+  }
+
   private panelState(): PanelState {
     const sel = this.selectedIndex();
     const p = sel >= 0 ? this.core.plates[sel] : null;
+    const { hint, warn } = this.toolHint();
+    const counts = this.core.counts();
+    let placed = 0, empty = 0;
+    for (let k = 0; k < counts.length; k++) {
+      if (counts[k] > 0) placed++;
+      else empty++;
+    }
+    let guide: PanelState['guide'] = null;
+    if (this.guideActive) {
+      const w = this.worldSummary();
+      guide = { continents: w.cells > 0, plates: placed > 1, motions: placed > 0 && w.moving };
+    }
     return {
+      hint,
+      hintWarn: warn,
+      emptyPlates: empty,
+      guide,
       tool: this.settings.tool,
       brushKm: this.settings.brushKm,
       minBrushKm: this.mesh.spacing * EARTH_RADIUS_KM,

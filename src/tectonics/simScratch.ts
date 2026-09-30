@@ -33,6 +33,8 @@ export interface StepScratch {
   /** Hotspot uplift over the step, m (already saturating toward the volcanic target). */
   hotspotUp: Float32Array;
   arcMask: Uint8Array;
+  /** Cells uplifted by a subduction front this step (their eroded sediment feeds the trench). */
+  subMask: Uint8Array;
   diffusion: Float32Array;
   /** Free scratch (any pass may overwrite; never assume contents). */
   tmpA: Float32Array;
@@ -73,6 +75,7 @@ export function stepScratch(state: SimState): StepScratch {
       uplift: new Float32Array(n),
       hotspotUp: new Float32Array(n),
       arcMask: new Uint8Array(n),
+      subMask: new Uint8Array(n),
       diffusion: new Float32Array(n),
       tmpA: new Float32Array(n),
       tmpB: new Float32Array(n),

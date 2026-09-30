@@ -234,7 +234,8 @@ export function buildStommelSetup(g: LatLonGrid, land: Uint8Array, retrograde: b
  * In zonally blocked basins friction on meridional shear is reduced (meridionalFriction) so
  * interiors reach Sverdrup balance on the coarse grid while the western boundary layer keeps
  * δ_S = r/β; in zonally open channels (e.g. the Southern Ocean) there is no western boundary to
- * close the flow and the full friction (standing in for form drag) is kept. The blend uses the
+ * close the flow and a higher friction (channelFriction × r, standing in for topographic form drag,
+ * which limits the circumpolar current) applies. The blend uses the
  * longest wet run of the two adjacent rows as a fraction of the latitude circle.
  */
 function meridionalFrictionPerFace(g: LatLonGrid, wet: Uint8Array, j0: number, j1: number): Float64Array {
@@ -260,7 +261,7 @@ function meridionalFrictionPerFace(g: LatLonGrid, wet: Uint8Array, j0: number, j
   for (let k = 0; k <= ny; k++) {
     const o = Math.max(k > 0 ? open[k - 1] : 0, k < ny ? open[k] : 0);
     const w = Math.pow(o, oceanTuning.channelOpennessPower);
-    out[k] = base + (1 - base) * w;
+    out[k] = base + (oceanTuning.channelFriction - base) * w;
   }
   return out;
 }

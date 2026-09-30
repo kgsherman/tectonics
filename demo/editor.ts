@@ -89,6 +89,98 @@ async function main(): Promise<void> {
     if (e.key === 'm' || e.key === 'M') show('map');
   });
   (window as unknown as { __editor: PlateEditor }).__editor = editor;
+  (window as unknown as { __qa: unknown }).__qa = qaHooks(editor, getView);
+}
+
+/**
+ * Scripted QA helpers (window.__qa): synthetic pointer drags in lat/lon, synchronous preview
+ * flush + view capture, and a DOM capture of the panel — usable while the page is in a hidden tab
+ * (no requestAnimationFrame). Captures are POSTed to the dev server's /__snap endpoint.
+ */
+function qaHooks(editor: PlateEditor, getView: () => WorldView) {
+  type LL = [number, number] | { x: number; y: number };
+  const DEGR = Math.PI / 180;
+  const renderer = () => (editor as unknown as { renderer: { flush(): void; cancelFrame(): void } }).renderer;
+  const toXY = (p: LL) => {
+    if (!Array.isArray(p)) return p;
+    const pr = getView().project({ lat: p[0] * DEGR, lon: p[1] * DEGR });
+    return { x: pr.x, y: pr.y };
+  };
+  const target = () => {
+    const el = getView().element;
+    return (el.querySelector('canvas')?.parentElement ?? el) as HTMLElement;
+  };
+  const fire = (type: string, p: LL, buttons: number, mods: { shift?: boolean; ctrl?: boolean } = {}) => {
+    const { x, y } = toXY(p);
+    target().dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, pointerId: 7, pointerType: 'mouse', clientX: x, clientY: y, button: 0, buttons,
+      shiftKey: !!mods.shift, ctrlKey: !!mods.ctrl,
+    }));
+  };
+  const status = () => document.querySelector('.pe-status')?.textContent ?? '';
+  const post = async (name: string, dataUrl: string) => (await fetch(`/__snap?name=${encodeURIComponent(name)}`, { method: 'POST', body: dataUrl })).text();
+  return {
+    /** Press at pts[0], move through the rest, release (optionally holding keys). Returns the status line. */
+    drag(pts: LL[], mods: { shift?: boolean; ctrl?: boolean; noUp?: boolean } = {}): string {
+      fire('pointermove', pts[0], 0, mods);
+      fire('pointerdown', pts[0], 1, mods);
+      for (let i = 1; i < pts.length; i++) fire('pointermove', pts[i], 1, mods);
+      if (!mods.noUp) fire('pointerup', pts[pts.length - 1], 0, mods);
+      return status();
+    },
+    /** Pointer move with the left button held (continues a drag started with drag(..., { noUp: true })). */
+    move(p: LL, mods: { shift?: boolean } = {}): string {
+      fire('pointermove', p, 1, mods);
+      return status();
+    },
+    hover(p: LL, mods: { shift?: boolean } = {}): string {
+      fire('pointermove', p, 0, mods);
+      return status();
+    },
+    up(p: LL): string {
+      fire('pointerup', p, 0);
+      return status();
+    },
+    key(key: string, mods: { shift?: boolean; ctrl?: boolean } = {}): void {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key, shiftKey: !!mods.shift, ctrlKey: !!mods.ctrl, bubbles: true, cancelable: true }));
+    },
+    status,
+    flush(): void {
+      renderer().cancelFrame();
+      renderer().flush();
+    },
+    xy: toXY,
+    async snapView(name: string): Promise<string> {
+      renderer().cancelFrame();
+      renderer().flush();
+      return post(name, getView().toDataURL());
+    },
+    /** Rasterise the editor panel through an SVG foreignObject (2× scale). */
+    async snapPanel(name: string): Promise<string> {
+      const node = document.getElementById('panel') as HTMLElement;
+      const rect = node.getBoundingClientRect();
+      const css = [...document.querySelectorAll('style')].map((s) => s.textContent ?? '').join('\n');
+      const clone = node.cloneNode(true) as HTMLElement;
+      const src = node.querySelectorAll('input'), dst = clone.querySelectorAll('input');
+      src.forEach((s, i) => dst[i].setAttribute('value', s.value));
+      const html = new XMLSerializer().serializeToString(clone);
+      const w = Math.ceil(rect.width), h = Math.ceil(rect.height);
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w * 2}" height="${h * 2}"><foreignObject x="0" y="0" width="${w}" height="${h}" transform="scale(2)">` +
+        `<div xmlns="http://www.w3.org/1999/xhtml" style="width:${w}px;height:${h}px;background:#0b0f14;color:#d7e0ea;font:13px system-ui,sans-serif">` +
+        `<style>${css.replace(/</g, '&lt;')}</style>${html}</div></foreignObject></svg>`;
+      const img = new Image();
+      await new Promise((res, rej) => {
+        img.onload = res;
+        img.onerror = rej;
+        img.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+      });
+      const c = document.createElement('canvas');
+      c.width = w * 2;
+      c.height = h * 2;
+      c.getContext('2d')?.drawImage(img, 0, 0);
+      return post(name, c.toDataURL('image/png'));
+    },
+  };
 }
 
 main().catch((err) => {

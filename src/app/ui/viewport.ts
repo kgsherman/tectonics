@@ -21,6 +21,8 @@ interface ViewExtras {
   setParticleCount?(count: number): void;
   getView?(): { center: GeoPoint };
   setView?(center: GeoPoint): void;
+  /** Strength of the GPU close-up detail (0..1). */
+  setSurfaceDetail?(amount: number): void;
 }
 export type AppView = WorldView & ViewExtras;
 
@@ -43,7 +45,8 @@ export class Viewport {
   readonly toolbar = h('div', { class: 'wg-toolbar' });
   readonly perf = h('div', { class: 'wg-view-perf wg-float', attrs: { hidden: true } });
   private readonly cover = h('div', { class: 'wg-view-cover' });
-  private readonly rendering = h('div', { class: 'wg-view-render wg-float' }, h('span', { class: 'wg-spinner' }), h('span', { text: 'Rendering…' }));
+  private readonly renderingLabel = h('span', { text: 'Rendering…' });
+  private readonly rendering = h('div', { class: 'wg-view-render wg-float', attrs: { role: 'status', 'aria-live': 'polite' } }, h('span', { class: 'wg-spinner' }), this.renderingLabel);
 
   private current: AppView | null = null;
   private currentKind: ViewKind | null = null;
@@ -60,6 +63,7 @@ export class Viewport {
   private field: VectorFieldSpec | null = null;
   private clouds: CloudSpec | null = null;
   private particleCount = 8000;
+  private surfaceDetail = 1;
 
   constructor(private readonly opts: ViewportOptions) {
     this.el.append(this.host, this.toolbar, this.perf, this.rendering, this.cover);
@@ -162,6 +166,12 @@ export class Viewport {
     if (this.live) this.current!.setParticleCount?.(n);
   }
 
+  /** GPU close-up detail strength (0..1), scaled by the Terrain detail setting. */
+  setSurfaceDetail(amount: number): void {
+    this.surfaceDetail = amount;
+    if (this.live) this.current!.setSurfaceDetail?.(amount);
+  }
+
   /** Stop pushing (the plate editor draws into the view). */
   suspend(): void {
     if (this.suspended) return;
@@ -207,13 +217,16 @@ export class Viewport {
       ));
   }
 
-  setRendering(on: boolean): void {
+  /** Busy badge over the view ("Rendering…", "Computing climate… 40%"). */
+  setRendering(on: boolean, label = 'Rendering…'): void {
     toggleClass(this.rendering, 'is-visible', on);
+    if (on) setText(this.renderingLabel, label);
   }
 
-  setPerf(text: string | null): void {
+  setPerf(text: string | null, detail?: string): void {
     this.perf.hidden = text === null;
     if (text !== null) setText(this.perf, text);
+    this.perf.title = detail ?? '';
   }
 
   screenshot(): string {
@@ -237,6 +250,7 @@ export class Viewport {
     v.setReliefScale(this.relief);
     v.setGraticule?.(this.graticule, 15);
     v.setParticleCount?.(this.particleCount);
+    v.setSurfaceDetail?.(this.surfaceDetail);
     if (this.base) v.setBaseImage(this.base.rgba, this.base.w, this.base.h);
     v.setHeightMap(this.heights?.data ?? null, this.heights?.w ?? 1, this.heights?.h ?? 1);
     v.setOverlayImage(this.overlay?.rgba ?? null, this.overlay?.w ?? 1, this.overlay?.h ?? 1);

@@ -428,3 +428,87 @@ button.wg-chip:hover { border-color: var(--wg-border); color: var(--wg-text); }
   .wg-month { flex-basis: 150px; }
   .wg-tl-speed { display: none; }
 }
+
+/* ------------------------------------------------------------------ */
+/* Polish: overlay chips, focus rings, editing layout, onboarding       */
+/* ------------------------------------------------------------------ */
+
+/* Overlay toggles under the layer tiles (always visible, even on short windows). */
+.wg-overlay-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+.wg-toggle-chip {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 26px; padding: 0 6px; border-radius: 13px; cursor: pointer; min-width: 0;
+  white-space: nowrap; overflow: hidden;
+  border: 1px solid var(--wg-border); background: transparent; color: var(--wg-text-dim); font-size: 11.5px; font-weight: 500;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.wg-toggle-chip:hover { color: var(--wg-text); background: var(--wg-hover); }
+.wg-toggle-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--wg-border); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08); transition: background 0.15s; }
+.wg-toggle-chip.is-on { color: #fff; border-color: rgba(79, 163, 255, 0.55); background: var(--wg-accent-soft); }
+.wg-toggle-chip.is-on .wg-toggle-dot { background: var(--wg-accent); box-shadow: 0 0 6px rgba(79, 163, 255, 0.7); }
+.wg-boundary-key { margin-top: 4px; }
+
+/* Keyboard focus is always visible (mouse clicks stay quiet). */
+.wg-tab:focus-visible, .wg-seg-btn:focus-visible, .wg-layer-tile:focus-visible, .wg-toggle-chip:focus-visible,
+button.wg-chip:focus-visible, .wg-picker-btn:focus-visible, .wg-layer-item:focus-visible, .wg-onb-link:focus-visible,
+.wg-onb-close:focus-visible {
+  outline: none; box-shadow: 0 0 0 2px var(--wg-accent), 0 0 0 5px var(--wg-accent-soft);
+}
+.wg-layer-item:focus-visible { background: var(--wg-hover); }
+
+/* Buttons sharing a row shrink instead of overflowing narrow panels. */
+.wg-row > .wg-btn { min-width: 0; padding: 0 9px; }
+.wg-row > .wg-btn > span { overflow: hidden; text-overflow: ellipsis; }
+
+/* Keyboard shortcut list. */
+.wg-keys { display: grid; grid-template-columns: 64px 1fr; gap: 6px 10px; margin: 0; font-size: 12px; align-items: center; }
+.wg-keys dt { margin: 0; }
+.wg-keys dd { margin: 0; color: var(--wg-text-dim); }
+
+/* Plate editing: the editor gets a wide panel, the (inactive) layer/legend panel steps aside. */
+:root { --wg-edit-w: 372px; }
+.wg-app.is-editing { grid-template-columns: var(--wg-edit-w) minmax(0, 1fr) 0; }
+.wg-app.is-editing .wg-right, .wg-app.is-editing .wg-drawer-float.is-right { display: none; }
+.wg-app.is-editing ~ .wg-toasts { right: 14px; }
+@media (max-width: 1280px) { :root { --wg-edit-w: 340px; } }
+@media (max-width: 760px) { .wg-app.is-editing { grid-template-columns: 0 minmax(0, 1fr) 0; } .wg-app.is-editing .wg-left { width: min(360px, 92vw); } }
+
+/* Short windows (e.g. 1280×720): a more compact inspector keeps the legend in view. */
+@media (max-height: 820px) {
+  .wg-climograph { height: 84px; }
+  .wg-right-dock { max-height: 52%; }
+  .wg-right-dock .wg-section { padding-top: 9px; padding-bottom: 10px; gap: 7px; }
+  .wg-cats { max-height: 150px; }
+  .wg-panel-title { padding-top: 12px; }
+}
+
+/* First-run tips. */
+.wg-onb {
+  position: absolute; left: 50%; bottom: 18px; z-index: 3; display: flex; align-items: center; gap: 6px; padding: 7px 8px 7px 14px;
+  width: max-content; max-width: calc(100% - 32px); opacity: 0; pointer-events: none; transform: translate(-50%, 8px);
+  transition: opacity 0.35s var(--wg-ease), transform 0.35s var(--wg-ease);
+}
+.wg-onb.is-visible { opacity: 1; pointer-events: auto; transform: translate(-50%, 0); }
+.wg-onb ul { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; margin: 0; padding: 0; list-style: none; font-size: 12.5px; }
+.wg-onb-item { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; color: var(--wg-text); transition: color 0.25s, opacity 0.25s; }
+.wg-onb-item b { font-weight: 600; }
+.wg-onb-item kbd { font-size: 11px; padding: 2px 6px; }
+.wg-onb-tick {
+  display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%;
+  border: 1px solid var(--wg-border); color: transparent; transition: background 0.25s, border-color 0.25s, color 0.25s;
+}
+.wg-onb-item.is-done { color: var(--wg-text-faint); }
+.wg-onb-item.is-done .wg-onb-tick { background: var(--wg-accent-2); border-color: transparent; color: #04111f; }
+.wg-onb-sep { width: 3px; height: 3px; border-radius: 50%; background: var(--wg-text-faint); }
+.wg-onb-link {
+  border: 0; padding: 1px 6px; border-radius: 5px; background: var(--wg-accent-soft); color: #cfe6ff; font: inherit; font-weight: 600; cursor: pointer;
+}
+.wg-onb-link:hover { background: rgba(79, 163, 255, 0.26); color: #fff; }
+.wg-onb-close {
+  display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; margin-left: 4px; flex: none;
+  border: 0; border-radius: 6px; background: transparent; color: var(--wg-text-dim); cursor: pointer;
+}
+.wg-onb-close:hover { background: var(--wg-hover); color: var(--wg-text); }
+@media (max-width: 760px) { .wg-onb-sep { display: none; } .wg-onb { bottom: 12px; } }
+.wg-btn-primary.is-pending { box-shadow: 0 0 0 3px var(--wg-accent-soft), 0 0 18px rgba(79, 163, 255, 0.35); }
+.wg-climate-status .wg-field-head b { font-weight: 600; }
+.wg-climate-stage { font-size: 11.5px; }

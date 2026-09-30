@@ -1,39 +1,43 @@
 /**
- * Climate data layers: temperature (lapse-corrected to the displayed surface), precipitation (log),
- * pressure (with isobars), SST (+ sea ice), wind speed, ocean currents (speed shading, warm/cold by
- * SST anomaly vs the zonal ocean mean, arrow glyphs) and Köppen classes. All land/sea decisions come
- * from the height map; climate data are sampled bilinearly (unwarped) except Köppen (warped nearest,
- * matching the satellite biome boundaries).
+ * Climate data layers: temperature (lapse-corrected to the displayed surface, 0 °C isotherm),
+ * precipitation (log), pressure (isobars every 4 hPa, H / L centres), SST (+ sea ice), wind speed,
+ * ocean currents (speed × warm/cold SST-anomaly tint, flow streamlets) and Köppen classes.
+ *
+ * Sampling (see layersSample): climate fields are split into land-extended and sea-extended grids,
+ * cubic-B-spline resampled to the raster, and chosen per pixel by the height map (land iff
+ * height > sea), with anti-aliased coasts from the height map's signed distance to sea level. So
+ * the land/sea contrast of a field follows the high-resolution coastline instead of 1° cells.
  */
 import * as _constants from '../core/constants';
-import * as _grid from '../core/grid';
 import type { ClimateResult, PaintOptions, RGB } from '../core/types';
 import * as _koppen from '../climate/koppen';
 import * as _colormaps from './colormaps';
 import * as _layersCommon from './layersCommon';
+import * as _layersGlyphs from './layersGlyphs';
+import * as _layersKoppen from './layersKoppen';
+import * as _layersSample from './layersSample';
 import type { PaintCache } from './paintCache';
-import * as _satelliteSampler from './satelliteSampler';
-import * as _terrain from './terrain';
 import type { HeightField } from './terrain';
 
 // Imported values are copied into module constants: some module runners (vitest / vite-node SSR)
 // compile named imports into namespace property reads, which would otherwise sit in per-pixel loops.
 const { LAPSE_RATE } = _constants;
-const { gridLat } = _grid;
-const { KOPPEN_CLASSES, classifyKoppen } = _koppen;
+const { KOPPEN_CLASSES } = _koppen;
 const {
-  CM_BATHY, CM_CURRENT, CM_PRECIP_LOG, CM_PRESSURE, CM_SST, CM_TEMP, CM_WIND, SRGB_TO_LINEAR,
-  cmapIndex, encodeSrgb,
+  CM_BATHY, CM_PRECIP_LOG, CM_PRESSURE, CM_SST, CM_TEMP, CM_WIND, CURRENT_LUT, SRGB_TO_LINEAR, cmapIndex, currentIndex, encodeSrgb,
 } = _colormaps;
-const { applyHillshade, gridLookup, putLut, sampleField } = _layersCommon;
-const { getClimateSampler } = _satelliteSampler;
-const { detailTexture } = _terrain;
+const { applyHillshade, drawCoastOutline, drawContours, putLut, putMixed } = _layersCommon;
+const { AlphaLayer, drawStreamlets, drawText } = _layersGlyphs;
+const { classifyPixels } = _layersKoppen;
+const { COAST_Q, coastDistance, monthSlice, sampleSurfaces, scratchF32, splineSample } = _layersSample;
 
-function smooth(a: number, b: number, x: number): number {
-  let t = (x - a) / (b - a);
-  t = t < 0 ? 0 : t > 1 ? 1 : t;
-  return t * t * (3 - 2 * t);
-}
+/** Quantized coast distance at or beyond which a pixel is purely land / sea (d ≥ 0.5 px). */
+const HALF = COAST_Q / 2;
+
+/** Relief-shading strength on land for the data layers (subtle context, legend colours dominate). */
+const SHADE_LAND = 0.4;
+/** Peak opacity of the coastline ink on continuous-field layers. */
+const COAST_ALPHA = 0.55;
 
 /** Per climate cell land reference height above the climate's sea level (m; 0 for ocean cells). */
 function refHeight(c: ClimateResult, cache: PaintCache): Float32Array {
@@ -45,120 +49,283 @@ function refHeight(c: ClimateResult, cache: PaintCache): Float32Array {
   });
 }
 
-/** Grey land for layers that describe the ocean (SST, currents), relief-shaded later. */
-const LAND_GREY: RGB = [88, 88, 86];
+/** Scale for pixel-size-dependent strokes (1 at 2048 px wide). */
+function strokeScale(w: number): number {
+  return Math.max(0.6, Math.min(1.6, w / 2048));
+}
+
+/** Paint a split field: land pixels from `landV`, sea pixels from `seaV`, anti-aliased at the coast. */
+function paintSplit(
+  rgba: Uint8ClampedArray, qd: Int8Array, landV: Float32Array, seaV: Float32Array,
+  lutL: Uint8Array, idxL: (v: number) => number, lutS: Uint8Array, idxS: (v: number) => number,
+): void {
+  for (let p = 0, n = qd.length; p < n; p++) {
+    const q = qd[p];
+    if (q >= HALF) putLut(rgba, p, lutL, idxL(landV[p]));
+    else if (q <= -HALF) putLut(rgba, p, lutS, idxS(seaV[p]));
+    else putMixed(rgba, p, lutL, idxL(landV[p]), lutS, idxS(seaV[p]), 0.5 + q / COAST_Q);
+  }
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* Temperature                                                                                   */
+/* ------------------------------------------------------------------------------------------- */
 
 export function paintTemperature(c: ClimateResult, hf: HeightField, opts: PaintOptions, month: number, cache: PaintCache): Uint8ClampedArray {
   const { w, h, height } = hf;
-  const lk = gridLookup(w, h, c.w, c.h, cache);
-  const t = sampleField(c.temp, c.w, c.h, month, lk, w, h, c.tempAnnual);
-  const href = sampleField(refHeight(c, cache), c.w, c.h, -1, lk, w, h);
+  const N = c.w * c.h, npx = w * h;
   const sea = opts.seaLevel;
-  const rgba = new Uint8ClampedArray(4 * w * h);
-  for (let p = 0; p < w * h; p++) {
-    // Sea-level-reduced temperature re-lapsed to the displayed surface height.
-    const hp = height[p] > sea ? height[p] - sea : 0;
-    putLut(rgba, p, CM_TEMP.lut, 3 * cmapIndex(CM_TEMP, t[p] + LAPSE_RATE * (href[p] - hp)));
+  const src = monthSlice(c.temp, N, month, c.tempAnnual);
+  // Land: temperature reduced to sea level (T + Γ·href), re-lapsed to each pixel's displayed height.
+  const href = refHeight(c, cache);
+  const t0 = scratchF32(2, N);
+  for (let i = 0; i < N; i++) t0[i] = src[i] + LAPSE_RATE * href[i];
+  const tl = scratchF32(0, npx), ts = scratchF32(1, npx);
+  sampleSurfaces(c, t0, w, h, tl, null, cache);
+  sampleSurfaces(c, src, w, h, null, ts, cache);
+  const qd = coastDistance(hf, sea);
+  // Colour and display temperature (for the 0 °C isotherm) per pixel.
+  const td = scratchF32(3, npx);
+  const rgba = new Uint8ClampedArray(4 * npx);
+  const lut = CM_TEMP.lut;
+  for (let p = 0; p < npx; p++) {
+    const q = qd[p];
+    if (q <= -HALF) {
+      const v = ts[p];
+      td[p] = v;
+      putLut(rgba, p, lut, 3 * cmapIndex(CM_TEMP, v));
+      continue;
+    }
+    const e = height[p] - sea;
+    const vl = tl[p] - LAPSE_RATE * (e > 0 ? e : 0);
+    if (q >= HALF) {
+      td[p] = vl;
+      putLut(rgba, p, lut, 3 * cmapIndex(CM_TEMP, vl));
+      continue;
+    }
+    const a = 0.5 + q / COAST_Q;
+    td[p] = a * vl + (1 - a) * ts[p];
+    putMixed(rgba, p, lut, 3 * cmapIndex(CM_TEMP, vl), lut, 3 * cmapIndex(CM_TEMP, ts[p]), a);
   }
-  if (opts.hillshade) applyHillshade(rgba, hf, sea, 0.55, 0, cache);
+  if (opts.hillshade) applyHillshade(rgba, hf, sea, SHADE_LAND, 0, cache);
+  const k = strokeScale(w);
+  drawContours(rgba, td, w, h, 10, [34, 44, 96], 0.8, 1.1 * k, { only: 0, maxDelta: 8 });
+  drawCoastOutline(rgba, qd, COAST_Q, COAST_ALPHA);
   return rgba;
 }
+
+/* ------------------------------------------------------------------------------------------- */
+/* Precipitation                                                                                 */
+/* ------------------------------------------------------------------------------------------- */
 
 export function paintPrecipitation(c: ClimateResult, hf: HeightField, opts: PaintOptions, month: number, cache: PaintCache): Uint8ClampedArray {
   const { w, h } = hf;
-  const lk = gridLookup(w, h, c.w, c.h, cache);
+  const N = c.w * c.h, npx = w * h;
   // Monthly: mm/month; annual: mm/yr shown on the same colours as the equivalent monthly mean.
-  const pr = sampleField(c.precip, c.w, c.h, month, lk, w, h, c.precipAnnual);
+  const src = monthSlice(c.precip, N, month, c.precipAnnual);
   const scale = month >= 0 ? 1 : 1 / 12;
-  const rgba = new Uint8ClampedArray(4 * w * h);
-  for (let p = 0; p < w * h; p++) {
-    const v = Math.log10(Math.max(1, pr[p] * scale));
-    putLut(rgba, p, CM_PRECIP_LOG.lut, 3 * cmapIndex(CM_PRECIP_LOG, v));
-  }
-  if (opts.hillshade) applyHillshade(rgba, hf, opts.seaLevel, 0.55, 0, cache);
+  // Log-transform on the grid (smooth interpolation of a log field keeps dry/wet gradients even).
+  const lg = scratchF32(2, N);
+  for (let i = 0; i < N; i++) lg[i] = Math.log10(Math.max(1, src[i] * scale));
+  const pl = scratchF32(0, npx), ps = scratchF32(1, npx);
+  sampleSurfaces(c, lg, w, h, pl, ps, cache);
+  const qd = coastDistance(hf, opts.seaLevel);
+  const rgba = new Uint8ClampedArray(4 * npx);
+  const idx = (v: number): number => 3 * cmapIndex(CM_PRECIP_LOG, v);
+  paintSplit(rgba, qd, pl, ps, CM_PRECIP_LOG.lut, idx, CM_PRECIP_LOG.lut, idx);
+  if (opts.hillshade) applyHillshade(rgba, hf, opts.seaLevel, SHADE_LAND, 0, cache);
+  drawCoastOutline(rgba, qd, COAST_Q, COAST_ALPHA);
   return rgba;
 }
+
+/* ------------------------------------------------------------------------------------------- */
+/* Pressure                                                                                      */
+/* ------------------------------------------------------------------------------------------- */
 
 /** Isobar spacing, hPa. */
 export const ISOBAR_HPA = 4;
+/** Bold isobars every this many hPa. */
+export const ISOBAR_BOLD_HPA = 20;
 
-export function paintPressure(c: ClimateResult, hf: HeightField, opts: PaintOptions, month: number, cache: PaintCache): Uint8ClampedArray {
-  const { w, h, height } = hf;
-  const lk = gridLookup(w, h, c.w, c.h, cache);
-  const pr = sampleField(c.pressure, c.w, c.h, month, lk, w, h);
-  const sea = opts.seaLevel;
-  const rgba = new Uint8ClampedArray(4 * w * h);
-  for (let r = 0; r < h; r++) {
-    const rowN = (r > 0 ? r - 1 : 0) * w, rowS = (r < h - 1 ? r + 1 : h - 1) * w, row = r * w;
-    for (let cc = 0; cc < w; cc++) {
-      const p = row + cc;
-      const v = pr[p];
-      const i3 = 3 * cmapIndex(CM_PRESSURE, v - 1013);
-      // Anti-aliased isobars: distance to the nearest level in pixels = |Δlevel| / |∇level|.
-      const f = v / ISOBAR_HPA;
-      const d = Math.abs(f - Math.round(f));
-      const gx = (pr[row + (cc + 1 < w ? cc + 1 : 0)] - pr[row + (cc > 0 ? cc - 1 : w - 1)]) * 0.5 / ISOBAR_HPA;
-      const gy = (pr[rowN + cc] - pr[rowS + cc]) * 0.5 / ISOBAR_HPA;
-      const g = Math.sqrt(gx * gx + gy * gy) + 1e-6;
-      const line = 1 - smooth(0.35, 1.1, d / g);
-      const land = height[p] > sea ? 0.9 : 1;
-      const k = (1 - 0.5 * line) * land;
-      const o = 4 * p;
-      rgba[o] = CM_PRESSURE.lut[i3] * k;
-      rgba[o + 1] = CM_PRESSURE.lut[i3 + 1] * k;
-      rgba[o + 2] = CM_PRESSURE.lut[i3 + 2] * k;
-      rgba[o + 3] = 255;
+/** Pressure centre on the climate grid. */
+export interface PressureCentre {
+  row: number;
+  col: number;
+  high: boolean;
+  value: number;
+}
+
+/**
+ * Local sea-level-pressure maxima / minima: cells that are extreme within `radiusDeg` (great circle)
+ * and stand out from the mean of that neighbourhood by ≥ `minProm` hPa. Poleward of 70° is ignored.
+ */
+export function pressureCentres(p: Float32Array, cw: number, ch: number, radiusDeg = 18, minProm = 1.5): PressureCentre[] {
+  const out: PressureCentre[] = [];
+  const dLat = 180 / ch, dLon = 360 / cw;
+  const rr = Math.max(1, Math.round(radiusDeg / dLat));
+  const cosR = Math.cos((radiusDeg * Math.PI) / 180);
+  const latOf = (r: number): number => ((90 - (r + 0.5) * dLat) * Math.PI) / 180;
+  const cosDc = new Float64Array(cw);
+  for (let dc = 0; dc < cw; dc++) cosDc[dc] = Math.cos((dc * dLon * Math.PI) / 180);
+  for (let r = 1; r < ch - 1; r++) {
+    const phi = latOf(r);
+    if (Math.abs(phi) > (70 * Math.PI) / 180) continue;
+    const sp = Math.sin(phi), cp = Math.cos(phi);
+    const rc = Math.min(Math.floor(cw / 2), Math.ceil(rr / Math.max(0.2, cp)));
+    for (let c = 0; c < cw; c++) {
+      const i = r * cw + c;
+      const v = p[i];
+      // Cheap 8-neighbour prefilter.
+      let ge = true, le = true;
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+          if (!dr && !dc) continue;
+          const u = p[(r + dr) * cw + ((c + dc + cw) % cw)];
+          if (u > v) ge = false;
+          if (u < v) le = false;
+        }
+      }
+      if (!ge && !le) continue;
+      let isMax = ge, isMin = le, sum = 0, n = 0;
+      for (let dr = -rr; dr <= rr && (isMax || isMin); dr++) {
+        const r2 = r + dr;
+        if (r2 < 0 || r2 >= ch) continue;
+        const phi2 = latOf(r2);
+        const s2 = Math.sin(phi2), c2 = Math.cos(phi2);
+        for (let dc = -rc; dc <= rc; dc++) {
+          if (sp * s2 + cp * c2 * cosDc[dc < 0 ? -dc : dc] < cosR) continue;
+          const j = r2 * cw + ((((c + dc) % cw) + cw) % cw);
+          const u = p[j];
+          sum += u;
+          n++;
+          // Ties broken by index so a plateau yields one centre.
+          if (u > v || (u === v && j < i)) isMax = false;
+          if (u < v || (u === v && j < i)) isMin = false;
+        }
+      }
+      if (!isMax && !isMin) continue;
+      const mean = sum / Math.max(1, n);
+      if (isMax && v - mean >= minProm) out.push({ row: r, col: c, high: true, value: v });
+      else if (isMin && mean - v >= minProm) out.push({ row: r, col: c, high: false, value: v });
     }
   }
-  if (opts.hillshade) applyHillshade(rgba, hf, sea, 0.45, 0, cache);
+  return out;
+}
+
+const HIGH_INK: RGB = [128, 18, 30];
+const LOW_INK: RGB = [18, 42, 128];
+const HALO: RGB = [250, 250, 248];
+
+export function paintPressure(c: ClimateResult, hf: HeightField, opts: PaintOptions, month: number, cache: PaintCache): Uint8ClampedArray {
+  const { w, h } = hf;
+  const N = c.w * c.h, npx = w * h;
+  const src = monthSlice(c.pressure, N, month);
+  // Sea-level pressure is continuous across coasts: one smooth field.
+  const pr = splineSample(src, c.w, c.h, w, h, scratchF32(0, npx), cache);
+  const rgba = new Uint8ClampedArray(4 * npx);
+  const lut = CM_PRESSURE.lut;
+  for (let p = 0; p < npx; p++) putLut(rgba, p, lut, 3 * cmapIndex(CM_PRESSURE, pr[p] - 1013));
+  if (opts.hillshade) applyHillshade(rgba, hf, opts.seaLevel, 0.3, 0, cache);
+  const qd = coastDistance(hf, opts.seaLevel);
+  drawCoastOutline(rgba, qd, COAST_Q, 0.35);
+  const k = strokeScale(w);
+  drawContours(rgba, pr, w, h, ISOBAR_HPA, [30, 34, 44], 0.6, 0.9 * k, { boldEvery: ISOBAR_BOLD_HPA, boldAlpha: 0.8, boldWidth: 1.7 * k });
+  const centres = cache.getOrBuild(`pcentres|${c.id}|${month}`, () => pressureCentres(src, c.w, c.h), () => 64);
+  drawPressureCentres(rgba, centres, c.w, c.h, w, h);
   return rgba;
 }
 
-export function paintSst(c: ClimateResult, hf: HeightField, opts: PaintOptions, month: number, cache: PaintCache): Uint8ClampedArray {
-  const { w, h, height } = hf;
-  const lk = gridLookup(w, h, c.w, c.h, cache);
-  const sst = sampleField(c.sst, c.w, c.h, month, lk, w, h);
-  const ice = sampleField(c.seaIce, c.w, c.h, month, lk, w, h);
-  const sea = opts.seaLevel;
-  const rgba = new Uint8ClampedArray(4 * w * h);
-  for (let p = 0; p < w * h; p++) {
-    const o = 4 * p;
-    if (height[p] > sea) {
-      rgba[o] = LAND_GREY[0]; rgba[o + 1] = LAND_GREY[1]; rgba[o + 2] = LAND_GREY[2]; rgba[o + 3] = 255;
-      continue;
+function drawPressureCentres(rgba: Uint8ClampedArray, centres: PressureCentre[], cw: number, ch: number, w: number, h: number): void {
+  if (centres.length === 0) return;
+  const size = Math.max(8, Math.round(h / 58));
+  const stroke = Math.max(1.4, size / 6.5);
+  // One coverage layer, reused: halos first (all centres), then the ink of highs and of lows.
+  const passes: Array<{ halo: boolean; high: boolean | null; rgb: RGB }> = [
+    { halo: true, high: null, rgb: HALO }, { halo: false, high: true, rgb: HIGH_INK }, { halo: false, high: false, rgb: LOW_INK },
+  ];
+  for (const pass of passes) {
+    const layer = new AlphaLayer(w, h, 0);
+    let any = false;
+    for (const cc of centres) {
+      if (pass.high !== null && cc.high !== pass.high) continue;
+      any = true;
+      const x = ((cc.col + 0.5) * w) / cw, y = ((cc.row + 0.5) * h) / ch;
+      const label = cc.high ? 'H' : 'L';
+      const val = String(Math.round(cc.value));
+      const vy = y + 0.95 * size;
+      const extra = pass.halo ? 2.6 : 0;
+      const alpha = pass.halo ? 0.75 : 1;
+      drawText(layer, label, x, y - 0.25 * size, size, stroke + extra, alpha);
+      drawText(layer, val, x, vy, 0.55 * size, 0.62 * stroke + (pass.halo ? 2.2 : 0), alpha);
     }
+    if (any) layer.composite(rgba, pass.rgb);
+  }
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* SST, wind, currents                                                                           */
+/* ------------------------------------------------------------------------------------------- */
+
+/** Grey land for layers that describe the ocean (SST, currents), relief-shaded when asked. */
+const LAND_GREY: RGB = [112, 112, 108];
+const LAND_LUT = new Uint8Array(LAND_GREY);
+const SEA_ICE: RGB = [232, 238, 244];
+
+export function paintSst(c: ClimateResult, hf: HeightField, opts: PaintOptions, month: number, cache: PaintCache): Uint8ClampedArray {
+  const { w, h } = hf;
+  const N = c.w * c.h, npx = w * h;
+  const sst = scratchF32(0, npx), ice = scratchF32(1, npx);
+  sampleSurfaces(c, monthSlice(c.sst, N, month), w, h, null, sst, cache);
+  sampleSurfaces(c, monthSlice(c.seaIce, N, month, undefined, 11), w, h, null, ice, cache);
+  const qd = coastDistance(hf, opts.seaLevel);
+  const rgba = new Uint8ClampedArray(4 * npx);
+  const lut = CM_SST.lut, L = SRGB_TO_LINEAR;
+  const iceL = [L[SEA_ICE[0]], L[SEA_ICE[1]], L[SEA_ICE[2]]], landL = [L[LAND_GREY[0]], L[LAND_GREY[1]], L[LAND_GREY[2]]];
+  for (let p = 0; p < npx; p++) {
+    const q = qd[p];
+    if (q >= HALF) { putLut(rgba, p, LAND_LUT, 0); continue; }
     const i3 = 3 * cmapIndex(CM_SST, sst[p]);
     const k = smooth(0.15, 0.85, ice[p]);
-    rgba[o] = CM_SST.lut[i3] + (228 - CM_SST.lut[i3]) * k;
-    rgba[o + 1] = CM_SST.lut[i3 + 1] + (234 - CM_SST.lut[i3 + 1]) * k;
-    rgba[o + 2] = CM_SST.lut[i3 + 2] + (240 - CM_SST.lut[i3 + 2]) * k;
+    const a = q <= -HALF ? 0 : 0.5 + q / COAST_Q;
+    const o = 4 * p;
+    for (let ch = 0; ch < 3; ch++) {
+      const s = L[lut[i3 + ch]] + (iceL[ch] - L[lut[i3 + ch]]) * k;
+      rgba[o + ch] = encodeSrgb(s + (landL[ch] - s) * a);
+    }
     rgba[o + 3] = 255;
   }
-  applyHillshade(rgba, hf, sea, opts.hillshade ? 0.8 : 0, 0, cache);
+  applyHillshade(rgba, hf, opts.seaLevel, opts.hillshade ? 0.8 : 0, 0, cache);
+  drawCoastOutline(rgba, qd, COAST_Q, 0.4);
   return rgba;
 }
 
 export function paintWind(c: ClimateResult, hf: HeightField, opts: PaintOptions, month: number, cache: PaintCache): Uint8ClampedArray {
-  const { w, h, height } = hf;
-  const lk = gridLookup(w, h, c.w, c.h, cache);
-  const u = sampleField(c.windU, c.w, c.h, month, lk, w, h);
-  const v = sampleField(c.windV, c.w, c.h, month, lk, w, h);
-  const sea = opts.seaLevel;
-  const rgba = new Uint8ClampedArray(4 * w * h);
-  for (let p = 0; p < w * h; p++) {
-    const i3 = 3 * cmapIndex(CM_WIND, Math.sqrt(u[p] * u[p] + v[p] * v[p]));
-    const k = height[p] > sea ? 0.82 : 1;
-    const o = 4 * p;
-    rgba[o] = CM_WIND.lut[i3] * k;
-    rgba[o + 1] = CM_WIND.lut[i3 + 1] * k;
-    rgba[o + 2] = CM_WIND.lut[i3 + 2] * k;
-    rgba[o + 3] = 255;
+  const { w, h } = hf;
+  const N = c.w * c.h, npx = w * h;
+  // Speed per cell (interpolating u, v would under-read speeds where the flow turns).
+  const sp = scratchF32(2, N);
+  if (month >= 0) {
+    const u = monthSlice(c.windU, N, month), v = monthSlice(c.windV, N, month);
+    for (let i = 0; i < N; i++) sp[i] = Math.sqrt(u[i] * u[i] + v[i] * v[i]);
+  } else {
+    sp.fill(0);
+    for (let m = 0; m < 12; m++) {
+      const o = m * N;
+      for (let i = 0; i < N; i++) sp[i] += Math.sqrt(c.windU[o + i] ** 2 + c.windV[o + i] ** 2) / 12;
+    }
   }
-  if (opts.hillshade) applyHillshade(rgba, hf, sea, 0.6, 0, cache);
+  const wl = scratchF32(0, npx), ws = scratchF32(1, npx);
+  sampleSurfaces(c, sp, w, h, wl, ws, cache);
+  const qd = coastDistance(hf, opts.seaLevel);
+  const rgba = new Uint8ClampedArray(4 * npx);
+  const idx = (x: number): number => 3 * cmapIndex(CM_WIND, x);
+  paintSplit(rgba, qd, wl, ws, CM_WIND.lut, idx, CM_WIND.lut, idx);
+  if (opts.hillshade) applyHillshade(rgba, hf, opts.seaLevel, SHADE_LAND, 0, cache);
+  drawCoastOutline(rgba, qd, COAST_Q, COAST_ALPHA);
   return rgba;
 }
 
-/** Zonal mean SST over ocean cells per climate row (falls back to all cells, then neighbours). */
+/** Zonal mean over ocean cells per climate row (falls back to all cells). */
 function zonalOceanMean(field: Float32Array, c: ClimateResult): Float64Array {
   const zm = new Float64Array(c.h);
   for (let r = 0; r < c.h; r++) {
@@ -173,110 +340,52 @@ function zonalOceanMean(field: Float32Array, c: ClimateResult): Float64Array {
   return zm;
 }
 
-const WARM: RGB = [236, 104, 58];
-const COLD: RGB = [70, 190, 236];
-
 export function paintCurrents(c: ClimateResult, hf: HeightField, opts: PaintOptions, month: number, cache: PaintCache): Uint8ClampedArray {
   const { w, h, height } = hf;
-  const lk = gridLookup(w, h, c.w, c.h, cache);
-  const u = sampleField(c.currentU, c.w, c.h, month, lk, w, h);
-  const v = sampleField(c.currentV, c.w, c.h, month, lk, w, h);
-  const N = c.w * c.h;
-  let sstM: Float32Array;
-  if (month >= 0) sstM = c.sst.subarray(month * N, (month + 1) * N);
-  else {
-    sstM = new Float32Array(N);
-    for (let m = 0; m < 12; m++) for (let i = 0; i < N; i++) sstM[i] += c.sst[m * N + i] / 12;
-  }
-  const zm = zonalOceanMean(sstM, c);
-  const anomGrid = new Float32Array(N);
-  for (let i = 0; i < N; i++) anomGrid[i] = sstM[i] - zm[Math.floor(i / c.w)];
-  const anom = sampleField(anomGrid, c.w, c.h, -1, lk, w, h);
+  const N = c.w * c.h, npx = w * h;
   const sea = opts.seaLevel;
-  const rgba = new Uint8ClampedArray(4 * w * h);
-  for (let p = 0; p < w * h; p++) {
-    const o = 4 * p;
-    if (height[p] > sea) {
-      rgba[o] = LAND_GREY[0]; rgba[o + 1] = LAND_GREY[1]; rgba[o + 2] = LAND_GREY[2]; rgba[o + 3] = 255;
-      continue;
-    }
+  const u = scratchF32(0, npx), v = scratchF32(1, npx), anom = scratchF32(2, npx);
+  sampleSurfaces(c, monthSlice(c.currentU, N, month, undefined, 10), w, h, null, u, cache);
+  sampleSurfaces(c, monthSlice(c.currentV, N, month, undefined, 11), w, h, null, v, cache);
+  const sstM = monthSlice(c.sst, N, month, undefined, 10);
+  const zm = zonalOceanMean(sstM, c);
+  const anomGrid = scratchF32(4, N);
+  for (let i = 0; i < N; i++) anomGrid[i] = sstM[i] - zm[Math.floor(i / c.w)];
+  sampleSurfaces(c, anomGrid, w, h, null, anom, cache);
+  const qd = coastDistance(hf, sea);
+  const rgba = new Uint8ClampedArray(4 * npx);
+  const L = SRGB_TO_LINEAR;
+  const landL = [L[LAND_GREY[0]], L[LAND_GREY[1]], L[LAND_GREY[2]]];
+  for (let p = 0; p < npx; p++) {
+    const q = qd[p];
+    if (q >= HALF) { putLut(rgba, p, LAND_LUT, 0); continue; }
     const s = Math.sqrt(u[p] * u[p] + v[p] * v[p]);
-    const i3 = 3 * cmapIndex(CM_CURRENT, s);
-    const a = anom[p];
-    const tint = a > 0 ? WARM : COLD;
-    const k = 0.8 * smooth(0.02, 0.35, s) * smooth(0.3, 3, Math.abs(a));
-    rgba[o] = CM_CURRENT.lut[i3] + (tint[0] - CM_CURRENT.lut[i3]) * k;
-    rgba[o + 1] = CM_CURRENT.lut[i3 + 1] + (tint[1] - CM_CURRENT.lut[i3 + 1]) * k;
-    rgba[o + 2] = CM_CURRENT.lut[i3 + 2] + (tint[2] - CM_CURRENT.lut[i3 + 2]) * k;
+    const i3 = currentIndex(s, anom[p]);
+    if (q <= -HALF) { putLut(rgba, p, CURRENT_LUT, i3); continue; }
+    const a = 0.5 + q / COAST_Q, o = 4 * p;
+    for (let ch = 0; ch < 3; ch++) rgba[o + ch] = encodeSrgb(a * landL[ch] + (1 - a) * L[CURRENT_LUT[i3 + ch]]);
     rgba[o + 3] = 255;
   }
   applyHillshade(rgba, hf, sea, opts.hillshade ? 0.8 : 0, 0, cache);
-  drawCurrentGlyphs(rgba, u, v, hf, sea);
+  drawCoastOutline(rgba, qd, COAST_Q, 0.4);
+  const k = strokeScale(w);
+  const glyphs = new AlphaLayer(w, h, 0);
+  drawStreamlets(glyphs, u, v, (p) => height[p] <= sea, {
+    spacing: Math.max(12, 28 * k), minSpeed: 0.02, fullSpeed: 0.4, width: Math.max(0.9, 1.1 * k), alpha: 0.85,
+  });
+  glyphs.composite(rgba, [236, 240, 246]);
   return rgba;
 }
 
-/** Blend a white-ish anti-aliased segment into the image (distance-based coverage, lon wraps). */
-function drawSegment(rgba: Uint8ClampedArray, w: number, h: number, x0: number, y0: number, x1: number, y1: number, alpha: number, width: number): void {
-  const minX = Math.floor(Math.min(x0, x1) - width - 1), maxX = Math.ceil(Math.max(x0, x1) + width + 1);
-  const minY = Math.max(0, Math.floor(Math.min(y0, y1) - width - 1)), maxY = Math.min(h - 1, Math.ceil(Math.max(y0, y1) + width + 1));
-  const dx = x1 - x0, dy = y1 - y0;
-  const l2 = dx * dx + dy * dy || 1e-9;
-  for (let y = minY; y <= maxY; y++) {
-    for (let x = minX; x <= maxX; x++) {
-      const px = x + 0.5, py = y + 0.5;
-      let t = ((px - x0) * dx + (py - y0) * dy) / l2;
-      t = t < 0 ? 0 : t > 1 ? 1 : t;
-      const ex = px - (x0 + t * dx), ey = py - (y0 + t * dy);
-      const d = Math.sqrt(ex * ex + ey * ey);
-      const cov = alpha * (1 - smooth(width * 0.5 - 0.5, width * 0.5 + 0.5, d));
-      if (cov <= 0) continue;
-      const xx = ((x % w) + w) % w;
-      const o = 4 * (y * w + xx);
-      for (let q = 0; q < 3; q++) {
-        const lin = SRGB_TO_LINEAR[rgba[o + q]];
-        rgba[o + q] = encodeSrgb(lin + (0.9 - lin) * cov);
-      }
-    }
-  }
+function smooth(a: number, b: number, x: number): number {
+  let t = (x - a) / (b - a);
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  return t * t * (3 - 2 * t);
 }
 
-/** Arrow glyphs on a roughly equal-area lattice over the ocean; length ∝ speed (saturating). */
-function drawCurrentGlyphs(rgba: Uint8ClampedArray, u: Float32Array, v: Float32Array, hf: HeightField, sea: number): void {
-  const { w, h, height } = hf;
-  const S = Math.max(10, Math.round(w / 90));
-  for (let gy = S / 2, gi = 0; gy < h; gy += S, gi++) {
-    const r = Math.floor(gy);
-    const cl = Math.cos(Math.PI / 2 - ((r + 0.5) * Math.PI) / h);
-    if (cl < 0.12) continue;
-    const step = S / cl;
-    const n = Math.max(1, Math.floor(w / step));
-    // Stagger alternate glyph rows by half a step.
-    const off = (gi & 1) === 0 ? 0 : 0.5;
-    for (let k = 0; k < n; k++) {
-      const x = ((k + off) * w) / n;
-      const c = Math.floor(x) % w;
-      const p = r * w + c;
-      if (height[p] > sea) continue;
-      const uu = u[p], vv = v[p];
-      const s = Math.sqrt(uu * uu + vv * vv);
-      if (s < 0.025) continue;
-      // Map direction on the equirectangular raster: east scales by 1/cos(lat).
-      let dx = uu / cl, dy = -vv;
-      const dl = Math.sqrt(dx * dx + dy * dy);
-      dx /= dl;
-      dy /= dl;
-      const len = S * 0.9 * Math.min(1, 0.25 + s / 0.35);
-      const x0 = x - 0.5 * len * dx, y0 = gy - 0.5 * len * dy;
-      const x1 = x + 0.5 * len * dx, y1 = gy + 0.5 * len * dy;
-      const a = 0.12 + 0.73 * smooth(0.025, 0.35, s);
-      drawSegment(rgba, w, h, x0, y0, x1, y1, a, 1.1);
-      const hl = Math.min(4, 0.35 * len);
-      const ca = Math.cos(0.5), sa = Math.sin(0.5);
-      drawSegment(rgba, w, h, x1, y1, x1 - hl * (dx * ca - dy * sa), y1 - hl * (dy * ca + dx * sa), a, 1.1);
-      drawSegment(rgba, w, h, x1, y1, x1 - hl * (dx * ca + dy * sa), y1 - hl * (dy * ca - dx * sa), a, 1.1);
-    }
-  }
-}
+/* ------------------------------------------------------------------------------------------- */
+/* Köppen                                                                                        */
+/* ------------------------------------------------------------------------------------------- */
 
 const KOPPEN_RGB = (() => {
   const t = new Uint8Array(3 * KOPPEN_CLASSES.length);
@@ -286,56 +395,42 @@ const KOPPEN_RGB = (() => {
 
 export function paintKoppen(c: ClimateResult, hf: HeightField, opts: PaintOptions, cache: PaintCache): Uint8ClampedArray {
   const { w, h, height } = hf;
-  const smp = getClimateSampler(w, h, c.w, c.h, opts.seed, detailTexture(opts.seed, w, cache), cache);
-  const href = refHeight(c, cache);
-  const N = c.w * c.h;
   const sea = opts.seaLevel;
-  const rgba = new Uint8ClampedArray(4 * w * h);
-  const memo = new Map<number, number>();
-  const T12 = new Float32Array(12), P12 = new Float32Array(12);
-  const stride = smp.stride;
+  const npx = w * h;
+  const qd = coastDistance(hf, sea);
+  // Classify land pixels and the sea pixels within half a pixel of the coast (outer anti-aliasing:
+  // land pixels keep exact class colours).
+  const cls = classifyPixels(c, height, sea, w, h, qd, -HALF, cache);
+  const rgba = new Uint8ClampedArray(4 * npx);
   const ocean = KOPPEN_CLASSES[0].color;
-  for (let p = 0; p < w * h; p++) {
+  const L = SRGB_TO_LINEAR;
+  for (let p = 0; p < npx; p++) {
     const o = 4 * p;
-    const e = height[p] - sea;
-    if (e <= 0) {
-      const i3 = 3 * cmapIndex(CM_BATHY, -e);
-      // Flat dark ocean, faintly depth-tinted.
-      rgba[o] = 0.75 * ocean[0] + 0.25 * CM_BATHY.lut[i3] * 0.5;
-      rgba[o + 1] = 0.75 * ocean[1] + 0.25 * CM_BATHY.lut[i3 + 1] * 0.5;
-      rgba[o + 2] = 0.75 * ocean[2] + 0.25 * CM_BATHY.lut[i3 + 2] * 0.5;
+    const q = qd[p];
+    if (q > 0) {
+      const k = cls[p];
+      rgba[o] = KOPPEN_RGB[3 * k];
+      rgba[o + 1] = KOPPEN_RGB[3 * k + 1];
+      rgba[o + 2] = KOPPEN_RGB[3 * k + 2];
       rgba[o + 3] = 255;
       continue;
     }
-    // Nearest climate cell at the warped position (same organic boundaries as the satellite).
-    const pi = smp.idx[p] + (smp.wr[p] >= 32768 ? stride : 0) + (smp.wc[p] >= 32768 ? 1 : 0);
-    let row = Math.floor(pi / stride), col = pi - row * stride;
-    if (col >= c.w) col = 0;
-    if (row >= c.h) row = c.h - 1;
-    const cell = row * c.w + col;
-    let k = c.koppenAll[cell];
-    // Alpine re-classification: lapse the cell's monthly temperatures to the pixel height.
-    const dT = LAPSE_RATE * (href[cell] - e);
-    if (dT > 1 || dT < -1) {
-      const q = Math.max(-128, Math.min(127, Math.round(dT * 2)));
-      const key = cell * 256 + q + 128;
-      let kk = memo.get(key);
-      if (kk === undefined) {
-        for (let m = 0; m < 12; m++) {
-          T12[m] = c.temp[m * N + cell] + q * 0.5;
-          P12[m] = c.precip[m * N + cell];
-        }
-        kk = classifyKoppen(T12, P12, gridLat(c.h, row) < 0);
-        memo.set(key, kk);
-      }
-      k = kk;
+    // Flat dark ocean, faintly depth-tinted.
+    const i3 = 3 * cmapIndex(CM_BATHY, sea - height[p]);
+    let r = 0.75 * ocean[0] + 0.125 * CM_BATHY.lut[i3];
+    let g = 0.75 * ocean[1] + 0.125 * CM_BATHY.lut[i3 + 1];
+    let b = 0.75 * ocean[2] + 0.125 * CM_BATHY.lut[i3 + 2];
+    if (q > -HALF) {
+      const a = 0.5 + q / COAST_Q, k = 3 * cls[p];
+      r = encodeSrgb(a * L[KOPPEN_RGB[k]] + (1 - a) * L[Math.round(r)]);
+      g = encodeSrgb(a * L[KOPPEN_RGB[k + 1]] + (1 - a) * L[Math.round(g)]);
+      b = encodeSrgb(a * L[KOPPEN_RGB[k + 2]] + (1 - a) * L[Math.round(b)]);
     }
-    if (k <= 0 || k >= KOPPEN_CLASSES.length) k = 0;
-    rgba[o] = KOPPEN_RGB[3 * k];
-    rgba[o + 1] = KOPPEN_RGB[3 * k + 1];
-    rgba[o + 2] = KOPPEN_RGB[3 * k + 2];
+    rgba[o] = r;
+    rgba[o + 1] = g;
+    rgba[o + 2] = b;
     rgba[o + 3] = 255;
   }
-  if (opts.hillshade) applyHillshade(rgba, hf, sea, 0.5, 0, cache);
+  if (opts.hillshade) applyHillshade(rgba, hf, sea, SHADE_LAND, 0, cache);
   return rgba;
 }

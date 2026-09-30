@@ -33,6 +33,14 @@ export interface PanelState {
   canRedo: boolean;
   undoLabel: string | null;
   redoLabel: string | null;
+  /** Context-aware usage hint for the current tool (defaults to the tool's static hint). */
+  hint?: string;
+  /** The hint is a warning (e.g. the tool cannot act at the plate cap). */
+  hintWarn?: boolean;
+  /** Plates without cells (offer a clean-up). */
+  emptyPlates?: number;
+  /** "Start drawing" checklist (null: hidden). */
+  guide?: { continents: boolean; plates: boolean; motions: boolean } | null;
 }
 
 export interface PanelActions extends PlateListActions {
@@ -53,6 +61,10 @@ export interface PanelActions extends PlateListActions {
   start(src: StartSource): void;
   style(s: PreviewStyle): void;
   apply(): void;
+  /** Hide the "Start drawing" checklist. */
+  dismissGuide?(): void;
+  /** Delete every plate without cells. */
+  removeEmpty?(): void;
 }
 
 export type StatusKind = 'info' | 'ok' | 'warn' | 'error';
@@ -84,6 +96,12 @@ export class EditorPanel {
   private readonly setContinent: (v: 'land' | 'ocean') => void;
   private readonly setRaise: (v: 'raise' | 'lower') => void;
   private readonly setLasso: (v: 'new' | 'selected') => void;
+  private readonly lassoButtons: Map<'new' | 'selected', HTMLButtonElement>;
+  private readonly guideEl: HTMLDivElement;
+  private readonly guideSteps: HTMLLIElement[] = [];
+  private readonly keysEl: HTMLDivElement;
+  private readonly keysBtn: HTMLButtonElement;
+  private readonly emptyBtn: HTMLButtonElement;
   private readonly setStyle: (v: PreviewStyle) => void;
   private readonly countEl: HTMLSpanElement;
   private readonly addBtn: HTMLButtonElement;
@@ -94,6 +112,7 @@ export class EditorPanel {
   private message: { text: string; kind: StatusKind } | null = null;
   private hover: string | null = null;
   private lastTool: ToolId | null = null;
+  private lastLassoTarget: 'new' | 'selected' | null = null;
 
   constructor(host: HTMLElement, actions: PanelActions) {
     injectEditorStyles(host.ownerDocument);
@@ -105,11 +124,48 @@ export class EditorPanel {
     this.redoBtn = button('pe-btn pe-icon-btn', `Redo (${MOD}+Shift+Z)`, ICONS.redo);
     this.undoBtn.addEventListener('click', () => actions.undo());
     this.redoBtn.addEventListener('click', () => actions.redo());
+    this.keysBtn = button('pe-btn pe-icon-btn', 'Keyboard shortcuts', KEYBOARD_ICON);
+    this.keysEl = buildKeysSheet();
+    this.keysEl.hidden = true;
+    this.keysBtn.addEventListener('click', () => {
+      this.keysEl.hidden = !this.keysEl.hidden;
+      this.keysBtn.classList.toggle('pe-active', !this.keysEl.hidden);
+      this.keysBtn.setAttribute('aria-expanded', String(!this.keysEl.hidden));
+    });
     const head = el(
       'div', 'pe-head', null,
-      el('div', 'pe-title', null, 'Plate editor', el('small', null, null, 'Draw plates, paint continents, set motions')),
-      el('div', 'pe-btn-group', null, this.undoBtn, this.redoBtn),
+      el('div', 'pe-title', null, 'Plate editor', el('small', null, null, 'Sketch a world, then simulate it')),
+      el('div', 'pe-btn-group', null, this.keysBtn, this.undoBtn, this.redoBtn),
     );
+
+    // "Start drawing" checklist (blank / simple worlds).
+    const step = (label: string, tool: ToolId, rest: string) => {
+      const link = el('button', 'pe-link', { type: 'button' }, label);
+      link.addEventListener('click', () => actions.tool(tool));
+      const li = el('li', null, null, el('span', null, null, link, rest));
+      this.guideSteps.push(li);
+      return li;
+    };
+    const guideClose = button('pe-guide-close', 'Hide these tips', ICONS.close);
+    guideClose.addEventListener('click', () => actions.dismissGuide?.());
+    const seedsLink = el('button', 'pe-link', { type: 'button' }, 'place seeds');
+    seedsLink.addEventListener('click', () => actions.tool('seeds'));
+    // Created in display order: guideSteps[0..2] = continents, plates, motions (see update()).
+    const continentStep = step('Paint continents', 'continent', ' (C) — land gets shelves and relief');
+    const cutStep = step('Cut it into plates', 'split', ' (S), or ');
+    cutStep.querySelector('span')?.append(seedsLink, ' (D)');
+    const motionStep = step('Set how plates move', 'motion', ' (V) — drag the arrows');
+    this.guideEl = el('div', 'pe-guide', { role: 'note' },
+      guideClose,
+      el('div', 'pe-guide-title', null, 'Draw your own world'),
+      el('div', 'pe-guide-sub', null, 'Your planet starts as one ocean plate. From here:'),
+      el('ol', null, null,
+        continentStep,
+        cutStep,
+        motionStep,
+        el('li', null, null, el('span', null, null, 'Press ', el('b', null, null, 'Simulate this world'), ' below')),
+      ));
+    this.guideEl.hidden = true;
 
     // Start from.
     const start = el('div', 'pe-seg');
@@ -178,6 +234,7 @@ export class EditorPanel {
       (v) => actions.lassoTarget(v),
     );
     this.setLasso = lasso.set;
+    this.lassoButtons = lasso.buttons;
     this.rows.lasso = el('div', 'pe-row', null, el('span', 'pe-row-label', null, 'Into'), el('div', 'pe-grow', null, lasso.root));
 
     this.roughRange = el('input', 'pe-range', { type: 'range', min: 0, max: 100, step: 1, 'aria-label': 'Boundary roughness' });
@@ -209,12 +266,15 @@ export class EditorPanel {
     this.countEl = el('span', 'pe-count');
     this.addBtn = button('pe-btn pe-icon-btn', 'Add a plate (then paint it)', ICONS.plus);
     this.addBtn.addEventListener('click', () => actions.addPlate());
+    this.emptyBtn = button('pe-btn pe-small', 'Delete every plate that has no cells on the map', null, 'Remove empty');
+    this.emptyBtn.addEventListener('click', () => actions.removeEmpty?.());
+    this.emptyBtn.hidden = true;
     const rndSmall = button('pe-btn pe-icon-btn', 'Randomize all motions', ICONS.dice);
     rndSmall.addEventListener('click', () => actions.randomizeMotions());
     const list = el('div', 'pe-list', { role: 'listbox', 'aria-label': 'Plates' });
     this.plates = new PlateListView(list, actions);
     const platesSec = el('div', 'pe-plates', null,
-      el('div', 'pe-plates-head', null, el('div', 'pe-label', null, 'Plates', this.countEl), el('div', 'pe-btn-group', null, rndSmall, this.addBtn)),
+      el('div', 'pe-plates-head', null, el('div', 'pe-label', null, 'Plates', this.countEl), el('div', 'pe-btn-group', null, this.emptyBtn, rndSmall, this.addBtn)),
       list);
 
     // Footer.
@@ -236,7 +296,7 @@ export class EditorPanel {
     this.busyText = el('div');
     const busy = el('div', 'pe-busy', { 'aria-live': 'polite' }, el('div', 'pe-spinner'), this.busyText);
 
-    const scroll = el('div', 'pe-scroll', null, head, startSec, toolSec, platesSec);
+    const scroll = el('div', 'pe-scroll', null, head, this.keysEl, this.guideEl, startSec, toolSec, platesSec);
     root.append(scroll, foot, busy);
     host.append(root);
     this.renderStatus();
@@ -248,14 +308,45 @@ export class EditorPanel {
       b.setAttribute('aria-pressed', String(id === s.tool));
     }
     const info = toolInfo(s.tool);
-    if (this.lastTool !== s.tool) {
+    const hint = s.hint ?? info.hint;
+    if (this.optHint.textContent !== hint) this.optHint.textContent = hint;
+    this.optHint.classList.toggle('pe-warn-text', !!s.hintWarn);
+    const atCap = s.plateCount >= s.cap;
+    for (const id of ['split', 'lasso'] as const) {
+      const b = this.toolButtons.get(id);
+      if (!b) continue;
+      const capped = atCap && (id === 'split' || s.lassoTarget === 'new');
+      b.classList.toggle('pe-capped', capped);
+      const t = toolInfo(id);
+      b.title = capped ? `${t.label} (${t.key}) — plate limit reached (${s.cap})` : `${t.label} (${t.key})`;
+    }
+    const lassoNew = this.lassoButtons.get('new');
+    if (lassoNew) {
+      lassoNew.disabled = atCap;
+      lassoNew.title = atCap ? `Plate limit reached (${s.cap})` : 'The lassoed region becomes a new plate';
+    }
+    const empties = s.emptyPlates ?? 0;
+    this.emptyBtn.hidden = empties === 0;
+    if (empties > 0) {
+      const label = this.emptyBtn.querySelector('span');
+      const txt = `Remove ${empties} empty`;
+      if (label && label.textContent !== txt) label.textContent = txt;
+    }
+    const g = s.guide ?? null;
+    this.guideEl.hidden = !g;
+    if (g) {
+      this.guideSteps[0]?.classList.toggle('pe-done', g.continents);
+      this.guideSteps[1]?.classList.toggle('pe-done', g.plates);
+      this.guideSteps[2]?.classList.toggle('pe-done', g.motions);
+    }
+    if (this.lastTool !== s.tool || this.lastLassoTarget !== s.lassoTarget) {
       this.lastTool = s.tool;
+      this.lastLassoTarget = s.lassoTarget;
       this.optName.textContent = info.label;
       this.optKey.textContent = info.key;
-      this.optHint.textContent = info.hint;
       const show: Record<string, boolean> = {
         brush: info.brush,
-        target: s.tool === 'plate' || s.tool === 'fill',
+        target: s.tool === 'plate' || s.tool === 'fill' || (s.tool === 'lasso' && s.lassoTarget === 'selected'),
         continent: s.tool === 'continent',
         raiseMode: s.tool === 'raise',
         raiseAmount: s.tool === 'raise',
@@ -351,4 +442,37 @@ function legendItem(c: RGB, label: string): HTMLSpanElement {
   const i = el('i');
   i.style.background = rgbCss(c);
   return el('span', null, null, i, label);
+}
+
+const KEYBOARD_ICON =
+  '<svg viewBox="0 0 20 20" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">' +
+  '<rect x="2.2" y="5" width="15.6" height="10" rx="2"/><path d="M5.2 8.2h.01M8.1 8.2h.01M11 8.2h.01M14 8.2h.01M5.2 11.6h.01M14.8 11.6h.01M7.6 11.6h4.8"/></svg>';
+
+/** Static keyboard / mouse reference. */
+function buildKeysSheet(): HTMLDivElement {
+  const rows: Array<[string, string] | string> = [
+    'Tools',
+    ...TOOLS.map((t): [string, string] => [t.key, t.label]),
+    'Brushes',
+    ['[ ]', 'Smaller / larger brush'],
+    ['Shift', 'Invert: paint ocean, lower terrain'],
+    ['X', 'Swap land / ocean (Continent)'],
+    [`${MOD}+click`, 'Pick the plate under the cursor'],
+    'Motion & seeds',
+    ['Drag', 'An arrow, or anywhere on a plate'],
+    ['Shift+drag', 'Snap to 15° and 0.5 cm/yr'],
+    ['Shift+click', 'Remove a seed'],
+    ['Enter', 'Generate plates from seeds'],
+    'Everywhere',
+    [`${MOD}+Z`, 'Undo'],
+    [`${MOD}+Shift+Z`, 'Redo'],
+    ['Esc', 'Cancel the current drag'],
+    ['Right-drag', 'Move the view (also Space/Alt+drag)'],
+  ];
+  const root = el('div', 'pe-keys', { role: 'region', 'aria-label': 'Keyboard shortcuts' });
+  for (const r of rows) {
+    if (typeof r === 'string') root.append(el('div', 'pe-keys-h', null, r));
+    else root.append(el('kbd', null, null, r[0]), el('span', null, null, r[1]));
+  }
+  return root;
 }

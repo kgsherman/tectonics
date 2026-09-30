@@ -90,71 +90,106 @@ export function continentalFractions(state: EditState): Float64Array {
 }
 
 export interface TopologyResult {
-  /** Ids of plates created from disconnected fragments. */
+  /** Ids of plates created by the operation's topology step (never by tidyFragments). */
   created: number[];
-  /** Ids of plates removed because an edit took all their cells. */
+  /** Ids of plates removed (only explicit clean-ups remove plates). */
   removed: number[];
-  /** Fragments merged into neighbours (too small, or the plate cap was reached). */
+  /** Small detached slivers merged into neighbouring plates. */
   merged: number;
+  /** Ids of plates the edit left without cells (they stay in the list, empty). */
+  emptied?: number[];
+}
+
+export interface TidyOptions {
+  /**
+   * Plate index whose pieces are never merged away (the plate being painted / filled / lassoed:
+   * painted cells keep the brush's plate, however small the piece).
+   */
+  keep?: number;
+  /** Cells the edit changed; only slivers next to them are tidied (null: consider every sliver). */
+  near?: ArrayLike<number> | null;
 }
 
 /**
- * Restore the editor's plate invariants after an edit that moved cells between plates:
- *  - each plate is one connected region: the largest component keeps the plate; other components
- *    with ≥ MIN_FRAGMENT_CELLS cells become new plates (same motion) while under the cap, the rest
- *    merge into the neighbouring plate with the longest shared boundary;
- *  - plates that owned cells before the edit (countsBefore) and none after are removed;
+ * Tidy the plate topology after an edit that moved cells between plates, WITHOUT ever creating or
+ * removing plates (a stroke must not change the plate list behind the user's back):
+ *  - detached slivers (< MIN_FRAGMENT_CELLS cells, not the plate's largest piece) of plates other
+ *    than `keep`, touching an edited cell, merge into the neighbour with the longest shared
+ *    boundary — the specks a brush leaves behind when it paints over a plate's edge;
+ *  - larger pieces stay with their plate: a plate may be in several pieces while editing (the list
+ *    shows a "pieces" badge; "Simulate" keeps the pieces as one plate);
+ *  - a plate painted over entirely stays in the list, empty (delete it explicitly, or paint it back);
  *  - plates that just received their first cells and have no motion get a default random motion.
  */
-export function normalizeTopology(mut: Mutator, countsBefore: Int32Array): TopologyResult {
+export function tidyFragments(mut: Mutator, countsBefore: Int32Array, opts: TidyOptions = {}): TopologyResult {
   const { mesh, state } = mut;
   const d = state.draft;
+  const n = d.n;
   const result: TopologyResult = { created: [], removed: [], merged: 0 };
-  const np0 = d.plates.length;
-  // Fragments are resolved largest first against the labels of the moment, so a fragment can merge
-  // into the plate of a smaller neighbouring fragment that is itself moved away afterwards (leaving
-  // the first one detached). Repeat on the result until every plate is one piece (converges in 1–2
-  // passes; bounded for safety).
-  for (let pass = 0; pass < 4; pass++) {
-    const comps = labelComponents(mesh, d.plate);
-    const main = new Int32Array(d.plates.length).fill(-1);
-    for (let c = 0; c < comps.size.length; c++) {
-      const k = comps.label[c];
-      if (main[k] < 0 || comps.size[c] > comps.size[main[k]]) main[k] = c;
+  const np = d.plates.length;
+  const comps = labelComponents(mesh, d.plate);
+  const nc = comps.size.length;
+  const main = new Int32Array(np).fill(-1);
+  for (let c = 0; c < nc; c++) {
+    const k = comps.label[c];
+    if (main[k] < 0 || comps.size[c] > comps.size[main[k]]) main[k] = c;
+  }
+  const keep = opts.keep ?? -1;
+  const isSliver = (c: number) => main[comps.label[c]] !== c && comps.size[c] < MIN_FRAGMENT_CELLS && comps.label[c] !== keep;
+  const pick = new Uint8Array(nc);
+  let any = false;
+  const consider = (c: number) => {
+    if (pick[c] || !isSliver(c)) return;
+    pick[c] = 1;
+    any = true;
+  };
+  if (opts.near) {
+    const { adjOffset, adj } = mesh;
+    const near = opts.near;
+    for (let q = 0; q < near.length; q++) {
+      const i = near[q];
+      consider(comps.comp[i]);
+      for (let e = adjOffset[i]; e < adjOffset[i + 1]; e++) consider(comps.comp[adj[e]]);
     }
-    const extras: number[] = [];
-    for (let c = 0; c < comps.size.length; c++) if (main[comps.label[c]] !== c) extras.push(c);
-    if (extras.length === 0) break;
-    extras.sort((a, b) => comps.size[b] - comps.size[a] || a - b);
-    const slot = new Int32Array(comps.size.length).fill(-1);
-    extras.forEach((c, s) => (slot[c] = s));
-    const lists: number[][] = extras.map(() => []);
-    for (let i = 0; i < d.n; i++) {
-      const s = slot[comps.comp[i]];
-      if (s >= 0) lists[s].push(i);
+  } else {
+    for (let c = 0; c < nc; c++) consider(c);
+  }
+  if (any) {
+    const lists = new Map<number, number[]>();
+    for (let i = 0; i < n; i++) {
+      const c = comps.comp[i];
+      if (!pick[c]) continue;
+      let l = lists.get(c);
+      if (!l) lists.set(c, (l = []));
+      l.push(i);
     }
-    for (let s = 0; s < extras.length; s++) {
-      const c = extras[s];
-      const cells = lists[s];
-      const parent = comps.label[c];
-      if (cells.length >= MIN_FRAGMENT_CELLS && d.plates.length < mut.cap) {
-        const k = appendPlate(state, d.plates[parent]);
-        result.created.push(d.plates[k].id);
-        mut.markPlateDirty(parent);
-        for (const i of cells) mut.setPlate(i, k);
-      } else {
-        const t = longestBorderNeighbor(mesh, d.plate, cells, parent, d.plates.length);
-        if (t < 0) continue;
-        result.merged++;
-        for (const i of cells) mut.setPlate(i, t);
-      }
+    // Largest first (deterministic): a sliver merging into a neighbouring sliver's plate is fine,
+    // nothing here requires plates to be connected.
+    const order = [...lists.keys()].sort((a, b) => comps.size[b] - comps.size[a] || a - b);
+    for (const c of order) {
+      const cells = lists.get(c) as number[];
+      const own = d.plate[cells[0]];
+      const t = longestBorderNeighbor(mesh, d.plate, cells, own, np);
+      if (t < 0) continue;
+      result.merged++;
+      for (const i of cells) mut.setPlate(i, t);
     }
   }
+  const counts = assignFirstMotions(mut, countsBefore);
+  for (let k = 0; k < Math.min(np, countsBefore.length); k++) {
+    if (countsBefore[k] > 0 && counts[k] === 0) (result.emptied ??= []).push(d.plates[k].id);
+  }
+  return result;
+}
+
+/** Plates that just received their first cells and have no motion get a default motion at their interior point. */
+function assignFirstMotions(mut: Mutator, countsBefore: Int32Array): Int32Array {
+  const { mesh, state } = mut;
+  const d = state.draft;
   const counts = plateCounts(d.plate, d.plates.length);
-  // First cells for a motionless plate: give it a default motion at its interior point.
   let anchors: Array<Vec3 | null> | null = null;
   let contFrac: Float64Array | null = null;
-  for (let k = 0; k < Math.min(np0, countsBefore.length); k++) {
+  for (let k = 0; k < Math.min(d.plates.length, countsBefore.length); k++) {
     const w = d.plates[k].omega;
     if (countsBefore[k] !== 0 || counts[k] === 0 || w[0] !== 0 || w[1] !== 0 || w[2] !== 0) continue;
     anchors ??= plateAnchors(mesh, d.plate, d.plates.length);
@@ -166,13 +201,46 @@ export function normalizeTopology(mut: Mutator, countsBefore: Int32Array): Topol
       mut.markMotionChanged(k);
     }
   }
-  for (let k = Math.min(np0, countsBefore.length) - 1; k >= 0; k--) {
-    if (counts[k] === 0 && countsBefore[k] > 0 && d.plates.length > 1) {
-      result.removed.push(d.plates[k].id);
-      removeEmptyPlate(mut, k);
-    }
+  return counts;
+}
+
+/** Remove every plate without cells (keeps at least one plate). Returns the removed ids. */
+export function removeEmptyPlates(mut: Mutator): number[] {
+  const d = mut.state.draft;
+  const counts = plateCounts(d.plate, d.plates.length);
+  const removed: number[] = [];
+  for (let k = d.plates.length - 1; k >= 0; k--) {
+    if (counts[k] !== 0 || d.plates.length <= 1) continue;
+    removed.push(d.plates[k].id);
+    removeEmptyPlate(mut, k);
   }
-  return result;
+  return removed.reverse();
+}
+
+/** Connected pieces of every plate: total pieces and pieces below MIN_FRAGMENT_CELLS (per plate index). */
+export interface PlatePieces {
+  pieces: Int32Array;
+  /** Detached pieces (not the largest) smaller than MIN_FRAGMENT_CELLS: they merge into neighbours on "Simulate". */
+  tiny: Int32Array;
+}
+
+export function platePieces(mesh: SphereMesh, plate: Int16Array, numPlates: number): PlatePieces {
+  const comps = labelComponents(mesh, plate);
+  const pieces = new Int32Array(numPlates);
+  const tiny = new Int32Array(numPlates);
+  const biggest = new Int32Array(numPlates).fill(-1);
+  for (let c = 0; c < comps.size.length; c++) {
+    const k = comps.label[c];
+    if (k < 0 || k >= numPlates) continue;
+    pieces[k]++;
+    if (biggest[k] < 0 || comps.size[c] > comps.size[biggest[k]]) biggest[k] = c;
+  }
+  for (let c = 0; c < comps.size.length; c++) {
+    const k = comps.label[c];
+    if (k < 0 || k >= numPlates) continue;
+    if (c !== biggest[k] && comps.size[c] < MIN_FRAGMENT_CELLS) tiny[k]++;
+  }
+  return { pieces, tiny };
 }
 
 /**

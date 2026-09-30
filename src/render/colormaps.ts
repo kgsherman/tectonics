@@ -131,25 +131,32 @@ export const CM_BATHY = colormap([
   s(0, [150, 206, 226]), s(150, [104, 170, 212]), s(1000, [58, 118, 182]), s(3000, [32, 78, 148]),
   s(5000, [20, 50, 110]), s(8000, [10, 26, 70]),
 ]);
-/** Air temperature (°C): cold purple-blue → white-ish cyan near 0 → yellow → deep red. */
+/**
+ * Air temperature (°C): diverging about 0 °C (near-white), cold side purple → blue → pale blue,
+ * warm side cream → yellow → orange → red → maroon. Stops every 10 °C (legend = stops).
+ */
 export const CM_TEMP = colormap([
-  s(-45, [48, 18, 84]), s(-30, [66, 64, 170]), s(-15, [52, 132, 216]), s(0, [168, 222, 234]),
-  s(10, [168, 214, 120]), s(20, [248, 212, 92]), s(30, [236, 112, 44]), s(40, [176, 28, 38]), s(50, [104, 8, 32]),
+  s(-50, [42, 10, 60]), s(-40, [80, 34, 128]), s(-30, [58, 72, 176]), s(-20, [44, 124, 212]), s(-10, [124, 188, 234]),
+  s(0, [244, 244, 238]), s(10, [252, 214, 110]), s(20, [246, 142, 56]), s(30, [206, 48, 40]), s(40, [124, 10, 52]),
+  s(50, [60, 4, 40]),
 ]);
-/** Sea-surface temperature (°C). */
+/** Sea-surface temperature (°C), "thermal"-style: lightness rises monotonically with temperature. */
 export const CM_SST = colormap([
-  s(-2, [36, 30, 96]), s(4, [42, 86, 170]), s(10, [44, 156, 186]), s(16, [92, 194, 152]),
-  s(22, [238, 216, 92]), s(27, [238, 128, 50]), s(32, [168, 30, 42]),
+  s(-2, [14, 26, 66]), s(4, [34, 58, 140]), s(10, [96, 70, 162]), s(16, [166, 72, 142]),
+  s(22, [226, 96, 88]), s(27, [248, 160, 66]), s(32, [250, 234, 140]),
 ]);
-/** Precipitation on log10(mm): dry brown → green → blue → violet. */
+/**
+ * Precipitation on log10(mm/month): diverging about the semi-arid pivot (~30 mm, pale cream) —
+ * dry side browns, wet side green → teal → blue → purple.
+ */
 export const CM_PRECIP_LOG = colormap([
-  s(0, [120, 84, 52]), s(1, [186, 150, 96]), s(1.5, [226, 214, 140]), s(2, [118, 186, 104]),
-  s(2.4, [42, 150, 140]), s(2.8, [40, 96, 190]), s(3.2, [72, 40, 150]), s(3.6, [40, 16, 80]),
+  s(0, [112, 72, 38]), s(Math.log10(3), [158, 108, 60]), s(1, [200, 158, 98]), s(Math.log10(30), [234, 222, 172]),
+  s(2, [148, 204, 150]), s(Math.log10(300), [60, 160, 168]), s(3, [42, 94, 180]), s(Math.log10(4000), [66, 28, 124]),
 ]);
-/** Sea-level pressure anomaly (hPa relative to 1013): blue lows, red highs. */
+/** Sea-level pressure anomaly (hPa relative to 1013): blue lows, white 1013, red highs. */
 export const CM_PRESSURE = colormap([
-  s(-40, [24, 40, 110]), s(-20, [52, 102, 186]), s(-8, [146, 186, 226]), s(0, [240, 238, 232]),
-  s(8, [238, 180, 136]), s(20, [206, 92, 64]), s(40, [120, 20, 36]),
+  s(-32, [22, 38, 108]), s(-24, [36, 70, 150]), s(-16, [58, 112, 190]), s(-8, [140, 180, 226]), s(0, [242, 241, 236]),
+  s(8, [240, 186, 150]), s(16, [214, 106, 76]), s(24, [170, 48, 50]), s(32, [112, 16, 34]),
 ]);
 /** Monthly-mean wind speed (m/s). */
 export const CM_WIND = colormap([
@@ -161,8 +168,57 @@ export const CM_AGE = colormap([
   s(0, [214, 38, 40]), s(20, [244, 132, 52]), s(40, [246, 214, 74]), s(70, [118, 190, 88]),
   s(100, [60, 160, 190]), s(140, [60, 92, 196]), s(180, [104, 58, 160]), s(250, [70, 40, 96]),
 ]);
-/** Ocean current speed (m/s), background ramp (most resolution below 0.3 m/s). */
+/**
+ * Ocean-current speed (m/s), neutral lightness ramp (the currents layer tints it warm / cold by the
+ * SST anomaly — see currentColor).
+ */
 export const CM_CURRENT = colormap([
-  s(0, [10, 20, 44]), s(0.05, [16, 36, 78]), s(0.15, [26, 64, 120]), s(0.3, [40, 104, 164]),
-  s(0.6, [80, 150, 196]), s(1.2, [168, 214, 236]),
+  s(0, [10, 18, 34]), s(0.05, [22, 36, 60]), s(0.15, [46, 66, 96]), s(0.3, [84, 106, 136]),
+  s(0.6, [150, 168, 190]), s(1.2, [226, 232, 238]),
 ]);
+
+/** Warm / cold tints of the currents layer (sRGB, applied in OKLab chroma by currentLut). */
+export const CURRENT_WARM: RGB = [236, 92, 52];
+export const CURRENT_COLD: RGB = [58, 150, 250];
+/** SST anomaly (°C) giving the full warm / cold tint. */
+export const CURRENT_ANOM_FULL = 3;
+
+/**
+ * Bivariate currents LUT: rows = SST anomaly bins (−FULL..+FULL, `na` bins), columns = speed bins
+ * of CM_CURRENT. Lightness follows the speed ramp; hue/chroma go to the warm or cold tint with
+ * |anomaly| (fading out for slow water). Uint8Array(3·na·CM_CURRENT.n).
+ */
+export const CURRENT_ANOM_BINS = 33;
+export const CURRENT_LUT = (() => {
+  const na = CURRENT_ANOM_BINS, ns = CM_CURRENT.n;
+  const out = new Uint8Array(3 * na * ns);
+  const warm = linToOklab(SRGB_TO_LINEAR[CURRENT_WARM[0]], SRGB_TO_LINEAR[CURRENT_WARM[1]], SRGB_TO_LINEAR[CURRENT_WARM[2]]);
+  const cold = linToOklab(SRGB_TO_LINEAR[CURRENT_COLD[0]], SRGB_TO_LINEAR[CURRENT_COLD[1]], SRGB_TO_LINEAR[CURRENT_COLD[2]]);
+  for (let ai = 0; ai < na; ai++) {
+    const t = (2 * ai) / (na - 1) - 1; // −1 cold .. +1 warm
+    const tint = t > 0 ? warm : cold;
+    const k = Math.abs(t);
+    for (let si = 0; si < ns; si++) {
+      const sp = CM_CURRENT.min + ((CM_CURRENT.max - CM_CURRENT.min) * si) / (ns - 1);
+      const base = linToOklab(SRGB_TO_LINEAR[CM_CURRENT.lut[3 * si]], SRGB_TO_LINEAR[CM_CURRENT.lut[3 * si + 1]], SRGB_TO_LINEAR[CM_CURRENT.lut[3 * si + 2]]);
+      // Tint strength grows with |anomaly| and with speed (still water stays neutral).
+      const g = k * Math.pow(Math.min(1, Math.max(0, (sp - 0.015) / 0.2)), 0.7);
+      const L = base[0] + (Math.max(base[0], 0.5 * (base[0] + tint[0])) - base[0]) * g;
+      const a = base[1] + (tint[1] - base[1]) * g;
+      const b = base[2] + (tint[2] - base[2]) * g;
+      const lin = oklabToLin(L, a, b);
+      const o = 3 * (ai * ns + si);
+      out[o] = encodeSrgb(Math.max(0, lin[0]));
+      out[o + 1] = encodeSrgb(Math.max(0, lin[1]));
+      out[o + 2] = encodeSrgb(Math.max(0, lin[2]));
+    }
+  }
+  return out;
+})();
+
+/** Byte offset into CURRENT_LUT for a speed (m/s) and SST anomaly (°C). */
+export function currentIndex(speed: number, anom: number): number {
+  let ai = Math.round(((anom / CURRENT_ANOM_FULL + 1) * (CURRENT_ANOM_BINS - 1)) / 2);
+  ai = ai < 0 ? 0 : ai >= CURRENT_ANOM_BINS ? CURRENT_ANOM_BINS - 1 : ai;
+  return 3 * (ai * CM_CURRENT.n + cmapIndex(CM_CURRENT, speed));
+}

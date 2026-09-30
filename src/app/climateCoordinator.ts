@@ -1,12 +1,12 @@
 /**
  * Runs climate jobs: ClimateQueue policy → climate input from the sim worker (for the displayed
- * state) → ClimateClient (climate worker) → result to the app. The sim worker receives its own
+ * state) → ClimateClient (climate worker) → result to the app. The paint worker receives its own
  * copy over the MessageChannel and repaints by itself.
  */
 import type { ClimateParams, ClimateResult } from '../core/types';
 import type { ClimatePurpose } from '../worker/protocol';
 import { CancelledError, type ClimateClient } from './climateClient';
-import { ClimateQueue, liveClimateDue, type ClimateJob } from './climateQueue';
+import { ClimateQueue, liveClimateDue, overallClimateProgress, type ClimateJob } from './climateQueue';
 import { CLIMATE_GRID_FULL, CLIMATE_GRID_LIVE } from './schema';
 import type { SimClient } from './simClient';
 import type { Action, AppState } from './state';
@@ -100,9 +100,9 @@ export class ClimateCoordinator {
     try {
       const input = await this.d.sim.request({ type: 'climateInput', epoch: this.d.epoch(), params });
       if (this.queue.running !== job) return; // superseded while the input was built
-      store.dispatch({ type: 'climateProgress', stage: 'dynamics', fraction: 0 });
+      store.dispatch({ type: 'climateProgress', stage: 'input', fraction: overallClimateProgress('input', 1) });
       const out = await this.d.climate.compute(input, params, job.purpose, this.warm, (stage, fraction) => {
-        if (this.queue.running === job) store.dispatch({ type: 'climateProgress', stage, fraction });
+        if (this.queue.running === job) store.dispatch({ type: 'climateProgress', stage, fraction: overallClimateProgress(stage, fraction) });
       });
       if (this.queue.running !== job) return;
       this.warm = true;

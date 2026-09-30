@@ -2,7 +2,7 @@
  * Climate worker logic (SPEC.md §10): runs computeClimate, one job at a time. Cancellation is done
  * by the main thread (terminate + respawn), so a job simply runs to completion here. The result is
  * kept as the next warm start and therefore leaves the worker by structured clone — once to the
- * main thread and once to the sim/paint worker over the MessageChannel.
+ * main thread and once to the paint worker over the MessageChannel.
  */
 import { computeClimate } from '../climate/climate';
 import type { ClimateResult } from '../core/types';

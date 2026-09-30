@@ -2,10 +2,10 @@
 import type { UiContext } from '../../commands';
 import { fmtMyr, fmtNum, fmtPercent } from '../../format';
 import { CONTINENT_MODES, MESH_RESOLUTIONS, WORLD_SPECS } from '../../schema';
-import type { WorldSettings } from '../../state';
+import { worldParamsKey, type WorldSettings } from '../../state';
 import { shallowEqual } from '../../store';
 import { button, hint, section, seedField, segmented, slider, statGrid, type Control } from '../controls';
-import { h } from '../dom';
+import { h, setText, toggleClass } from '../dom';
 
 export function createWorldTab(ctx: UiContext): HTMLElement {
   const { store, commands } = ctx;
@@ -35,10 +35,18 @@ export function createWorldTab(ctx: UiContext): HTMLElement {
   });
 
   const generate = button({ label: 'Generate world', icon: 'sparkles', variant: 'primary', wide: true, onClick: () => commands.generate() });
-  const meshNote = hint('Mesh resolution applies when you generate. 160k is sharper but slower to simulate.');
-  store.watch((s) => ({ busy: s.runtime.tasks.some((t) => t.id === 'generate'), want: s.settings.world.meshN, have: s.runtime.meshN }), (v) => {
+  const changedNote = hint('Settings changed: generate to build a world with them.');
+  const meshNote = hint('160k cells is sharper but slower to simulate.');
+  store.watch((s) => ({
+    busy: s.runtime.tasks.some((t) => t.id === 'generate'), want: s.settings.world.meshN, have: s.runtime.meshN,
+    key: worldParamsKey(s.settings.world), built: s.runtime.worldParams,
+  }), (v) => {
     generate.disabled = v.busy;
-    meshNote.hidden = !(v.have && v.want !== v.have);
+    setText(generate.lastElementChild as HTMLElement, v.busy ? 'Generating…' : 'Generate world');
+    const changed = !v.busy && v.built !== '' && v.key !== v.built;
+    changedNote.hidden = !changed;
+    toggleClass(generate, 'is-pending', changed);
+    meshNote.hidden = !(v.want === 160_000 && v.have !== v.want);
   }, { immediate: true, equal: shallowEqual });
 
   const stats = statGrid([
@@ -62,7 +70,7 @@ export function createWorldTab(ctx: UiContext): HTMLElement {
     h('div', { class: 'wg-panel-title', text: 'New world' }),
     h('div', { class: 'wg-panel-sub', text: 'Procedural plates, continents and hotspots.' }),
     section('Generation', seed.el, mesh.el, mode.el, ...sliders.map(([, c]) => c.el)),
-    h('section', { class: 'wg-section' }, generate, meshNote),
+    h('section', { class: 'wg-section' }, generate, changedNote, meshNote),
     section('Current world', stats.el),
   );
 }

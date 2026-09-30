@@ -73,6 +73,7 @@ export function closeTrappedBasins(state: SimState): void {
     P.elev[j] = sumH / cnt;
     P.age[j] = sumA / cnt;
     state.counters.continentalCreated++;
+    state.counters.basinClosures++;
   }
 }
 

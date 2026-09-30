@@ -71,6 +71,52 @@ export const FRONT_SMOOTH_PASSES = 2;
 export const UPLIFT_SMOOTH_KM = 60;
 /** Oceanic crust converts to continental only in the arc core (subduction kernel ≥ this fraction). */
 export const ARC_CORE_FRACTION = 0.3;
+/**
+ * Crustal growth budget (arc accretion vs. recycling). Emergent arc-core crust converts to continental
+ * crust stochastically: per step with probability (raw arc uplift of the step, m) / ARC_JUVENILE_UPLIFT,
+ * i.e. after ~ARC_JUVENILE_UPLIFT m of accumulated arc uplift on average — the magmatic addition
+ * needed to build a continental column. Island arcs still rise above sea level (as volcanic islands on
+ * oceanic crust) long before they become continental.
+ */
+export const ARC_JUVENILE_UPLIFT = 150000;
+/**
+ * Tectonic (subduction) erosion + sediment subduction: the overriding plate's leading edge at every
+ * subduction front retreats at this rate (km/Myr at TECTONIC_EROSION_REF_SPEED km/Myr of convergence,
+ * proportional to convergence, capped at 2×). Earth: ~1–3 km/Myr at erosive margins; globally the
+ * recycled volume ≈ the arc addition, so continental area stays roughly constant.
+ */
+export const TECTONIC_EROSION_RATE = 1.7;
+export const TECTONIC_EROSION_REF_SPEED = 50;
+/** Plates with fewer owned cells than this are never eroded (keeps housekeeping invariants simple). */
+export const TECTONIC_EROSION_MIN_CELLS = 64;
+/**
+ * Continental volume closure: land eroded above the freeboard is redeposited on passive margins, and
+ * once a margin cell has received a continental column's worth (MARGIN_COLUMN_M of elevation
+ * equivalent — the same proxy as a consumed collision column, COLLISION_THICKNESS_PROXY + 500 m) it
+ * becomes continental shelf. Collisions turn area into thickness; erosion of the resulting belts turns
+ * it back into area over ~100 Myr, as on Earth. SEDIMENT_EFFICIENCY: fraction of the eroded volume
+ * that stays on the margins (the rest is subducted with the sea floor).
+ */
+export const SEDIMENT_EFFICIENCY = 0.7;
+/** Same for land being uplifted above a subducting slab (arcs, cordilleras): it is subducted. */
+export const SEDIMENT_ACTIVE_EFFICIENCY = 0;
+export const MARGIN_COLUMN_M = 5000;
+/**
+ * Terrane accretion: a continental fragment of TERRANE_MIN_FRACTION..TERRANE_MAX_FRACTION of the sphere
+ * (~5·10⁴ – 3·10⁶ km²) docks onto the overriding plate once its collision has absorbed
+ * TERRANE_DOCK_SHORTENING km of shortening.
+ */
+export const TERRANE_DOCK_SHORTENING = 150;
+export const TERRANE_MAX_FRACTION = 0.006;
+export const TERRANE_MIN_FRACTION = 0.0001;
+/** Trapped ocean basins up to this fraction of the sphere, whose youngest crust is older than
+ * TRAPPED_BASIN_MIN_AGE Myr (no ridge inside), fill from the edge by one ring per MARGIN_INTERVAL. */
+export const TRAPPED_BASIN_MAX_FRACTION = 0.01;
+export const TRAPPED_BASIN_MIN_AGE = 60;
+/** Margin accretion runs every this many Myr. */
+export const MARGIN_INTERVAL = 5;
+/** Unspent sediment is capped at this fraction of all cells (no instant continents after long droughts). */
+export const MARGIN_MAX_BACKLOG = 0.01;
 
 /** Hotspot saturating growth rate at the plume centre, 1/Myr (× strength × activity). */
 export const HOTSPOT_RATE = 0.35;
@@ -80,6 +126,12 @@ export const HOTSPOT_OCEAN_TARGET = 1500;
 export const HOTSPOT_CONT_TARGET = 1000;
 /** Hotspot influence radius in units of Hotspot.radius. */
 export const HOTSPOT_REACH = 2.5;
+/**
+ * Volcanic construction is confined to the plume core (Gaussian width HOTSPOT_EDIFICE_WIDTH × radius),
+ * so plates carry away seamount chains of edifice width. (Growth over the full plume width used to
+ * leave ~600 km wide shallow walls across the oceans behind every hotspot.)
+ */
+export const HOTSPOT_EDIFICE_WIDTH = 0.6;
 
 /* ---------------- Surface processes (G) ---------------- */
 
@@ -149,6 +201,13 @@ export const SLAB_PULL_FULL_FRACTION = 0.15;
 
 /* ---------------- Rifting (I) & housekeeping (J) ---------------- */
 
+/**
+ * Rift rate scaling with plate size: riftRate applies to a world of RIFT_REF_PLATES equal plates; the
+ * rate is multiplied by RIFT_REF_PLATES·Σ A_k² (A = area fraction), clamped to [MIN, MAX].
+ */
+export const RIFT_REF_PLATES = 12;
+export const RIFT_SIZE_FACTOR_MIN = 0.5;
+export const RIFT_SIZE_FACTOR_MAX = 4;
 /** Minimum visible area (fraction of the sphere) of a plate that may rift. */
 export const RIFT_MIN_AREA = 0.04;
 /** Relative separation speed of rift halves, km/Myr. */

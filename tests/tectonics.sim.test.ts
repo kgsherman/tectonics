@@ -259,7 +259,9 @@ describe('TectonicSim kinematic scenarios', () => {
     }
     // Spin about the cap centre (50 km/Myr at the rim) plus a slow drift.
     draft.plates[1].omega = [50 / EARTH_RADIUS_KM / Math.sin(40 * DEG), 0, 4 / EARTH_RADIUS_KM];
-    const sim = new TectonicSim(mesh, draft, { riftRate: 0 });
+    // Kinematics only: with erosion on, the eroding 400 m plateau legitimately builds new margin
+    // crust from its sediment (accreteMargins), which is not what this test is about.
+    const sim = new TectonicSim(mesh, draft, { riftRate: 0, erosion: 0 });
     const cont0 = count(draft.crust, (c) => c === CRUST_CONTINENTAL);
     for (let t = 0; t < 100; t += 10) {
       sim.step(10);

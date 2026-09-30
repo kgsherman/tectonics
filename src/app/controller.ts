@@ -1,5 +1,5 @@
 /**
- * Application controller (SPEC.md §10): owns the two workers, the main-thread copies of the world
+ * Application controller (SPEC.md §10): owns the three workers (sim, paint, climate), the main-thread copies of the world
  * (mesh, latest snapshot, latest climate) and the world lifecycle (generate, play/pause/step,
  * history, editor round trip, exports). Presentation lives in ViewSync / HoverController, store
  * reactions in effects.ts, the DOM shell in ui/layout.ts.
@@ -15,15 +15,18 @@ import type { Commands, UiContext } from './commands';
 import { displaySettings, generateParams } from './display';
 import { EditorBridge } from './editorBridge';
 import { wireStoreEffects } from './effects';
+import { layerUsesClimate } from '../worker/layerInfo';
 import { downloadBlob, downloadUrl, exportName, rgbaToPngBlob } from './exportImage';
 import { fmtNum } from './format';
 import { HoverController } from './hoverController';
 import { installShortcuts, type Command } from './keyboard';
+import { RateMeter } from './rateMeter';
 import { PAINT_FULL } from './schema';
 import { browserStorage, loadSettings } from './settings';
 import { SimClient, type WorkerLike } from './simClient';
-import { initialState, reduce, type Action, type AppState, type ViewKind } from './state';
-import { createStore, type Store } from './store';
+import { initialState, reduce, worldParamsKey, type Action, type AppState, type ViewKind } from './state';
+import { createStore, shallowEqual, type Store } from './store';
+import { createFirstRunHint } from './ui/firstRunHint';
 import { buildLayout } from './ui/layout';
 import type { RightPanel } from './ui/rightPanel';
 import type { SimulateTab } from './ui/tabs/simulateTab';
@@ -33,6 +36,7 @@ import { ViewSync } from './viewSync';
 
 export interface AppWorkers {
   sim: () => WorkerLike;
+  paint: () => WorkerLike;
   climate: () => WorkerLike;
 }
 
@@ -64,13 +68,16 @@ export class App implements Commands {
   private generating = false;
   private scrubTarget: number | null | undefined = undefined;
   private scrubRaf = 0;
+  /** Playback frames shown per second, and the paint worker's last paint time. */
+  private readonly frameRate = new RateMeter();
+  private lastPaintMs = 0;
 
   constructor(root: HTMLElement, workers: AppWorkers) {
     const storage = browserStorage();
     this.store = createStore(initialState(loadSettings(storage)), reduce);
     const ctx: UiContext = { store: this.store, commands: this };
 
-    this.sim = new SimClient(workers.sim());
+    this.sim = new SimClient(workers.sim(), workers.paint());
     this.climateClient = new ClimateClient(workers.climate, (port) => {
       this.sim.send({ type: 'connectClimate', epoch: this.epoch, port }, [port]);
     });
@@ -104,8 +111,13 @@ export class App implements Commands {
       onApply: (d) => void this.loadDraft(d),
       seaLevel: () => this.store.getState().settings.seaLevel,
       onError: (title, detail) => this.toasts.error(title, detail),
+      worldStamp: () => {
+        const rt = this.store.getState().runtime;
+        return `${rt.worldSeed}|${rt.meshN}|${rt.steps}`;
+      },
     });
     this.viewport.showCover({ kind: 'loading', title: 'Starting…', detail: 'Loading the simulation workers.' });
+    this.viewport.el.appendChild(createFirstRunHint(ctx, storage, this.viewport.host));
     root.append(layout.root, this.toasts.el);
 
     this.wireWorker();
@@ -124,6 +136,10 @@ export class App implements Commands {
       sendSpeed: (stepsPerFrame) => this.sim.send({ type: 'setSpeed', epoch: this.epoch, stepsPerFrame }),
     }, storage);
     installShortcuts(window, () => ({ editorActive: this.store.getState().runtime.editorActive }), (c) => this.runShortcut(c));
+    this.store.watch((s) => ({
+      phase: s.runtime.climate.phase, pct: Math.round(s.runtime.climate.progress * 100), layer: s.settings.view.layer,
+      playing: s.runtime.playing, seasons: s.runtime.seasonsPlaying, editing: s.runtime.editorActive,
+    }), () => this.updateRendering(), { equal: shallowEqual });
 
     const want = this.store.getState().settings.view.view;
     const kind = this.viewport.setKind(want);
@@ -141,11 +157,12 @@ export class App implements Commands {
     const s = this.store.getState();
     this.generating = true;
     this.beginNewWorld('Generating world…');
+    const paramsKey = worldParamsKey(s.settings.world);
     this.sim.request({
       type: 'generate', epoch: this.epoch, meshN: s.settings.world.meshN, params: generateParams(s.settings.world),
       tectonic: s.settings.tectonic, display: displaySettings(s),
     })
-      .then((loaded) => this.onWorldLoaded(loaded))
+      .then((loaded) => this.onWorldLoaded(loaded, paramsKey))
       .catch((e) => this.onLoadFailed('Could not generate the world', e))
       .finally(() => {
         this.generating = false;
@@ -163,14 +180,16 @@ export class App implements Commands {
 
   togglePlay(): void {
     const rt = this.store.getState().runtime;
-    if (!rt.worldLoaded || rt.editorActive) return;
+    // While a world loads the sim worker is busy with it; a queued play would start the new world
+    // behind a UI that shows it paused.
+    if (!rt.worldLoaded || rt.editorActive || this.generating) return;
     if (rt.playing) this.pause();
     else this.play();
   }
 
   step(): void {
     const s = this.store.getState();
-    if (!s.runtime.worldLoaded || s.runtime.editorActive) return;
+    if (!s.runtime.worldLoaded || s.runtime.editorActive || this.generating) return;
     this.epoch++;
     // The worker stops playback before stepping.
     this.setPlaying(false);
@@ -259,6 +278,7 @@ export class App implements Commands {
 
   private play(): void {
     const s = this.store.getState();
+    this.frameRate.reset();
     this.setPlaying(true);
     this.sim.request({ type: 'play', epoch: this.epoch, stepsPerFrame: s.settings.speed, display: displaySettings(s) })
       .catch((e) => {
@@ -307,9 +327,9 @@ export class App implements Commands {
     this.viewSync.weather();
   }
 
-  private onWorldLoaded(loaded: WorldLoaded): void {
+  private onWorldLoaded(loaded: WorldLoaded, paramsKey: string): void {
     const prevMesh = this.store.getState().runtime.meshN;
-    this.store.dispatch({ type: 'worldLoaded', ...loaded });
+    this.store.dispatch({ type: 'worldLoaded', ...loaded, paramsKey });
     this.editor.worldChanged(prevMesh !== loaded.meshN);
     this.climateAfterChange('full');
     this.viewSync.legend();
@@ -339,7 +359,7 @@ export class App implements Commands {
         // The editor hands over a fresh clone (onApply(cloneDraft(d))): its buffers can move.
         transferList(draft.plate, draft.crust, draft.elev, draft.age, draft.orogeny),
       );
-      this.onWorldLoaded(loaded);
+      this.onWorldLoaded(loaded, '');
       this.store.dispatch({ type: 'setTab', tab: 'simulate' });
       this.toasts.show('success', 'World loaded', 'Press Space to simulate your plates.');
     } catch (e) {
@@ -407,11 +427,17 @@ export class App implements Commands {
     sim.on('history', (e) => this.store.dispatch({ type: 'history', keyframes: e.keyframes, intervalMyr: e.intervalMyr, viewing: e.viewing }));
     sim.on('status', (e) => {
       const playing = this.store.getState().runtime.playing;
-      this.store.dispatch({ type: 'status', playing, time: e.time, steps: e.steps, perf: e.perf });
+      // Steps come from the sim worker; frames are counted where they are shown.
+      const perf = { ...e.perf, framesPerSec: playing ? this.frameRate.rate(performance.now()) : 0, lastPaintMs: this.lastPaintMs };
+      this.store.dispatch({ type: 'status', playing, time: e.time, steps: e.steps, perf });
       if (playing) {
         this.climate.playbackTick(e.time);
+        // Sim and paint workers run side by side: the frame rate follows the slower stage.
+        const simMs = perf.lastStepMs * this.store.getState().settings.speed + (perf.lastSnapshotMs ?? 0);
         this.viewport.setPerf(
-          `${fmtNum(e.perf.stepsPerSec, 1)} steps/s · ${fmtNum(e.perf.framesPerSec, 0)} fps · step ${fmtNum(e.perf.lastStepMs, 0)} ms · paint ${fmtNum(e.perf.lastPaintMs, 0)} ms`,
+          `${fmtNum(perf.framesPerSec, 0)} fps · sim ${fmtNum(simMs, 0)} ms ∥ paint ${fmtNum(perf.lastPaintMs, 0)} ms`,
+          `${fmtNum(perf.stepsPerSec, 1)} steps/s · per frame: ${this.store.getState().settings.speed} step(s) at ${fmtNum(perf.lastStepMs, 0)} ms` +
+            ` + snapshot ${fmtNum(perf.lastSnapshotMs ?? 0, 0)} ms (sim worker), paint ${fmtNum(perf.lastPaintMs, 0)} ms (paint worker)`,
         );
       } else {
         this.viewport.setPerf(null);
@@ -425,6 +451,8 @@ export class App implements Commands {
       if (e.reqId) this.paints.complete(e.reqId);
       this.toasts.error('Simulation worker', e.message);
       if (/playback stopped/.test(e.message)) this.setPlaying(false);
+      // The paint worker cannot stop the sim: a failing playback paint pauses it the normal way.
+      if (/^paint failed/.test(e.message) && this.store.getState().runtime.playing) this.pause(false);
       if (/^paint failed/.test(e.message)) {
         // No frame is coming for this request: drop the "Rendering…" badge and the loading cover.
         this.awaitingStill = false;
@@ -446,6 +474,8 @@ export class App implements Commands {
     if (f.kind === 'play') this.sim.send({ type: 'frameAck', epoch: this.epoch, frameId: f.frameId });
     if (f.reqId) this.paints.complete(f.reqId);
     if (isStaleEpoch(f.epoch, this.epoch)) return;
+    if (f.kind === 'play') this.frameRate.tick(performance.now());
+    if (f.rgba) this.lastPaintMs = f.paintMs;
     this.viewport.applyFrame(f);
     this.viewport.showCover(null);
     if (f.kind === 'still' && f.quality === 'full') this.awaitingStill = false;
@@ -478,10 +508,19 @@ export class App implements Commands {
     this.updateRendering();
   }
 
-  /** "Rendering…" badge for still repaints; hidden during playback and seasons (constant repaints). */
+  /**
+   * Busy badge over the view: "Rendering…" for still repaints, or the climate's progress while a
+   * full climate is computed for a layer that shows it (the planet repaints when it lands). Hidden
+   * during playback and seasons (constant repaints, live climate).
+   */
   private updateRendering(): void {
-    const rt = this.store.getState().runtime;
-    this.viewport.setRendering((this.awaitingStill || this.paints.busy) && !rt.playing && !rt.seasonsPlaying);
+    const s = this.store.getState();
+    const rt = s.runtime;
+    const idle = !rt.playing && !rt.seasonsPlaying && !rt.editorActive;
+    const painting = idle && (this.awaitingStill || this.paints.busy);
+    const c = rt.climate;
+    const climate = idle && c.phase === 'computing' && c.purpose !== 'live' && layerUsesClimate(s.settings.view.layer);
+    this.viewport.setRendering(painting || climate, painting ? 'Rendering…' : `Computing climate… ${Math.round(c.progress * 100)}%`);
   }
 
   private runShortcut(c: Command): void {

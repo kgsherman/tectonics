@@ -46,6 +46,11 @@ export class GlobeSurface {
       uHeight: { value: null as Texture | null },
       uHasHeight: { value: 0 },
       uHeightTexel: { value: new Vector2(1, 1) },
+      uHeightSize: { value: new Vector2(1, 1) },
+      uBaseSize: { value: new Vector2(1, 1) },
+      uSameSize: { value: 0 },
+      uDetail: { value: 0 },
+      uRecon: { value: 1 },
       uHeightLod: { value: 0 },
       uPoleHeight: { value: new Vector2(0, 0) },
       uSeaLevel: { value: 0 },
@@ -75,6 +80,8 @@ export class GlobeSurface {
     this.base.set(rgba, w, h);
     this.u.uBase.value = this.base.texture;
     this.u.uHasBase.value = 1;
+    (this.u.uBaseSize.value as Vector2).set(w, h);
+    this.updateSameSize();
   }
 
   setOverlay(rgba: Uint8ClampedArray | null, w: number, h: number): void {
@@ -100,6 +107,8 @@ export class GlobeSurface {
     this.u.uHeight.value = this.height.texture;
     this.u.uHasHeight.value = 1;
     (this.u.uHeightTexel.value as Vector2).set(1 / w, 1 / h);
+    (this.u.uHeightSize.value as Vector2).set(w, h);
+    this.updateSameSize();
     (this.u.uPoleHeight.value as Vector2).set(this.height.poleNorth, this.height.poleSouth);
     // Vertex sampling LOD matched to the mesh density (texels per segment).
     this.u.uHeightLod.value = Math.max(0, Math.log2(w / SEGMENTS_W));
@@ -107,6 +116,25 @@ export class GlobeSurface {
 
   setSeaLevel(seaLevel: number): void {
     this.u.uSeaLevel.value = seaLevel;
+  }
+
+  /** Procedural detail / coast breakup strength 0..1 (fades in with zoom inside the shader). */
+  setDetail(amount: number): void {
+    this.u.uDetail.value = Math.max(0, Math.min(1, amount));
+  }
+
+  get detail(): number {
+    return this.u.uDetail.value as number;
+  }
+
+  /** Sub-texel coastline/color reconstruction when zoomed in (on by default). */
+  setReconstruction(on: boolean): void {
+    this.u.uRecon.value = on ? 1 : 0;
+  }
+
+  private updateSameSize(): void {
+    const b = this.u.uBaseSize.value as Vector2, h = this.u.uHeightSize.value as Vector2;
+    this.u.uSameSize.value = b.x === h.x && b.y === h.y ? 1 : 0;
   }
 
   /** exaggeration: vertical exaggeration factor (0 = no displacement). */

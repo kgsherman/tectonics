@@ -61,30 +61,32 @@ function routingClimate(climate: ClimateResult | null, rw: number, rh: number, e
   const c = climate;
   const lk = gridLookup(rw, rh, c.w, c.h, cache);
   const N = c.w * c.h;
-  const evapAnn = new Float32Array(N);
-  const petAnn = new Float32Array(N);
-  for (let m = 0; m < 12; m++) {
-    for (let i = 0; i < N; i++) {
-      evapAnn[i] += c.evap[m * N + i];
+  // Per climate cell (cheaper than per routing cell): runoff = P − ET from the climate, capped by
+  // the Budyko curve (Fu 1981, ω = 2.6) so drylands, where ET ≈ P, do not feed spurious rivers and
+  // lakes; and the sea-level-reduced annual temperature for the lake evaporation.
+  const runC = new Float32Array(N), tSl = new Float32Array(N);
+  const sea0 = c.params.seaLevel;
+  for (let i = 0; i < N; i++) {
+    let e = 0, pet = 0;
+    for (let m = 0; m < 12; m++) {
+      e += c.evap[m * N + i];
       const t = c.temp[m * N + i];
-      petAnn[i] += t > 0 ? 12 + 4.6 * t : 12;
+      pet += t > 0 ? 12 + 4.6 * t : 12;
     }
+    const P = c.precipAnnual[i];
+    const phi = pet / Math.max(1, P);
+    const budyko = P * ((1 + Math.pow(phi, 2.6)) ** (1 / 2.6) - phi);
+    runC[i] = Math.max(0, Math.min(P - e, budyko));
+    const hRef = c.land[i] ? Math.max(0, c.elev[i] - sea0) : 0;
+    tSl[i] = c.tempAnnual[i] + LAPSE_RATE * hRef;
   }
-  const hRef = new Float32Array(N);
-  for (let i = 0; i < N; i++) hRef[i] = c.land[i] ? Math.max(0, c.elev[i] - c.params.seaLevel) : 0;
+  const R = sampleField(runC, c.w, c.h, -1, lk, rw, rh);
+  const T = sampleField(tSl, c.w, c.h, -1, lk, rw, rh);
   const P = sampleField(c.precipAnnual, c.w, c.h, -1, lk, rw, rh);
-  const E = sampleField(evapAnn, c.w, c.h, -1, lk, rw, rh);
-  const T = sampleField(c.tempAnnual, c.w, c.h, -1, lk, rw, rh);
-  const H = sampleField(hRef, c.w, c.h, -1, lk, rw, rh);
-  const PET = sampleField(petAnn, c.w, c.h, -1, lk, rw, rh);
   for (let i = 0; i < n; i++) {
-    // Runoff = P − ET from the climate, capped by the Budyko curve (Fu 1981, ω = 2.6) so drylands,
-    // where ET ≈ P, do not feed spurious rivers and lakes.
-    const phi = PET[i] / Math.max(1, P[i]);
-    const budyko = P[i] * ((1 + Math.pow(phi, 2.6)) ** (1 / 2.6) - phi);
-    runoff[i] = Math.max(0, Math.min(P[i] - E[i], budyko));
+    runoff[i] = R[i];
     // Lapse the annual temperature to the cell, then a simple open-water evaporation proxy.
-    const t = T[i] + LAPSE_RATE * (H[i] - Math.max(0, elev[i] - sea));
+    const t = T[i] - LAPSE_RATE * Math.max(0, elev[i] - sea);
     const ev = Math.max(150, Math.min(2600, 380 + 62 * t));
     lakeEvap[i] = ev;
     arid[i] = 1 - smooth(0.25, 1.1, P[i] / ev);
@@ -297,12 +299,21 @@ function drawLakes(rgba: Uint8ClampedArray, hf: HeightField, net: RiverNetwork, 
   const { w, h, height, patch } = hf;
   const d = net.drainage, f = net.f;
   if (d.lakes.length === 0) return;
+  const { lakeOf, lakes } = d;
+  const dw = d.w;
+  // Routing rows that contain any lake / salt-pan zone.
+  const rowHas = new Uint8Array(d.h);
+  for (let i = 0; i < lakeOf.length; i++) if (lakeOf[i] >= 0) rowHas[(i / dw) | 0] = 1;
+  const colOf = new Int32Array(w);
+  for (let x = 0; x < w; x++) colOf[x] = Math.min(dw - 1, (x / f) | 0);
   for (let y = 0; y < h; y++) {
-    const ry = Math.min(d.h - 1, Math.floor(y / f));
+    const ry = Math.min(d.h - 1, (y / f) | 0);
+    if (!rowHas[ry]) continue;
+    const lrow = ry * dw;
     for (let x = 0; x < w; x++) {
-      const li = d.lakeOf[ry * d.w + Math.min(d.w - 1, Math.floor(x / f))];
+      const li = lakeOf[lrow + colOf[x]];
       if (li < 0) continue;
-      const lake = d.lakes[li];
+      const lake = lakes[li];
       const p = y * w + x;
       const H = height[p];
       if (H <= sea) continue; // lakes are inland water on land pixels only

@@ -237,7 +237,11 @@ describe('resolution and quality consistency', () => {
     const down = resampleGrid(big, 1024, 512, 512, 256);
     let agree = 0;
     for (let p = 0; p < lo.length; p++) if (lo[p] > 0 === down[p] > 0) agree++;
-    expect(agree / lo.length).toBeGreaterThan(0.985);
+    // The coastline now carries crisp, band-limited detail down to ~2 px (whiter coast noise), which a
+    // 512-px raster cannot represent: pixel-level agreement is lower than with the previous smooth
+    // breakup, while large-scale coasts are identical (block-level test in
+    // polish.painter-satellite.test.ts). Was 0.985.
+    expect(agree / lo.length).toBeGreaterThan(0.97);
     // Also at extreme display sea levels (the preview deep-sea skip follows the sea level).
     for (const seaLevel of [-3500, 700]) {
       const pv = paintHeightMap(src, opts({ quality: 'preview', seaLevel }), cache);

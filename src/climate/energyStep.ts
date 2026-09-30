@@ -43,14 +43,18 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
   const month = Math.floor(k / M.stepsPerMonth) % 12;
   const A = t.olrA, B = t.olrB, Tf = t.freezeT, aIce = t.albedoIce;
   const cL = t.cLand, cA = t.cAir, cI = t.cIceSurface, gam = t.airSeaExchange;
-  const Tc = S.T, E = S.E, Ti = S.Ti;
+  const Tc = S.T, E = S.E, Ti = S.Ti, Es = S.Es;
+  // Seasonal stratified layer (energy.ts EbmState.Es): capacity and per-step mixing into the deep layer.
+  const Cs = t.stratDepth > 0 ? t.rhoCpWater * t.stratDepth : 0;
+  const invCs = Cs > 0 ? 1 / Cs : 0;
+  const stratMix = Cs > 0 ? 1 - Math.exp(-dt / (t.stratMixDays * 86400)) : 1;
   const { F, dep, To, tAirMean, cEff, ice } = work;
   const qOff = k * ny;
 
   // (0) Land forcing with snow albedo lagged from the previous step (plus the free-troposphere
   //     coupling of high terrain toward the row-mean air temperature); ocean surface state.
   const ft = M.freeTrop;
-  const albOff = cp.landAlbedoOffset;
+  const albOff = cp.albedoOffset;
   const aOff = month * n;
   for (let j = 0; j < ny; j++) {
     const Q = M.insol[qOff + j];
@@ -59,18 +63,22 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
     let rowMean = 0;
     for (let c = 0; c < nx; c++) rowMean += Tc[j * nx + c];
     rowMean /= nx;
+    const moistShift = t.moistLapseReduction > 0 ? (t.moistLapseReduction / 6.5) * Math.min(1, Math.max(0, rowMean / t.moistLapseWarmT)) : 0;
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
       if (land[i]) {
         const a0 = albOff ? aL + albOff[aOff + i] : aL;
         const aSnow = aIce + (t.albedoIceSheet - aIce) * iceSheetWeight(S.Tann[i]);
         const alb = a0 + (aSnow - a0) * snowWeight(Tc[i] - lapse[i]) * snowCoverFactor(S.Tann[i], lapse[i]);
-        F[i] = Q * (1 - alb) - A + B * lapse[i] + ft[i] * rowMean;
+        // Free-troposphere coupling target: the free air at the terrain height follows the moist
+        // adiabat, which in warm climates is shallower than the standard lapse rate Γ (the surface
+        // of a tropical plateau sits in air warmer than T_sl − Γh).
+        F[i] = Q * (1 - alb) - A + B * lapse[i] + ft[i] * (rowMean + moistShift * lapse[i]);
         To[i] = 0;
         ice[i] = 0;
       } else {
         ice[i] = iceFraction(E[i], eFull);
-        To[i] = Tf + Math.max(0, E[i]) / Co;
+        To[i] = Tf + Math.max(0, E[i]) / Co + (Es[i] > 0 ? Es[i] * invCs : 0);
       }
     }
   }
@@ -103,7 +111,12 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
     }
   }
 
-  // (2) Mixed-layer heat advection by currents (pass 2).
+  // (2) Mixed-layer heat advection by currents (pass 2); currents, the overturning and the ocean
+  //     diffusion move the deep mixed layer (To holds its temperature until the end of step 3b).
+  for (let j = 0; j < ny; j++) {
+    const Co = cOcean[j];
+    for (let i = j * nx; i < (j + 1) * nx; i++) if (!land[i]) To[i] = Tf + Math.max(0, E[i]) / Co;
+  }
   const seaSt = cp.sea ? cp.sea[month] : null;
   if (seaSt && cp.nearestOcean) {
     const near = cp.nearestOcean;
@@ -139,7 +152,7 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
     const Co = cOcean[j];
     const cdo = Co / dt;
     const cdi = cI / dt;
-    const saW = Q * (1 - albWater[j]);
+    const saWRow = Q * (1 - albWater[j]);
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
       if (land[i]) {
@@ -147,19 +160,47 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
         continue;
       }
       cEff[i] = cA;
+      const saW = albOff ? saWRow - Q * albOff[aOff + i] : saWRow;
       const lu = upw ? upw[uOff + i] : 0;
       const ts = tSub ? tSub[i] : Tf;
       const ta = tAirMean[i];
       let e = E[i];
       let ti = Ti[i];
+      let es = Es[i];
       if (e >= 0) {
         const to = Tf + e / Co;
-        let toNew = (cdo * to + saW - A + lu * ts + gam * ta) / (cdo + B + lu + gam);
-        // Convective thermostat: deep convection sheds heat steeply above ~28 °C.
-        if (toNew > tConv) toNew = (cdo * to + saW - A + lu * ts + gam * ta + kConv * tConv) / (cdo + B + lu + gam + kConv);
-        e = Co * (toNew - Tf);
-        if (e < 0) ti = Math.min(Tf, ta);
+        const t1 = to + es * invCs;
+        const F0 = saW - A + lu * ts + gam * ta;
+        const lam = B + lu + gam;
+        if (Cs > 0 && Cs < Co && (es > 0 || F0 - lam * t1 > 0)) {
+          // Stratified (or stratifying) surface layer takes the surface flux; once cooling has
+          // eroded it, the rest of the cooling reaches the deep mixed layer.
+          const cds = Cs / dt;
+          let t1New = (cds * t1 + F0) / (cds + lam);
+          if (t1New > tConv) t1New = (cds * t1 + F0 + kConv * tConv) / (cds + lam + kConv);
+          es += Cs * (t1New - t1);
+          if (es < 0) {
+            e += es;
+            es = 0;
+          }
+          // Wind stirring mixes the stratified heat down.
+          const d = es * stratMix;
+          es -= d;
+          e += d;
+        } else {
+          let toNew = (cdo * to + F0) / (cdo + lam);
+          // Convective thermostat: deep convection sheds heat steeply above ~28 °C.
+          if (toNew > tConv) toNew = (cdo * to + F0 + kConv * tConv) / (cdo + lam + kConv);
+          e = Co * (toNew - Tf);
+        }
+        if (e < 0) {
+          ti = Math.min(Tf, ta);
+          e += es;
+          es = 0;
+        }
       } else {
+        e += es;
+        es = 0;
         const a = Math.min(1, -e / eFull);
         const hi = Math.max(hFull, -e / Lf);
         const K = kIce / (hi + hSnow);
@@ -187,9 +228,30 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
       const aNew = iceFraction(e, eFull);
       if (aNew > 0 && ice[i] === 0) ti = Math.min(Tf, ta);
       E[i] = e;
+      Es[i] = es;
       Ti[i] = ti;
       To[i] = Tf + Math.max(0, e) / Co;
       ice[i] = aNew;
+    }
+  }
+
+  // (3a) Interhemispheric overturning: steady heat source/sink of the ocean (melts ice where released).
+  const moc = M.overturning;
+  if (moc) {
+    for (let j = 0; j < ny; j++) {
+      const Co = cOcean[j];
+      for (let c = 0; c < nx; c++) {
+        const i = j * nx + c;
+        const q = moc[i];
+        if (q === 0 || land[i]) continue;
+        let e = E[i] + dt * q;
+        if (e < -eMax) e = -eMax;
+        const aNew = iceFraction(e, eFull);
+        if (aNew > 0 && ice[i] === 0) Ti[i] = Math.min(Tf, tAirMean[i]);
+        E[i] = e;
+        ice[i] = aNew;
+        To[i] = Tf + Math.max(0, e) / Co;
+      }
     }
   }
 
@@ -225,8 +287,31 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
     for (let i = 0; i < n; i++) if (land[i]) cEff[i] = cL;
   }
 
-  // (4–5) Implicit diffusion of the air column: rows (periodic) then columns.
-  diffuse(M, Tc, cEff, M.kE, M.kN, M.kS);
+  // Surface (stratified-layer) temperature for the monthly SST and the annual memory.
+  if (Cs > 0) for (let i = 0; i < n; i++) if (!land[i] && Es[i] > 0) To[i] += Es[i] * invCs;
+
+  // (4–5) Implicit diffusion of the air column: rows (periodic) then columns. Over cold, snow-covered
+  //       land a stable surface layer decouples the ground air from the transient eddies: the
+  //       face couplings are scaled by the mean stability factor of the two cells.
+  if (t.stableLandDiffusion < 1) {
+    const sf = work.stab;
+    // Ice sheets keep their own (inversion) factor in kE/kN/kS.
+    for (let i = 0; i < n; i++) {
+      sf[i] = land[i] ? 1 - (1 - t.stableLandDiffusion) * snowWeight(Tc[i] - lapse[i]) * (1 - iceSheetWeight(S.Tann[i])) : 1;
+    }
+    const { kE, kN, kS } = M;
+    const sE = work.kE2, sN = work.kN2, sS = work.kS2;
+    for (let j = 0; j < ny; j++) {
+      for (let c = 0; c < nx; c++) {
+        const i = j * nx + c;
+        const e = j * nx + (c === nx - 1 ? 0 : c + 1);
+        sE[i] = kE[i] * 0.5 * (sf[i] + sf[e]);
+        sN[i] = j > 0 ? kN[i] * 0.5 * (sf[i] + sf[i - nx]) : kN[i];
+        sS[i] = j < ny - 1 ? kS[i] * 0.5 * (sf[i] + sf[i + nx]) : kS[i];
+      }
+    }
+    diffuse(M, Tc, cEff, sE, sN, sS);
+  } else diffuse(M, Tc, cEff, M.kE, M.kN, M.kS);
 
   // (6) Annual memory of the surface temperature.
   const rate = 1 / M.stepsPerYear;

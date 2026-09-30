@@ -37,8 +37,14 @@ export class ImplicitDiffusion {
     this.colSupPrime = new Float64Array(n);
   }
 
-  /** Prefactor both systems for diffusivity K (m²/s, per cell) and time step dt (s). */
-  setup(K: ArrayLike<number>, dt: number): void {
+  /**
+   * Prefactor both systems for diffusivity K (m²/s, per cell) and time step dt (s). With `height`
+   * (m, per cell) each face's diffusivity is multiplied by exp(−|Δheight|/blockHeight) (terrain
+   * blocking; symmetric, so Σ area·W stays conserved).
+   */
+  setup(K: ArrayLike<number>, dt: number, height: ArrayLike<number> | null = null, blockHeight = 0): void {
+    const block = height && blockHeight > 0 ? 1 / blockHeight : 0;
+    const fb = (a: number, b: number): number => (block > 0 ? Math.exp(-Math.abs(height![a] - height![b]) * block) : 1);
     const { w, h, dLon, dLat, cosLat, faceCos } = this.g;
     const sub = new Float64Array(w);
     const diag = new Float64Array(w);
@@ -51,8 +57,8 @@ export class ImplicitDiffusion {
       for (let c = 0; c < w; c++) {
         const ce = c + 1 < w ? c + 1 : 0;
         const cw = c > 0 ? c - 1 : w - 1;
-        const aE = f * 0.5 * (K[row + c] + K[row + ce]);
-        const aW = f * 0.5 * (K[row + c] + K[row + cw]);
+        const aE = f * 0.5 * (K[row + c] + K[row + ce]) * fb(row + c, row + ce);
+        const aW = f * 0.5 * (K[row + c] + K[row + cw]) * fb(row + c, row + cw);
         sub[c] = -aW;
         sup[c] = -aE;
         diag[c] = 1 + aE + aW;
@@ -90,8 +96,8 @@ export class ImplicitDiffusion {
       const invCos = 1 / Math.max(cosLat[r], 1e-6);
       for (let c = 0; c < w; c++) {
         const i = r * w + c;
-        const aN = r > 0 ? cf * faceCos[r] * invCos * 0.5 * (K[i] + K[i - w]) : 0;
-        const aS = r < h - 1 ? cf * faceCos[r + 1] * invCos * 0.5 * (K[i] + K[i + w]) : 0;
+        const aN = r > 0 ? cf * faceCos[r] * invCos * 0.5 * (K[i] + K[i - w]) * fb(i, i - w) : 0;
+        const aS = r < h - 1 ? cf * faceCos[r + 1] * invCos * 0.5 * (K[i] + K[i + w]) * fb(i, i + w) : 0;
         const pivot = 1 + aN + aS - (r > 0 ? -aN * this.colSupPrime[i - w] : 0);
         const ip = 1 / pivot;
         this.colSub[i] = -aN;

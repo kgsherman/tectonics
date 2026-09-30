@@ -16,6 +16,14 @@ export function satVaporPressure(tC: number): number {
   return 611.2 * Math.exp((17.67 * t) / (t + 243.5));
 }
 
+/** Saturation vapour pressure over ice relative to over (supercooled) water at tC ≤ 0 (1 above 0 °C). */
+export function iceToWaterSaturation(tC: number): number {
+  if (!(tC < 0)) return 1;
+  const t = tC < T_MIN ? T_MIN : tC;
+  // Magnus over ice (Alduchov & Eskridge 1996) / Bolton over water.
+  return Math.exp((22.587 * t) / (t + 273.86) - (17.67 * t) / (t + 243.5));
+}
+
 /**
  * Saturation column water (kg/m² = mm) for a column whose surface air is at tC:
  * W_sat = H_w · ρ_v,sat = H_w · e_s / (R_v T). Uses the vapour density, which does not depend on

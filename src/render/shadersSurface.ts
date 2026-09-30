@@ -1,12 +1,22 @@
 /**
  * Globe surface shader: base (sRGB), overlay (premultiplied) and height (R16F) textures in one pass.
  *
- * Textures are row-0-north equirect rasters sampled at st = (uv.x, 1 − uv.y) (the "flip v in the
- * shader" option of SPEC §2). Normals are object-space, computed from central differences of the
- * height texture with the 1/cosφ metric (no tangent attributes); the difference step grows with the
- * pixel footprint so distant relief is shaded from the matching mip level instead of aliasing.
+ * Textures are row-0-north equirect rasters. The fragment derives its texture coordinate from the
+ * interpolated sphere direction (exact at any zoom, no per-triangle UV warping near the poles);
+ * texture derivatives are unwrapped across the antimeridian so mip selection has no seam.
+ *
+ * Two sampling regimes, blended by how many screen pixels a texel covers:
+ *  - minified / ~1:1: hardware trilinear + anisotropic sampling; normals from central differences
+ *    whose step grows with the pixel footprint (distant relief is shaded from the matching mip);
+ *  - magnified (texel ≥ ~2 px): sub-texel reconstruction (GLSL_TERRAIN_RECON): smooth anti-aliased
+ *    coastline from the Catmull-Rom height, land/sea colors reconstructed per class (no bleeding),
+ *    C1 relief normals, plus procedural detail (albedo ±~6 %, normals, fractal coast breakup) that
+ *    fades in octave by octave with zoom and is scaled by slope/elevation (GLSL_TERRAIN_DETAIL).
+ * Relief normals are object-space from the height gradient with the 1/cosφ metric (no tangents).
  */
-import { GLSL_BASIS, GLSL_CONSTANTS, GLSL_SRGB } from './shadersCommon';
+import {
+  GLSL_BASIS, GLSL_CONSTANTS, GLSL_RELIEF_RESPONSE, GLSL_SRGB, GLSL_TERRAIN_DETAIL, GLSL_TERRAIN_RECON,
+} from './shadersCommon';
 
 export const SURFACE_VERTEX = /* glsl */ `
 uniform sampler2D uHeight;
@@ -40,15 +50,23 @@ export const SURFACE_FRAGMENT = /* glsl */ `
 ${GLSL_CONSTANTS}
 ${GLSL_SRGB}
 ${GLSL_BASIS}
+${GLSL_TERRAIN_RECON}
+${GLSL_TERRAIN_DETAIL}
+${GLSL_RELIEF_RESPONSE}
 uniform sampler2D uBase;
 uniform float uHasBase;
+uniform vec2 uBaseSize;
 uniform sampler2D uOverlay;
 uniform float uHasOverlay;
 uniform sampler2D uHeight;
 uniform float uHasHeight;
 uniform vec2 uHeightTexel;
+uniform vec2 uHeightSize;
+uniform float uSameSize;
 uniform float uSeaLevel;
 uniform float uShadeScale;
+uniform float uDetail;
+uniform float uRecon;
 uniform int uLightMode;
 uniform vec3 uSunDir;
 uniform vec3 uCamUpLeft;
@@ -66,9 +84,16 @@ varying vec3 vWorld;
 // Relief light elevation above the local horizon (35°).
 const float SIN_ALT = 0.573576;
 const float COS_ALT = 0.819152;
+// Largest shading tilt (tan of the normal's deviation): steep exaggerated slopes saturate instead of
+// turning into black walls / blown-out faces.
+const float MAX_TILT = 1.6;
 
-float seaClampedHeight(vec2 st) {
-  return max(texture(uHeight, st).r, uSeaLevel);
+float seaClampedHeight(vec2 st, vec2 dx, vec2 dy) {
+  return max(textureGrad(uHeight, st, dx, dy).r, uSeaLevel);
+}
+
+vec3 saturateTilt(vec3 t) {
+  return t * inversesqrt(1.0 + dot(t, t) * (1.0 / (MAX_TILT * MAX_TILT)));
 }
 
 // Anti-aliased mask of lines at multiples of stepSize; widthPx wide on screen (fw = fwidth(x)).
@@ -79,35 +104,107 @@ float lineMask(float x, float stepSize, float fw, float widthPx) {
 
 void main() {
   vec3 n0 = normalize(vDir);
-  vec2 st = vec2(vUv.x, 1.0 - vUv.y);
-  float lat = (vUv.y - 0.5) * PI;
-  float lon = vUv.x * TWO_PI - PI;
+  float lat = asin(clamp(n0.y, -1.0, 1.0));
+  float lon = atan(-n0.z, n0.x);
+  vec2 st = vec2(lon * (1.0 / TWO_PI) + 0.5, 0.5 - lat * (1.0 / PI));
+  // Screen derivatives of st with the antimeridian jump removed (|Δs| < 0.5 everywhere else).
+  vec2 dsx = dFdx(st), dsy = dFdy(st);
+  dsx.x -= floor(dsx.x + 0.5);
+  dsy.x -= floor(dsy.x + 0.5);
+  vec2 fwSt = abs(dsx) + abs(dsy);
+  // Angular size of a screen pixel on the sphere.
+  float pxRad = max(max(length(dFdx(n0)), length(dFdy(n0))), 1e-7);
+  float lonW = lon < 0.0 ? lon + TWO_PI : lon;
+  float fwLat = fwidth(lat), fwLon = min(fwidth(lon), fwidth(lonW));
   vec3 east, north;
   geoBasis(lat, lon, east, north);
+  float cosLat = max(cos(lat), 0.5 * uHeightTexel.y * PI);
+  bool lit = uLightMode != 0;
+  bool hasH = uHasHeight > 0.5;
 
-  vec3 col = uHasBase > 0.5 ? texture(uBase, st).rgb : vec3(0.015, 0.02, 0.03);
+  // Magnification: 0 while a texel covers ≤ 1 px, 1 once it covers ≥ 2 px.
+  vec2 texSize = uHasBase > 0.5 ? uBaseSize : uHeightSize;
+  float texRad = PI / max(texSize.y, 1.0);
+  // Only for one shared raster: a base painted on another grid has its own land/sea mask, so per-class
+  // colours around the height contour would show a second, blocky coastline (hardware path instead).
+  bool oneRaster = uSameSize > 0.5 || uHasBase < 0.5;
+  float k = hasH && oneRaster ? uRecon * smoothstep(1.0, 0.5, pxRad / texRad) : 0.0;
 
-  vec3 n = n0;
-  float ocean = 0.0;
-  if (uHasHeight > 0.5) {
-    ocean = step(texture(uHeight, st).r, uSeaLevel);
-    if (uLightMode != 0) {
-      vec2 d = max(uHeightTexel, fwidth(st));
-      float hE = seaClampedHeight(st + vec2(d.x, 0.0));
-      float hW = seaClampedHeight(st - vec2(d.x, 0.0));
-      float hN = seaClampedHeight(st - vec2(0.0, d.y));
-      float hS = seaClampedHeight(st + vec2(0.0, d.y));
-      float cosLat = max(cos(lat), 0.5 * uHeightTexel.y * PI);
+  // Hardware-filtered height (uniform control flow: its derivative gives the coast AA width).
+  float hLin = hasH ? textureGrad(uHeight, st, dsx, dsy).r : uSeaLevel - 1.0;
+  float fwH = fwidth(hLin);
+
+  vec3 col = vec3(0.015, 0.02, 0.03);
+  vec3 tilt = vec3(0.0);
+  float land = 0.0;
+  float detailAlbedo = 0.0;
+  float rough = 0.0;
+
+  if (k < 1.0) {
+    vec3 c = uHasBase > 0.5 ? textureGrad(uBase, st, dsx, dsy).rgb : col;
+    float l = hasH ? smoothstep(-0.5, 0.5, (hLin - uSeaLevel) / max(fwH, 1e-3)) : 0.0;
+    vec3 t = vec3(0.0);
+    if (hasH && lit) {
+      vec2 d = max(uHeightTexel, fwSt);
+      float hE = seaClampedHeight(st + vec2(d.x, 0.0), dsx, dsy);
+      float hW = seaClampedHeight(st - vec2(d.x, 0.0), dsx, dsy);
+      float hN = seaClampedHeight(st - vec2(0.0, d.y), dsx, dsy);
+      float hS = seaClampedHeight(st + vec2(0.0, d.y), dsx, dsy);
       // Surface gradient in metres per radian of arc: d/dx = (1/cosφ) d/dλ, d/dy = d/dφ.
       float gE = (hE - hW) / (2.0 * d.x * TWO_PI * cosLat);
       float gN = (hN - hS) / (2.0 * d.y * PI);
-      n = normalize(n0 - uShadeScale * (gE * east + gN * north));
+      // Seas render flat: the clamped gradient still rises toward the coast on the sea side.
+      t = uShadeScale * l * (gE * east + gN * north);
     }
+    col = c;
+    land = l;
+    tilt = t;
   }
+
+  if (k > 0.0) {
+    vec3 warp = vec3(0.0);
+    float ridgeW = smoothstep(400.0, 2500.0, hLin - uSeaLevel);
+    vec4 det = uDetail > 0.0 ? terrainDetail(n0, texRad, pxRad, ridgeW, warp) : vec4(0.0);
+    // Fractal coast breakup by domain warping the lookup (≤ ~0.4 texel, tangent to the sphere).
+    warp = uDetail * (warp - dot(warp, n0) * n0);
+    vec2 stw = st + vec2(dot(warp, east) / (TWO_PI * cosLat), -dot(warp, north) / PI);
+    TerrainSample ts = reconstructTerrain(uHeight, uHeightSize, uBase, uBaseSize, uSameSize > 0.5, uHasBase > 0.5, stw, uSeaLevel);
+    // Height texel angle (the reconstruction works in height texels).
+    float texRadH = PI / uHeightSize.y;
+    // Real (unexaggerated) slope and elevation drive how rugged the procedural detail is.
+    float slopeReal = length(ts.g) / (texRadH * 6371000.0);
+    float above = max(ts.h - uSeaLevel, 0.0);
+    float r = clamp(max(smoothstep(0.004, 0.05, slopeReal), smoothstep(250.0, 3000.0, above)), 0.0, 1.0);
+    // Coast = zero contour of the squashed height, anti-aliased over one pixel (analytic gradient).
+    float aa = max(length(ts.gm) * (pxRad / texRadH), 1e-4);
+    float l = smoothstep(-0.5, 0.5, ts.m / aa);
+    vec3 c = uHasBase > 0.5 ? mix(ts.seaCol, ts.landCol, l) : col;
+    vec3 t = vec3(0.0);
+    if (lit) {
+      vec2 gt = terrainGradient(ts, texRadH / pxRad);
+      float gE = gt.x * uHeightSize.x / (TWO_PI * cosLat);
+      float gN = -gt.y * uHeightSize.y / PI;
+      t = uShadeScale * l * (gE * east + gN * north);
+      vec3 dg = det.yzw - dot(det.yzw, n0) * n0;
+      t += (uDetail * l * (0.04 + 0.3 * r)) * dg;
+    }
+    col = mix(col, c, k);
+    land = mix(land, l, k);
+    tilt = mix(tilt, t, k);
+    detailAlbedo = k * l * det.x;
+    rough = r;
+  }
+
+  vec3 n = normalize(n0 - saturateTilt(tilt));
+  float ocean = hasH ? 1.0 - land : 0.0;
 
   vec3 V = normalize(cameraPosition - vWorld);
   float nv = max(dot(n0, V), 0.0);
   float overlayLight = 1.0;
+  if (lit) {
+    // Albedo detail (lit modes only: flat mode keeps exact legend colors).
+    col *= 1.0 + uDetail * (0.14 + 0.06 * rough) * detailAlbedo;
+  }
   if (uLightMode == 1) {
     // Hillshade with the light 35° above the local horizon toward screen up-left, evaluated per
     // fragment so the whole visible hemisphere is evenly lit; 1.0 on flat ground.
@@ -115,31 +212,40 @@ void main() {
     float tl = length(t);
     vec3 T = tl > 1e-4 ? t / tl : north;
     vec3 L = n0 * SIN_ALT + T * COS_ALT;
-    // Shadowed slopes darken fully; lit slopes brighten less (bright surfaces would clip).
-    float rel = dot(n, L) / SIN_ALT;
-    float shade = rel < 1.0 ? max(0.28, mix(1.0, rel, 0.85)) : min(1.35, 1.0 + 0.45 * (rel - 1.0));
+    float shade = reliefShade(dot(n, L) / SIN_ALT);
     col *= shade * (0.8 + 0.2 * nv);
-    col = mix(col, uAtmoColor, 0.3 * pow(1.0 - nv, 3.0));
+    col = mix(col, uAtmoColor * 0.9, 0.28 * pow(1.0 - nv, 3.0));
   } else if (uLightMode == 2) {
     float mu0 = dot(n0, uSunDir);
     float day = smoothstep(-0.10, 0.12, mu0);
     // Relief can catch light just past the terminator (peaks at dawn), never deep on the night side.
-    float diff = max(dot(n, uSunDir), 0.0) * smoothstep(-0.05, 0.04, mu0);
-    col = col * (1.05 * diff + 0.05 * day + 0.012) + vec3(0.0012, 0.0018, 0.0035) * (1.0 - day);
-    vec3 H = normalize(uSunDir + V);
-    float nh = max(dot(n0, H), 0.0);
-    col += ocean * day * (0.7 * pow(nh, 260.0) + 0.04 * pow(nh, 24.0)) * vec3(1.0, 0.93, 0.8);
-    col = mix(col, uAtmoColor * 1.15, 0.45 * pow(1.0 - nv, 3.0) * smoothstep(-0.25, 0.3, mu0));
+    float nl = dot(n, uSunDir);
+    float diff = max(nl, 0.0) * smoothstep(-0.05, 0.04, mu0);
+    // Sky fill on slopes facing away from the sun (keeps shadowed mountainsides readable).
+    float fill = 0.06 * day * (0.5 + 0.5 * dot(n, n0));
+    col = col * (1.02 * diff + fill + 0.012) + vec3(0.0012, 0.0018, 0.0035) * (1.0 - day);
+    // Sun glint on water only: microfacet (Beckmann, rms wave slope ~0.19) × Schlick Fresnel. A
+    // soft, moderately bright patch, never a saturated white disk.
+    if (ocean > 0.0) {
+      vec3 H = normalize(uSunDir + V);
+      float nh = max(dot(n0, H), 1e-3);
+      float nh2 = nh * nh;
+      const float M2 = 0.036;
+      float D = exp((nh2 - 1.0) / (nh2 * M2)) / (PI * M2 * nh2 * nh2);
+      float F = 0.02 + 0.98 * pow(1.0 - max(dot(H, V), 0.0), 5.0);
+      float spec = D * F / (4.0 * max(nv, 0.08));
+      col += ocean * smoothstep(0.0, 0.08, mu0) * min(spec, 0.6) * 2.2 * vec3(1.0, 0.97, 0.92);
+    }
+    col = mix(col, uAtmoColor * 1.1, 0.4 * pow(1.0 - nv, 3.0) * smoothstep(-0.25, 0.3, mu0));
     overlayLight = mix(0.22, 1.0, day);
   }
 
   if (uHasOverlay > 0.5) {
-    vec4 o = texture(uOverlay, st);
+    vec4 o = textureGrad(uOverlay, st, dsx, dsy);
     if (o.a > 0.003) col = mix(col, srgbToLinear(o.rgb / o.a) * overlayLight, o.a);
   }
 
   if (uGratOn > 0.5) {
-    float fwLat = fwidth(lat), fwLon = fwidth(lon);
     float polarFade = 1.0 - smoothstep(radians(76.0), radians(87.0), abs(lat));
     float minor = max(lineMask(lat, uGratStep, fwLat, 1.0), lineMask(lon, uGratStep, fwLon, 1.0) * polarFade);
     float major = max(lineMask(lat, PI, fwLat, 1.6), lineMask(lon, TWO_PI, fwLon, 1.6) * polarFade);

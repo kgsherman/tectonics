@@ -23,6 +23,7 @@ const GROUP_CAPS: Record<string, number> = {
   climsampler: 4,
   satgrid: 26,
   gridmap: 6,
+  edgelen: 2,
   detail: 4,
 };
 
@@ -34,7 +35,7 @@ const GROUP_CAPS: Record<string, number> = {
  * (A "volatile groups first" rule evicted the CURRENT height field while playing seasons at 2048,
  * forcing a height + river rebuild on every month change.)
  */
-const PROTECTED_GROUPS = new Set(['gridmap', 'detail', 'climsampler']);
+const PROTECTED_GROUPS = new Set(['gridmap', 'detail', 'climsampler', 'edgelen']);
 
 function groupOf(key: string): string {
   const i = key.indexOf('|');

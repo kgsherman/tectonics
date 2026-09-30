@@ -23,6 +23,8 @@ export interface DabSettings {
   oceanAges: Float64Array | null;
   /** Noisy footprint (continent / ocean brushes). */
   rough: DabRoughness | null;
+  /** Continent brush: cells this stroke turned continental are flagged here (coast hygiene). */
+  paintMask?: Uint8Array | null;
 }
 
 /**
@@ -60,6 +62,7 @@ export function applyDab(mut: Mutator, s: DabSettings, c: Vec3, buf: number[]): 
         st.brushRelief[i] = 1;
         st.userElev[i] = 0;
         st.sourceRelief[i] = 0;
+        if (s.paintMask) s.paintMask[i] = 1;
         mut.markCell(i);
         changed++;
       }

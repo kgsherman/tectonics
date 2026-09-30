@@ -14,9 +14,11 @@ import type { HydroGrid } from './moistureGrid';
 import { allocStencil, applyStencil, buildDepartureStencil } from './moistureStencil';
 import type { Stencil } from './moistureStencil';
 import { substepsFor } from './moistureColumn';
-import { hamonPet, monthDayLength, satSpecificHumidity, saturationColumnWater } from './moistureThermo';
+import { hamonPet, iceToWaterSaturation, monthDayLength, satSpecificHumidity, saturationColumnWater } from './moistureThermo';
 
 export interface StaticForcing {
+  /** Smoothed height above sea level h⁺ (m). */
+  hSmooth: Float64Array;
   /** Gradient (m/m) of the smoothed height above sea level h⁺, eastward / northward. */
   hGradX: Float64Array;
   hGradY: Float64Array;
@@ -70,7 +72,7 @@ export interface ForcingScratch {
   stabStencil: Stencil;
 }
 
-function rmsAllMonths(g: HydroGrid, f: Float32Array): number {
+export function rmsAllMonths(g: HydroGrid, f: Float32Array): number {
   let s = 0;
   for (let m = 0; m < 12; m++) {
     const off = m * g.n;
@@ -103,6 +105,7 @@ export function computeStaticForcing(g: HydroGrid, dyn: DynamicsResult, t: Hydro
     for (let r = 0; r < g.h; r++) dayLength[m * g.h + r] = monthDayLength(g.lat[r], m, tilt);
   }
   return {
+    hSmooth: hPlus,
     hGradX,
     hGradY,
     ascentScale: aRms > 1e-30 ? aRms * t.ascentRmsScale : Infinity,
@@ -300,7 +303,10 @@ export function computeMonthForcing(
       const upslope = (dyn.steerU[k] * st.hGradX[i] + dyn.steerV[k] * st.hGradY[i]) * invOroRef;
       const mult = precipMultiplier(asc, baro, upslope, f.stab[i], t);
       f.mult[i] = mult;
-      const r0 = t.gateThreshold - gateThresholdShift(lf, T + lapse - tRef, asc, baro, t);
+      // Ice-phase onset (Wegener–Bergeron–Findeisen): below 0 °C precipitation forms once the column
+      // is saturated with respect to ice, e_si/e_sw of the liquid saturation used for W_sat.
+      const icePhase = t.icePhaseGate > 0 && tCol < 0 ? 1 - t.icePhaseGate * (1 - iceToWaterSaturation(tCol)) : 1;
+      const r0 = t.gateThreshold * icePhase - gateThresholdShift(lf, T + lapse - tRef, asc, baro, t);
       f.gateR0[i] = r0;
       f.substeps[i] = substepsFor(mult, invTauP, t.gateSteepness, r0, dt, t.sinkStiffnessBound, t.maxSinkSubsteps);
 

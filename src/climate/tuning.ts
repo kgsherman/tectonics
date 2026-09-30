@@ -3,8 +3,13 @@
  *
  * The objects are deliberately mutable so a calibration harness (scripts/calibrate.ts) can sweep
  * them; the model reads them at call time. Units are given per field. Values were calibrated
- * against the Earth input (src/climate/earthInput.ts) in stages: temperature, then winds, then
- * currents.
+ * against the Earth input (src/climate/earthInput.ts) in stages (temperature, then winds and
+ * pressure, then currents / SST / sea ice, then precipitation), and finally jointly with the
+ * hydrology constants by coordinate descent on a combined score: zonal-mean temperature and its
+ * band biases, Köppen group shares, reference-city classes, station temperatures, seasonal sea-ice
+ * areas, coastal SST anomalies, western-boundary-current speeds and global precipitation.
+ * Physical meaning takes precedence over the score: mechanisms and bounds follow the literature
+ * values quoted with each constant, and no constant is tied to a place on Earth.
  */
 
 /** Dynamic-core grid and time stepping. */
@@ -25,23 +30,20 @@ export const ebmTuning = {
    * OLR = A + B·T (T in °C at the actual surface height), W/m², W/m²/K. A starts from North et al.
    * (203.3) and is recalibrated for the converged (pass-2 Aitken) spin-up.
    */
-  olrA: 202.3,
+  olrA: 201,
   olrB: 2.09,
   /** Snow/ice-free planetary albedo 0.30 + 0.08·P2(sinφ). */
   albedoBase: 0.29,
-  albedoP2: 0.11,
+  albedoP2: 0.19,
   /** Offset for open ocean relative to land (darker surface). */
   albedoOceanOffset: -0.015,
   /** Planetary albedo over snow and cold sea ice, and over permanent land ice sheets. */
-  albedoIce: 0.58,
+  albedoIce: 0.61,
   albedoIceSheet: 0.68,
   /** Melting sea ice (surface near 0 °C: ponds, wet snow) and its ramp on ice-surface T (°C, ≥ 10 K wide). */
   albedoSeaIceMelt: 0.45,
   seaIceRampCold: -11,
   seaIceRampWarm: -1,
-  /** Land albedo reduction per unit of normalized subsidence (clear skies), capped at subsidenceMax units. */
-  subsidenceAlbedo: 0.03,
-  subsidenceMax: 1.5,
   /** Snow albedo ramp on surface temperature (°C): full snow at ≤ cold, none at ≥ warm (≥ 10 K wide). */
   snowRampCold: -13,
   snowRampWarm: -2,
@@ -62,22 +64,75 @@ export const ebmTuning = {
   /** Ocean mixed layer: ρc (J/m³/K) and depth by latitude (m): depth = min + (max-min)·sin²φ. */
   rhoCpWater: 4.1e6,
   mixedLayerMin: 30,
-  mixedLayerMax: 55,
+  mixedLayerMax: 180,
+  /**
+   * Seasonal stratified surface layer (m, 0 = off) above the winter mixed layer, and the e-folding
+   * time (days) over which wind stirring mixes its heat down.
+   */
+  stratDepth: 25,
+  stratMixDays: 80,
   /** Diffusivity on the unit sphere, W/m²/K: D(φ) = D0·(1 + d2·sin²φ + d4·sin⁴φ) (North 1975 shape). */
   diffusion: 0.56,
   diffusionD2: -0.5,
   diffusionD4: 0,
+  /**
+   * Hadley-cell enhancement of the meridional diffusivity: D·(1 + boost·exp(−(φ/lat)^power)), and
+   * the fraction of the boost applied to zonal faces (Walker circulation).
+   */
+  hadleyBoost: 0.5,
+  hadleyLat: 25,
+  hadleyPower: 6,
+  hadleyZonalFactor: 0,
+  /** Obliquity (deg) up to which the boost applies fully, and at which it has faded out. */
+  hadleyTiltFull: 35,
+  hadleyTiltMax: 65,
   /** Ocean mixed-layer heat diffusion between ocean cells (eddies, overturning), W/m²/K on the unit sphere. */
-  oceanDiffusion: 0.08,
+  oceanDiffusion: 0.3,
+  /**
+   * Meridional ocean diffusion across zonally open channels: × (1 − (1 − factor)·open^power), open =
+   * longest ocean run of the adjacent rows as a fraction of the latitude circle.
+   */
+  channelDiffusionFactor: 0.5,
+  /** Zonal ocean diffusion relative to the meridional one. */
+  oceanZonalDiffusionFactor: 1,
+  /** Interhemispheric overturning heat transport (PW) for a single-hemisphere circumpolar channel (energyOverturning.ts). */
+  overturningPW: 0.4,
+  channelDiffusionPower: 4,
   /** Free-troposphere coupling of high terrain: k·min(1, (h/height)²), W/m²/K and m. */
-  freeTropCoupling: 8,
+  freeTropCoupling: 10,
   freeTropHeight: 3000,
+  /**
+   * Moist-adiabatic lapse of the free troposphere: the free-troposphere coupling pulls high terrain
+   * toward T_row − (Γ − reduction·clamp(T_row/moistLapseWarmT, 0, 1))·h with reduction in K/km
+   * (T_row = the row-mean sea-level air temperature, °C).
+   */
+  moistLapseReduction: 1.5,
+  moistLapseWarmT: 25,
+  /** Air diffusion factor over fully snow-covered (cold) land: stable surface layers (1 = off). */
+  stableLandDiffusion: 1,
   /** Diffusivity factor over land (weaker low-level eddy mixing into continental interiors). */
-  landDiffusionFactor: 1.0,
+  landDiffusionFactor: 1,
   /** Diffusivity factor over high polar plateaus (ice sheets: strong surface inversions), poleward of iceSheetLat above iceSheetHeight (m). */
   iceSheetDiffusionFactor: 0.2,
   iceSheetLat: 60,
   iceSheetHeight: 1500,
+  /**
+   * Snow-surface inversion of the reported land temperature (surfaceInversion.ts): up to
+   * inversionMax K under full snow cover when the daily insolation is far below inversionInsolation
+   * (W/m²), shaped by inversionPower.
+   */
+  inversionMax: 7,
+  inversionInsolation: 250,
+  inversionPower: 1.5,
+  /** Terrain slope (m/km) over which katabatic mixing weakens the inversion by 1/e (0 = no slope effect). */
+  inversionSlope: 13,
+  /**
+   * Cloud cover (0..1) below which the inversion is full and above which it vanishes: surface
+   * inversions form under clear skies (longwave cooling of the snow); overcast, windy maritime
+   * winters keep the surface layer mixed. clear ≥ overcast disables the cloud dependence.
+   */
+  inversionCloudClear: 0.6,
+  inversionCloudOvercast: 0.9,
   /** Sea-water freezing point °C. */
   freezeT: -1.8,
   /** Sea ice: latent heat per unit volume J/m³, thickness at which a cell is fully covered (m), max thickness (m). */
@@ -86,16 +141,21 @@ export const ebmTuning = {
   iceMaxThickness: 6,
   /** Conductive coupling k/(h + h_snow), W/m/K and m of equivalent snow insulation. */
   iceConductivity: 2.0,
-  iceSnowEquivalent: 0.35,
+  iceSnowEquivalent: 1.5,
   /** Upwelling cooling ∝ ρc·w⁺·efficiency·(SST − T_sub), T_sub = zonal annual SST − upwellingDeltaT. */
-  upwellingEfficiency: 2.0,
+  upwellingEfficiency: 4,
   upwellingDeltaT: 6,
+  /**
+   * Temperature of the deep water below polar surface layers (°C): T_sub ≥ min(zonal + ΔT, this), so
+   * upwelling of warmer deep water limits sea ice (Antarctic divergence).
+   */
+  deepWaterT: 1.5,
   /** Thermocline tilt: T_sub is up to this much colder at the eastern coast (warmer at the western). */
   upwellingTiltDeltaT: 7,
   /** Air heat advection: effective velocity = factor × steering wind (boundary-layer heat content). */
   heatAdvectionFactor: 0.4,
   /** Coupling of warm advection over a colder surface (stable inversion) relative to cold advection. */
-  stableAdvectionFactor: 0.6,
+  stableAdvectionFactor: 0.5,
   /** Air advected across a terrain step Δh (cold air uphill, warm air downhill) couples with exp(−|Δh|/leeHeight). */
   leeHeight: 700,
   /** Mixed-layer heat advection: effective velocity = factor × surface current × params.oceanCurrents. */
@@ -109,16 +169,41 @@ export const ebmTuning = {
 };
 
 /**
+ * Cloud regimes in the pass-2 planetary albedo (dynCloud.ts): offsets per unit of normalized
+ * subsidence (−ascent, capped at subsidenceMax), storm-track index (baroclinic, capped at stormMax,
+ * this share from the annual mean) and cold-SST anomaly (relative to the row's ocean mean, / stratusRefK,
+ * capped at 1; × (1 + stratusSubsidence·subsidence)).
+ */
+export const cloudAlbedoTuning = {
+  subsidenceLand: 0.11,
+  /** Convective cloud over land per unit of normalized ascent (capped at ascentMax). */
+  ascentLand: 0.02,
+  ascentMax: 2,
+  subsidenceOcean: 0.06,
+  subsidenceMax: 1.5,
+  stormLand: 0,
+  stormOcean: 0.04,
+  stormMax: 1.5,
+  stormAnnualWeight: 0.5,
+  stratus: 0.08,
+  stratusRefK: 4,
+  stratusSubsidence: 0.5,
+};
+
+/**
  * Spin-up schedule (model years). Pass-1 years are spin-up years before the diagnosed (monthly
  * output) year; pass-2 years include the output year. Aitken extrapolates the ocean enthalpy
  * after every second spin-up year. Pass 2 starts ~3 K warmer than its own equilibrium (upwelling
  * and current transport cool the uncoupled pass-1 climate) and needs its Aitken step to converge.
+ * The pass-1 climate also sets pass 2's circulation, upwelling source temperature and cloud
+ * regimes, so fast mode spins pass 1 up as well (without it the fast climate ran ~1.5 K warmer
+ * than the full one); a warm-started full solve needs 3 years for the deep winter mixed layer.
  */
 export const spinupTuning = {
   full: { pass1Years: 2, pass1Aitken: true, pass2Years: 4, pass2Aitken: true },
-  fast: { pass1Years: 0, pass1Aitken: false, pass2Years: 3, pass2Aitken: true },
+  fast: { pass1Years: 2, pass1Aitken: true, pass2Years: 3, pass2Aitken: true },
   /** With a warm start pass 1 keeps the cold schedule above and pass 2 starts from the warm state. */
-  warmFull: { pass2Years: 2, pass2Aitken: false },
+  warmFull: { pass2Years: 3, pass2Aitken: false },
   warmFast: { pass2Years: 1, pass2Aitken: false },
   /** Steady (annual-mean) solve: albedo outer iterations and CG tolerance (K). */
   steadyAlbedoIters: 3,
@@ -136,15 +221,26 @@ export const pressureTuning = {
   itczWidth: 9,
   /** Subtropical highs. */
   subtropicalLat: 31,
-  subtropicalAmp: 9,
+  subtropicalAmp: 12,
   subtropicalWidth: 13,
+  /** Subtropical-high amplitude over (smoothed) land relative to the ocean amplitude. */
+  subtropicalLandFactor: 0.45,
   /** Subpolar lows: land / ocean amplitudes (ocean lows are deeper). */
   subpolarLat: 62,
-  subpolarAmpLand: 6,
-  subpolarAmpOcean: 16,
+  subpolarAmpLand: 2,
+  subpolarAmpOcean: 10,
   subpolarWidth: 13,
+  /**
+   * Deepening of the subpolar trough over a zonally open ocean (circumpolar storm track): factor
+   * 1 + channelBoost·clamp((f_ocean − channelStart)/(1 − channelStart)), f_ocean = ocean share of the
+   * band subpolarLat − channelBandLow .. subpolarLat + channelBandHigh (deg).
+   */
+  channelBoost: 1.3,
+  channelStart: 0.7,
+  channelBandLow: 8,
+  channelBandHigh: 3,
   /** Polar highs. */
-  polarAmp: 6,
+  polarAmp: 7,
   polarWidth: 12,
   /** Belt shift with the thermal equator decays with distance from it (deg). */
   shiftDecay: 35,
@@ -160,9 +256,9 @@ export const pressureTuning = {
   /** Scale = (G/G_ref)^exponent (sub-linear: summer belts weaken but persist). */
   gradientExponent: 0.5,
   /** Thermal term ΔP = −k·(T_slr − T_ref(lat)), hPa/K, smoothing length km. */
-  thermalK: 0.8,
+  thermalK: 1,
   /** Weight of the all-cell zonal mean in T_ref (0 = ocean-only reference). */
-  refAllCellWeight: 0.5,
+  refAllCellWeight: 0,
   thermalSmoothKm: 500,
   thermalMax: 28,
   /** Final smoothing length for the belt field and the land fraction used for ocean/land amplitudes, km. */
@@ -176,12 +272,29 @@ export const windTuning = {
   /** Rayleigh friction, s⁻¹. */
   rOcean: 3.7e-5,
   rLand: 7e-5,
+  /**
+   * Latitude-dependent friction: r = max(rMin, |f|·tan α) with boundary-layer turning angles α
+   * (deg) over ocean and land; α ≤ 0 selects the constant rOcean / rLand above.
+   */
+  frictionAngleOcean: 16,
+  frictionAngleLand: 35,
+  rMinOcean: 3e-5,
+  rMinLand: 3e-5,
   coastSmoothKm: 300,
   /** Polar filter start latitude (deg). */
   polarFilterLat: 60,
   maxSpeed: 30,
   /** Steering wind: rotate half-way back toward geostrophic, times this factor. */
   steerFactor: 1.2,
+  /** Thermal-wind shear added to the steering wind: depth (m, 0 = off), |f| floor latitude (deg), cap (m/s). */
+  steerThermalHeight: 1500,
+  steerThermalMinLat: 15,
+  steerThermalMax: 12,
+  /** Thermal-wind term fades in from this latitude over the given width (deg); 0 = from the equator. */
+  steerThermalFadeLat: 45,
+  steerThermalFadeWidth: 15,
+  /** Share of the thermal-wind shear in the boundary-layer flow used for heat advection. */
+  heatThermalShare: 0.75,
   /** Steering rotation tapers to 0 at the equator over this latitude (deg). */
   steerEquatorTaper: 8,
   /** Ascent (frictional convergence) smoothing (km) and normalization (s⁻¹ ↦ 1). */
@@ -190,19 +303,23 @@ export const windTuning = {
   /** Baroclinicity: smoothing (km) and normalization of |∂T/∂y|·westerly (K/1000 km · m/s ↦ 1). */
   baroSmoothKm: 500,
   baroRef: 40,
+  /** Weight of the steering-wind speed (vs the westerly component) in the storm-track proxy. */
+  baroSpeedWeight: 0.75,
 };
 
 /** Wind-driven ocean (SPEC §6.1.6). */
 export const oceanTuning = {
   rhoWater: 1025,
   /** Stommel boundary-layer width δ_S = r/β_eq (km). */
-  stommelWidthKm: 275,
+  stommelWidthKm: 200,
   /**
    * Friction on meridional faces relative to zonal ones in zonally blocked basins (anisotropic
    * bottom friction) and the power of the row openness that restores full friction in open channels.
    */
   meridionalFriction: 0.05,
   channelOpennessPower: 4,
+  /** Friction factor (× r) on meridional faces of zonally open channels (form drag on the circumpolar current). */
+  channelFriction: 10,
   /** Stommel-solver land threshold on the core land fraction (closes narrow isthmuses such as Panama). */
   solverLandThreshold: 0.3,
   /** Latitude of the channel walls (deg). */
@@ -212,11 +329,16 @@ export const oceanTuning = {
   /** Wind stress: ρ_a C_d sqrt(|u|² + σ²) u. */
   dragCoeff: 1.3e-3,
   gustiness: 3,
+  /** Storm-track gustiness (m/s) per unit of the normalized baroclinic index (capped at stormGustinessMax). */
+  stormGustiness: 0,
+  stormGustinessMax: 2,
   /** Easterly row-mean stress (N/m²) giving the full thermocline tilt. */
   thermoclineTiltStressRef: 0.04,
   curlSmoothPasses: 2,
   /** Surface velocity = transport / effectiveDepth (m), calibrated once on Earth. */
-  effectiveDepth: 50,
+  effectiveDepth: 40,
+  /** Latitude scale (deg) of the equatorial taper of the zonal geostrophic surface current (0 = off). */
+  equatorTaperLat: 5,
   maxCurrent: 2.5,
   /** Ekman: regularization latitude (deg) and surface drift depth (m). */
   ekmanRegLat: 3,

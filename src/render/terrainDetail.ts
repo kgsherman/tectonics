@@ -9,10 +9,11 @@
  *
  * Channels (dimensionless):
  *   CH_RIDGE  ridged multifractal, ≈[0, 1], mean DetailTexture.ridgeMean (mountains)
- *   CH_HILL   octaves > SPLIT_F of a domain-warped fbm, ≈[-1, 1] (hills, abyssal hills, the fine
- *             part of the coastline breakup, vegetation patchiness)
- *   CH_COAST  octaves ≤ SPLIT_F of the same warped fbm, ≈[-1, 1] (coastline breakup, combined
- *             with the fine octaves as CH_COAST + HILL_IN_COAST·CH_HILL).
+ *   CH_HILL   octaves > SPLIT_F of a (weakly, isotropically) domain-warped fbm, ≈[-1, 1] (hills,
+ *             abyssal hills, vegetation patchiness); a softer band limit keeps ~2-texel features
+ *   CH_COAST  the same fine octaves (same noise values) with a whiter spectrum (COAST_GAIN), ≈[-1, 1]:
+ *             coastline breakup — many small headlands, coves and skerries per unit of displaced
+ *             area, rather than broad shifts of the simulated coast.
  *   CH_LITH   very-low-frequency fbm, ≈[-1, 1] (lithology / soil colour variation)
  */
 import { createNoise3 } from '../core/noise';
@@ -40,6 +41,8 @@ interface OctaveSet {
 const FBM: OctaveSet = { f0: 2.6, gain: 0.6, octaves: 8 };
 /** Gain of the fine (> SPLIT_F) octaves: whiter than the coarse ones so pixel-scale texture survives. */
 const FINE_GAIN = 0.74;
+/** Gain of the fine octaves in CH_COAST (whiter still: crisp, fractal coastlines). */
+const COAST_GAIN = 0.88;
 const RIDGE: OctaveSet = { f0: 7, gain: 0.6, octaves: 7 };
 /** Gain of the fine ridged octaves (sharper pixel-scale ridges/valleys in mountain belts). */
 const RIDGE_FINE_GAIN = 0.8;
@@ -49,13 +52,20 @@ const RIDGE_W1 = 1.4;
 const LITH: OctaveSet = { f0: 3.5, gain: 0.5, octaves: 3 };
 const WARP_F = [1.8, 3.9];
 const WARP_AMP = [0.075, 0.03];
+/**
+ * Fraction of the (low-frequency) domain warp applied to the FINE octaves. The full warp stretches
+ * pixel-scale noise up to ~4:1 where its Jacobian shears ("brushed" hair-like streaks in the land
+ * texture, comb teeth on coasts perpendicular to the streaks); a fraction keeps the fine octaves
+ * gently swirled but isotropic (≤ ~1.4:1). The coarse octaves keep the full warp.
+ */
+const FINE_WARP = 0.22;
+const RIDGE_FINE_WARP = 0.45;
 
 function amplitudeSum(o: OctaveSet, from: (f: number) => boolean): number {
   let s = 0;
   for (let k = 0, f = o.f0, a = 1; k < o.octaves; k++, f *= LACUNARITY, a *= o.gain) if (from(f)) s += a;
   return s;
 }
-const FBM_LOW_NORM = amplitudeSum(FBM, (f) => f <= SPLIT_F);
 const FBM_HIGH_NORM = (() => {
   // Fine octaves restart at amplitude 1 and decay with FINE_GAIN.
   let s = 0, a = 1;
@@ -63,6 +73,15 @@ const FBM_HIGH_NORM = (() => {
     if (f <= SPLIT_F) continue;
     s += a;
     a *= FINE_GAIN;
+  }
+  return s;
+})();
+const COAST_NORM = (() => {
+  let s = 0, a = 1;
+  for (let k = 0, f = FBM.f0; k < FBM.octaves; k++, f *= LACUNARITY) {
+    if (f <= SPLIT_F) continue;
+    s += a;
+    a *= COAST_GAIN;
   }
   return s;
 })();
@@ -76,15 +95,10 @@ const RIDGE_NORM = (() => {
   return s;
 })();
 const LITH_NORM = amplitudeSum(LITH, () => true);
-/**
- * Weight of CH_HILL inside the coastline breakup (relative to CH_COAST). Larger than the plain fbm
- * ratio (FBM_HIGH_NORM / FBM_LOW_NORM ≈ 0.3) so coasts stay rough down to the pixel scale.
- */
-export const HILL_IN_COAST = 1.0;
 
 // Coarse channels.
-const K_RSUM = 0, K_RW = 1, K_CSUM = 2, K_LITH = 3, K_WX = 4, K_WY = 5, K_WZ = 6;
-const COARSE_CH = 7;
+const K_RSUM = 0, K_RW = 1, K_LITH = 2, K_WX = 3, K_WY = 4, K_WZ = 5;
+const COARSE_CH = 6;
 
 export interface DetailTexture {
   /** Texels per face edge (without the 1-texel border). */
@@ -126,6 +140,18 @@ function octaveWeight(f: number, fmax: number): number {
   if (f <= 0.5 * fmax) return 1;
   if (f >= fmax) return 0;
   const x = (fmax - f) / (0.5 * fmax);
+  return x * x * (3 - 2 * x);
+}
+
+/**
+ * Softer band limit for the texture-only hill octaves: an octave just above the nominal limit keeps
+ * part of its amplitude (features of ~2 texels), so land textures stay crisp down to the pixel.
+ */
+function hillOctaveWeight(f: number, fmax: number): number {
+  const lo = 0.6 * fmax, hi = 1.4 * fmax;
+  if (f <= lo) return 1;
+  if (f >= hi) return 0;
+  const x = (hi - f) / (hi - lo);
   return x * x * (3 - 2 * x);
 }
 
@@ -194,10 +220,6 @@ function buildCoarse(nz: Noises): Float32Array {
           wz += a * nz.wz(x * f, y * f, z * f + k * 5.1);
         }
         const X = x + wx, Y = y + wy, Z = z + wz;
-        let csum = 0;
-        for (let o = 0, f = FBM.f0, a = 1; o < FBM.octaves && f <= SPLIT_F; o++, f *= LACUNARITY, a *= FBM.gain) {
-          csum += a * nz.fbm(X * f + o * 17.13, Y * f - o * 9.71, Z * f + o * 5.37);
-        }
         let rsum = 0, rw = 1;
         for (let o = 0, f = RIDGE.f0, a = 1; o < RIDGE.octaves && f <= SPLIT_F; o++, f *= LACUNARITY, a *= RIDGE.gain) {
           // Ridged multifractal (Musgrave): sharp crests, each octave weighted by the previous one.
@@ -213,7 +235,6 @@ function buildCoarse(nz: Noises): Float32Array {
         const q = ((face * stride + j) * stride + i) * COARSE_CH;
         data[q + K_RSUM] = rsum;
         data[q + K_RW] = rw;
-        data[q + K_CSUM] = csum;
         data[q + K_LITH] = lsum / LITH_NORM;
         data[q + K_WX] = wx;
         data[q + K_WY] = wy;
@@ -261,15 +282,17 @@ export function buildDetailTexture(seed: number, n: number): DetailTexture {
     cf[i] = Math.min(1, Math.max(0, s - i0));
   }
   // Fine octave tables (frequency, amplitude × band-limit weight).
-  const fbmF: number[] = [], fbmA: number[] = [], ridF: number[] = [], ridA: number[] = [], ridK: number[] = [];
+  const fbmF: number[] = [], fbmA: number[] = [], fbmC: number[] = [], ridF: number[] = [], ridA: number[] = [], ridK: number[] = [];
   {
     let { k, f } = fineStart(FBM);
     let a = 1;
-    for (; k < FBM.octaves; k++, f *= LACUNARITY, a *= FINE_GAIN) {
-      const w = octaveWeight(f, fmax);
-      if (w <= 0) break;
+    let ac = 1;
+    for (; k < FBM.octaves; k++, f *= LACUNARITY, a *= FINE_GAIN, ac *= COAST_GAIN) {
+      const wh = hillOctaveWeight(f, fmax), w = octaveWeight(f, fmax);
+      if (wh <= 0) break;
       fbmF.push(f);
-      fbmA.push((w * a) / FBM_HIGH_NORM);
+      fbmA.push((wh * a) / FBM_HIGH_NORM);
+      fbmC.push((w * ac) / COAST_NORM);
     }
     ({ k, f, a } = fineStart(RIDGE));
     for (; k < RIDGE.octaves; k++, f *= LACUNARITY, a *= RIDGE_FINE_GAIN) {
@@ -297,16 +320,19 @@ export function buildDetailTexture(seed: number, n: number): DetailTexture {
         for (let k = 0; k < COARSE_CH; k++) {
           cs[k] = w00 * coarse[q00 + k] + w01 * coarse[q01 + k] + w10 * coarse[q10 + k] + w11 * coarse[q11 + k];
         }
-        const X = d[0] + cs[K_WX], Y = d[1] + cs[K_WY], Z = d[2] + cs[K_WZ];
-        let hsum = 0;
+        const X = d[0] + FINE_WARP * cs[K_WX], Y = d[1] + FINE_WARP * cs[K_WY], Z = d[2] + FINE_WARP * cs[K_WZ];
+        let hsum = 0, csum = 0;
         for (let m = 0; m < fbmF.length; m++) {
           const f = fbmF[m], o = fbmK0 + m;
-          hsum += fbmA[m] * nz.fbm(X * f + o * 17.13, Y * f - o * 9.71, Z * f + o * 5.37);
+          const v = nz.fbm(X * f + o * 17.13, Y * f - o * 9.71, Z * f + o * 5.37);
+          hsum += fbmA[m] * v;
+          csum += fbmC[m] * v;
         }
+        const XR = d[0] + RIDGE_FINE_WARP * cs[K_WX], YR = d[1] + RIDGE_FINE_WARP * cs[K_WY], ZR = d[2] + RIDGE_FINE_WARP * cs[K_WZ];
         let rsum = cs[K_RSUM], rw = cs[K_RW];
         for (let m = 0; m < ridF.length; m++) {
           const f = ridF[m], o = ridK[m];
-          let s = 1 - Math.abs(nz.ridge(X * f + o * 31.7, Y * f + o * 7.3, Z * f - o * 13.1));
+          let s = 1 - Math.abs(nz.ridge(XR * f + o * 31.7, YR * f + o * 7.3, ZR * f - o * 13.1));
           s *= s * rw;
           rw = RIDGE_W0 + RIDGE_W1 * s > 1 ? 1 : RIDGE_W0 + RIDGE_W1 * s;
           rsum += ridA[m] * s;
@@ -314,7 +340,7 @@ export function buildDetailTexture(seed: number, n: number): DetailTexture {
         const q = ((face * stride + j) * stride + i) * C;
         data[q + CH_RIDGE] = rsum / RIDGE_NORM;
         data[q + CH_HILL] = hsum;
-        data[q + CH_COAST] = cs[K_CSUM] / FBM_LOW_NORM;
+        data[q + CH_COAST] = csum;
         data[q + CH_LITH] = cs[K_LITH];
       }
     }

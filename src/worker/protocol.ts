@@ -1,9 +1,17 @@
 /**
- * Typed message protocol between the main thread and the two workers (SPEC.md §10).
+ * Typed message protocol between the main thread and the three workers (SPEC.md §10).
  *
- *  main ⇄ sim/paint worker   SimRequest / SimEvent
+ *  main ⇄ sim worker         SimRequest / SimEvent (requests routed by `requestTarget`)
+ *  main ⇄ paint worker       the paint-side SimRequests (paint, frameAck, exportImage, …) / SimEvent
+ *  sim ⇄ paint worker        SimToPaint / PaintToSim over a MessageChannel
  *  main ⇄ climate worker     ClimateRequest / ClimateEvent
- *  climate → sim worker      ClimatePortMessage over a MessageChannel
+ *  climate → paint worker    ClimatePortMessage over a MessageChannel
+ *
+ * Playback is a two-stage pipeline: the sim worker steps and posts each new snapshot (structured
+ * clone; the sim keeps its memoized copy) to the paint worker, which paints it while the sim computes
+ * the next step. Credits keep it tight: the sim steps again only once the paint worker has *taken*
+ * its last snapshot (PaintToSim 'taken'), and the paint worker takes a snapshot only while fewer
+ * than FrameGate.max frames are unacknowledged by the main thread (frameAck).
  *
  * Every request carries `reqId` (0 = fire-and-forget) and `epoch`. The main thread bumps its epoch
  * whenever the displayed state changes under it — pause (also on editor entry during playback),
@@ -38,6 +46,13 @@ export interface DisplaySettings {
   /** Playback (preview-quality) frame size. */
   previewWidth: number;
   previewHeight: number;
+  /**
+   * Creation order on the main thread. Display settings reach the paint worker on two paths (directly
+   * with paint requests, and relayed by the sim worker with pause/step/scrub): the paint worker keeps
+   * the newest by `seq`, so a relayed older copy never overrides a newer direct one. Undefined = always
+   * accepted (tests, tools).
+   */
+  seq?: number;
 }
 
 export type PaintQuality = 'preview' | 'full';
@@ -53,10 +68,14 @@ export interface KeyframeInfo {
 export interface PerfStats {
   /** Simulation steps per second over the last second of playback. */
   stepsPerSec: number;
-  /** Frames produced per second over the last second of playback. */
+  /** Frames per second over the last second of playback (the main thread counts the frames it shows). */
   framesPerSec: number;
+  /** Wall time of one simulation step, ms. */
   lastStepMs: number;
+  /** Paint time of the last frame (paint worker), ms. */
   lastPaintMs: number;
+  /** Building the world snapshot after a step (sim worker), ms. */
+  lastSnapshotMs?: number;
 }
 
 /** Why a climate was computed (drives UI labels and scheduling). */
@@ -73,6 +92,10 @@ interface Req {
 
 export type SimRequest =
   | (Req & { type: 'connectClimate'; port: MessagePort })
+  /** main → sim worker: its end of the sim ⇄ paint channel. */
+  | (Req & { type: 'connectPaint'; port: MessagePort })
+  /** main → paint worker: its end of the sim ⇄ paint channel. */
+  | (Req & { type: 'connectSim'; port: MessagePort })
   | (Req & { type: 'generate'; meshN: number; params: GenerateParams; tectonic: TectonicParams; display: DisplaySettings })
   | (Req & { type: 'loadDraft'; draft: WorldDraft; tectonic: TectonicParams; display: DisplaySettings })
   | (Req & { type: 'generateDraft'; params: GenerateParams })
@@ -91,9 +114,18 @@ export type SimRequest =
 
 export type SimRequestType = SimRequest['type'];
 
+/** Requests the paint worker handles; every other request goes to the sim worker. */
+const PAINT_REQUESTS: ReadonlySet<SimRequestType> = new Set<SimRequestType>(['connectClimate', 'connectSim', 'paint', 'frameAck', 'exportImage']);
+
+export function requestTarget(type: SimRequestType): 'sim' | 'paint' {
+  return PAINT_REQUESTS.has(type) ? 'paint' : 'sim';
+}
+
 /** Reply payload per request type (requests that reply). */
 export interface SimReplyMap {
   connectClimate: null;
+  connectPaint: null;
+  connectSim: null;
   generate: WorldLoaded;
   loadDraft: WorldLoaded;
   generateDraft: WorldDraft;
@@ -145,9 +177,15 @@ export interface FrameMessage {
   height: number;
   /** Null when only the overlay was repainted. */
   rgba: Uint8ClampedArray | null;
+  /**
+   * Null when unchanged: the display height map depends only on the snapshot, size, quality, sea level
+   * and detail, so month and layer changes do not resend (or re-upload) it. Within one epoch the main
+   * thread applies every frame, so "unchanged" always refers to a height map it holds.
+   */
   heightMap: Float32Array | null;
   /** Null when no overlay flag is set (or the overlay was not repainted). */
   overlay: Uint8ClampedArray | null;
+  /** False when the overlay is unchanged (keep the previous one); `overlay` is then null. */
   overlayRepainted: boolean;
   snapshotId: number;
   time: number;
@@ -171,6 +209,45 @@ export type SimEvent =
   | { type: 'error'; reqId: number; message: string };
 
 /* ------------------------------------------------------------------ */
+/* sim worker ⇄ paint worker                                            */
+/* ------------------------------------------------------------------ */
+
+/** A state for the paint worker to put on screen. */
+export interface ShowMessage {
+  type: 'show';
+  /** Monotonic per sim worker; echoed by 'taken'. */
+  seq: number;
+  epoch: number;
+  /** Main-thread request that produced it (pause, step, …), 0 for playback and automatic repaints. */
+  reqId: number;
+  kind: 'play' | 'still';
+  /** Structured clone of the sim's (memoized) snapshot or of a history keyframe. */
+  snapshot: WorldSnapshot;
+  /** Keyframe index on screen, null for the live state. */
+  keyframe: number | null;
+  /** Display settings relayed from the main-thread request, null when unchanged since the last show. */
+  display: DisplaySettings | null;
+  quality: PaintQuality;
+  parts: PaintParts;
+  /** Paint a quick preview before the full-quality frame (first look after load / scrub). */
+  previewFirst: boolean;
+}
+
+export type SimToPaint =
+  /** A new world: mesh is set when its resolution changed (structured clone), seed drives the painter's detail. */
+  | { type: 'world'; epoch: number; meshN: number; mesh: SphereMesh | null; seed: number }
+  | ShowMessage
+  /** Playback stopped: drop a pending playback snapshot. */
+  | { type: 'stop'; epoch: number }
+  /** A climate input was built from snapshot `snapshotId` (time `time`): climates for it belong to this world. */
+  | { type: 'climateSource'; snapshotId: number; time: number }
+  /** History branched at `time`: climates and climate sources of later states are void. */
+  | { type: 'branch'; time: number };
+
+/** The paint worker started painting playback snapshot `seq`: the sim may step again. */
+export type PaintToSim = { type: 'taken'; seq: number };
+
+/* ------------------------------------------------------------------ */
 /* climate worker                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -187,7 +264,7 @@ export type ClimateEvent =
   | { type: 'result'; reqId: number; climate: ClimateResult; purpose: ClimatePurpose; ms: number }
   | { type: 'error'; reqId: number; message: string };
 
-/** climate worker → sim worker (MessageChannel). */
+/** climate worker → paint worker (MessageChannel). */
 export type ClimatePortMessage = { type: 'climate'; climate: ClimateResult };
 
 /* ------------------------------------------------------------------ */
@@ -235,7 +312,7 @@ export function isStaleEpoch(epoch: number, current: number): boolean {
 
 /**
  * Backpressure for playback frames: at most `max` unacknowledged frames in flight.
- * Used by the sim worker; acks for frames sent before a reset are ignored.
+ * Used by the paint worker; acks for frames sent before a reset are ignored.
  */
 export class FrameGate {
   private inFlight = new Set<number>();

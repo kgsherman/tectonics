@@ -65,8 +65,9 @@ export function wireStoreEffects(store: Store<AppState, Action>, host: EffectHos
     if (got !== kind) st.dispatch({ type: 'patchView', patch: { view: got } });
   });
   st.watch((s) => ({
-    l: s.settings.view.lighting, layer: s.settings.view.layer, m: s.runtime.month, tilt: s.settings.climate.axialTilt,
+    l: s.settings.view.lighting, layer: s.settings.view.layer, m: s.runtime.month, tilt: s.settings.climate.axialTilt, view: s.settings.view.view,
     relief: s.settings.view.reliefScale, grat: s.settings.view.overlays.graticule, sea: s.settings.seaLevel,
+    detail: s.settings.view.detail,
   }), () => host.viewSync.viewProps(), { equal: shallowEqual });
   st.watch((s) => ({
     p: s.settings.view.particles, n: s.settings.view.particleCount, c: s.settings.view.clouds, d: s.settings.view.cloudDensity,

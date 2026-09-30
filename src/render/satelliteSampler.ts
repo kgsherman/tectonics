@@ -30,7 +30,10 @@ export interface ClimateSampler {
   /** Per pixel: bilinear weights toward the next row / next column, ×65535. */
   wr: Uint16Array;
   wc: Uint16Array;
-  /** Per pixel world-frame texture noise (mid + fine octaves), ≈[-1,1] × 127. */
+  /**
+   * Per pixel world-frame texture noise, ≈[-1,1] × 127: 1.6·CH_HILL + 0.8·CH_COAST. Both channels are
+   * now fine octaves of the same fbm (0.99-correlated), so this is ≈ 0.91 × `fine`, not a mid-scale noise.
+   */
   tex: Int8Array;
   /** Per pixel world-frame fine noise only, ≈[-1,1] × 127. */
   fine: Int8Array;

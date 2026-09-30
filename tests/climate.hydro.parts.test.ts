@@ -260,7 +260,9 @@ describe('snowpack and clouds', () => {
 
   it('cloud cover rises with RH and precipitation and stays in [0, 1]', () => {
     const t = HYDRO_TUNING;
-    expect(cloudCover(0.1, 0, 0, 1, t)).toBeLessThan(0.05);
+    // A dry column over land is clear (open water always carries some shallow cumulus).
+    expect(cloudCover(0.1, 0, 0, 0, t)).toBeLessThan(0.05);
+    expect(cloudCover(0.1, 0, 0, 1, t)).toBeLessThan(0.3);
     expect(cloudCover(0.9, 10, 0, 1, t)).toBeGreaterThan(0.8);
     expect(cloudCover(0.5, 0, 8, 1, t)).toBeGreaterThan(cloudCover(0.5, 0, 0, 1, t));
     expect(cloudCover(2, 1000, 100, 1, t)).toBeLessThanOrEqual(1);

@@ -52,15 +52,22 @@ export function createClimateTab(ctx: UiContext): HTMLElement {
   const bar = h('span');
   const progress = h('div', { class: 'wg-progress', style: { width: '100%' } }, bar);
   const staleNote = hint('The world changed since this climate was computed.', 'warn');
-  const status = h('div', { class: 'wg-insp-block' }, h('div', { class: 'wg-field-head' }, statusTitle, statusSub), progress, staleNote);
+  const statusStage = h('span', { class: 'wg-readout wg-climate-stage' });
+  const status = h('div', { class: 'wg-insp-block wg-climate-status' }, h('div', { class: 'wg-field-head' }, statusTitle, statusSub), progress, statusStage, staleNote);
   store.watch((s) => ({ c: s.runtime.climate, stale: climateIsStale(s.runtime), loaded: s.runtime.worldLoaded }), ({ c, stale, loaded }) => {
-    compute.disabled = !loaded;
+    // A full computation already running for this state: pressing again would only restart it.
+    const busyFull = c.phase === 'computing' && (c.purpose === 'full' || c.purpose === 'refine');
+    compute.disabled = !loaded || busyFull;
+    setText(compute.lastElementChild as HTMLElement,
+      busyFull ? 'Computing climate…' : c.phase === 'ready' && !c.fast && !stale ? 'Recompute climate' : 'Compute climate');
     progress.hidden = c.phase !== 'computing';
+    statusStage.hidden = c.phase !== 'computing';
     bar.style.width = `${Math.round(c.progress * 100)}%`;
     staleNote.hidden = !(stale && c.phase !== 'computing');
     if (c.phase === 'computing') {
-      setText(statusTitle, c.purpose === 'live' || c.purpose === 'scrub' ? 'Updating (fast)…' : 'Computing climate…');
-      setText(statusSub, STAGES[c.stage] ?? c.stage);
+      setText(statusTitle, c.purpose === 'live' || c.purpose === 'scrub' ? 'Quick update…' : 'Computing climate…');
+      setText(statusSub, `${Math.round(c.progress * 100)}%`);
+      setText(statusStage, STAGES[c.stage] ?? c.stage);
     } else if (c.phase === 'error') {
       setText(statusTitle, 'Climate failed');
       setText(statusSub, c.error ?? '');

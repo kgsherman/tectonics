@@ -124,7 +124,11 @@ export function warmState(M: EbmModel, core: CoreSurface, warm: WarmFields, S: E
     const hgt = warm.land[i] ? Math.max(0, warm.elev[i] - warm.params.seaLevel) : 0;
     const t = 0.5 * (warm.temp[i] + warm.temp[11 * N + i]) - off;
     tSl[i] = Number.isFinite(t) ? t + LAPSE_RATE * hgt : 0;
-    const s = 0.5 * (warm.sst[i] + warm.sst[11 * N + i]) - off;
+    // The result's SST is the surface (stratified-layer) temperature; the mixed layer beneath is no
+    // warmer than the annual mean (summer stratification), so seed the enthalpy from the colder one.
+    let sAnn = 0;
+    for (let m = 0; m < 12; m++) sAnn += warm.sst[m * N + i] / 12;
+    const s = Math.min(0.5 * (warm.sst[i] + warm.sst[11 * N + i]), sAnn) - off;
     sst[i] = Number.isFinite(s) ? s : 0;
     const a = 0.5 * (warm.seaIce[i] + warm.seaIce[11 * N + i]);
     ice[i] = Number.isFinite(a) ? a : 0;

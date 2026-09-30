@@ -136,7 +136,7 @@ export function solveAnnualCycle(
       forcing.etMemory[i] = beta * mu * lf * memory[i];
     }
     buildDepartureStencil(g, dyn.steerU, dyn.steerV, off, dt, t.departureIterations, stencil, forcing.compression);
-    diffusion.setup(forcing.eddyK, dt);
+    diffusion.setup(forcing.eddyK, dt, t.diffusionBlockHeight > 0 ? st.hSmooth : null, t.diffusionBlockHeight);
     tForcing += now() - t0;
 
     t0 = now();

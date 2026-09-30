@@ -106,6 +106,11 @@ export interface RuntimeState {
   viewingKeyframe: number | null;
   tasks: TaskInfo[];
   editorActive: boolean;
+  /**
+   * World-tab settings the world on screen was generated with (worldParamsKey), '' for worlds from
+   * the plate editor: the World tab tells the user when "Generate" would apply changed settings.
+   */
+  worldParams: string;
 }
 
 export interface AppState {
@@ -150,6 +155,7 @@ export function initialRuntime(): RuntimeState {
     worldLoaded: false, meshN: 0, worldSeed: 0, playing: false, time: 0, steps: 0, snapshotId: 0, stats: null,
     perf: { stepsPerSec: 0, framesPerSec: 0, lastStepMs: 0, lastPaintMs: 0 }, month: -1, seasonsPlaying: false,
     climate: { ...EMPTY_CLIMATE }, keyframes: [], keyframeInterval: 0, viewingKeyframe: null, tasks: [], editorActive: false,
+    worldParams: '',
   };
 }
 
@@ -176,7 +182,7 @@ export type Action =
   | { type: 'setMonth'; month: number }
   | { type: 'stepMonth'; delta: number }
   | { type: 'setSeasonsPlaying'; playing: boolean }
-  | { type: 'worldLoaded'; meshN: number; seed: number; time: number; stats: TectonicStats }
+  | { type: 'worldLoaded'; meshN: number; seed: number; time: number; stats: TectonicStats; paramsKey?: string }
   | { type: 'status'; playing: boolean; time: number; steps: number; perf: PerfStats }
   | { type: 'snapshot'; snapshotId: number; stats: TectonicStats }
   | { type: 'history'; keyframes: KeyframeInfo[]; intervalMyr: number; viewing: number | null }
@@ -314,7 +320,7 @@ export function reduce(s: AppState, a: Action): AppState {
     case 'worldLoaded':
       return withRuntime(s, {
         worldLoaded: true, meshN: a.meshN, worldSeed: a.seed, time: a.time, steps: a.stats.steps, stats: a.stats, playing: false,
-        viewingKeyframe: null,
+        viewingKeyframe: null, worldParams: a.paramsKey ?? rt.worldParams,
       });
     case 'status':
       return withRuntime(s, { playing: a.playing, time: a.time, steps: a.steps, perf: a.perf });
@@ -360,6 +366,11 @@ export function reduce(s: AppState, a: Action): AppState {
       throw new Error(`reduce: unknown action ${JSON.stringify(never)}`);
     }
   }
+}
+
+/** Identity of the World-tab settings (what "Generate world" would build). */
+export function worldParamsKey(w: WorldSettings): string {
+  return JSON.stringify([w.seed, w.meshN, w.plateCount, w.continentalFraction, w.continentMode, w.hotspotCount, w.plateSpeed, w.boundaryRoughness]);
 }
 
 /** Time of the state on screen: the keyframe being viewed, else the live simulation time. */

@@ -161,7 +161,13 @@ export function routeDrainage(inp: RouteInput): Drainage {
       const j = rr * w + cc;
       if (done[j]) continue;
       done[j] = 1;
-      filled[j] = Math.max(elev[j], filled[i] + FILL_EPS);
+      // Jittered ε: across filled flats the flood front (and hence the drainage paths, which
+      // follow it back to the outlet) wanders instead of fanning out in straight lines.
+      let hsh = Math.imul(j ^ 0x5bd1e995, 0x27d4eb2d);
+      hsh ^= hsh >>> 15;
+      hsh = Math.imul(hsh, 0x2c1b3c6d);
+      hsh ^= hsh >>> 13;
+      filled[j] = Math.max(elev[j], filled[i] + FILL_EPS * (0.05 + ((hsh >>> 0) % 1000) * 0.004));
       heap.push(filled[j], j);
     }
   };

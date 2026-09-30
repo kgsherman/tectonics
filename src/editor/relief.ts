@@ -7,18 +7,52 @@ import { CRUST_CONTINENTAL, CRUST_OCEANIC } from '../core/types';
 import type { EditState } from './editState';
 import { COAST_INFLUENCE_KM, DEFAULT_OCEAN_AGE } from './editorConstants';
 
+/** Per-cell noise inputs of the painted-continent profile, each ≈ [−1, 1]. */
+export interface ReliefNoise {
+  /** Low-frequency (~2500 km) field: shelf width and broad basins/swells. */
+  low: number;
+  /** Mid-frequency (~600 km) field: shelf and coastal-plain breakup. */
+  mid: number;
+  /** Undulation of the continental base (basins and swells). */
+  und: number;
+  /** Upland field: inland plateaus where it is high. */
+  up: number;
+  /** Ridged field 0..1 (1 on ridge crests): old, eroded mountain belts. */
+  ridge: number;
+  /** Low-frequency gate deciding where old belts exist at all. */
+  gate: number;
+}
+
+const smoothstep = (a: number, b: number, x: number): number => {
+  const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+};
+
 /**
- * Elevation of a continent-brush cell (m) from its distance to the nearest ocean cell centre and a
- * smooth noise value n ≈ [−1, 1]. The outermost ring of cells (coastKm ≈ one spacing) is shelf at
- * about −150 m at every mesh resolution; land rises over a few hundred km to low plains (~+450 m)
- * whose relief grows inland (rolling hills and a few uplands). Mountains are left to tectonics.
+ * Elevation (m) of a continent-brush cell from its distance to the nearest ocean cell centre and
+ * per-cell noise (same recipe as the random generator's continents, evaluated locally):
+ *  - an emergence potential (coast distance + noise) below zero gives a continental SHELF, −15 m at
+ *    the shoreline to ~−200 m at the shelf break; the outermost ring of cells (the edge of the
+ *    continental crust) is always shelf, and noise widens it to a few hundred km in places (broad
+ *    shelves, narrow shelves, the odd epicontinental bay);
+ *  - above zero, land rises gently from a low coastal plain (so the painter's coastline breakup has
+ *    room to make organic coasts) to a ~+400 m continental base with broad basins and swells,
+ *    occasional dissected plateaus well inland and old, eroded mountain belts (≤ ~1.4 km).
+ * Young mountains are left to the tectonic simulation (convergent boundaries).
  */
-export function continentProfile(coastKm: number, spacingKm: number, n: number): number {
+export function continentProfile(coastKm: number, spacingKm: number, nz: ReliefNoise): number {
   const d = Math.max(0, coastKm - spacingKm);
-  const base = -150 + 600 * (1 - Math.exp(-d / 220));
-  const inland = 1 - Math.exp(-d / 350);
-  const relief = inland * (500 * n + 350 * Math.max(0, n - 0.2));
-  return Math.max(-200, Math.min(2200, base + relief));
+  let pot = d / 300 + 0.7 * nz.low + 0.25 * nz.mid - 0.1;
+  // The outermost ring of continental crust is always submerged: it is the shelf edge.
+  if (coastKm < 1.5 * spacingKm) pot = Math.min(pot, -0.2);
+  if (pot < 0) return -(15 + 185 * smoothstep(0, 0.45, -pot));
+  const ramp = 1 - Math.exp(-pot / 0.7);
+  const inland = smoothstep(120, 650, d);
+  const undulate = 240 * nz.und + 70 * nz.mid;
+  const plateau = 1300 * inland * smoothstep(0.2, 0.65, nz.up);
+  const belts = 1050 * smoothstep(60, 350, d) * smoothstep(0.05, 0.45, nz.gate) * nz.ridge * nz.ridge * nz.ridge;
+  const h = ramp * (400 + undulate + plateau + belts) + 8;
+  return Math.max(2 + 20 * ramp, Math.min(3200, h));
 }
 
 /** Raise/Lower dab falloff: raised cosine, 1 at the centre, 0 at the rim (d, r in radians). */
@@ -89,7 +123,14 @@ class MinHeap {
  */
 export class ReliefModel {
   private readonly noise: Noise3;
+  private readonly nLow: Noise3;
+  private readonly nMid: Noise3;
+  private readonly nUnd: Noise3;
+  private readonly nUp: Noise3;
+  private readonly nRidge: Noise3;
+  /** 6 channels per cell (ReliefNoise order), NaN until first used. */
   private readonly noiseCache: Float32Array;
+  private readonly nz: ReliefNoise = { low: 0, mid: 0, und: 0, up: 0, ridge: 0, gate: 0 };
   private readonly local: Int32Array;
   private readonly localGen: Int32Array;
   private gen = 0;
@@ -98,22 +139,42 @@ export class ReliefModel {
   private readonly spacingKm: number;
 
   constructor(private readonly mesh: SphereMesh, seed: number) {
-    this.noise = createNoise3(((seed | 0) * 7 + 11) >>> 0);
-    this.noiseCache = new Float32Array(mesh.n).fill(NaN);
+    const base = ((seed | 0) * 7 + 11) >>> 0;
+    this.noise = createNoise3(base);
+    this.nLow = createNoise3(base + 1);
+    this.nMid = createNoise3(base + 2);
+    this.nUnd = createNoise3(base + 3);
+    this.nUp = createNoise3(base + 4);
+    this.nRidge = createNoise3(base + 5);
+    this.noiseCache = new Float32Array(6 * mesh.n).fill(NaN);
     this.local = new Int32Array(mesh.n);
     this.localGen = new Int32Array(mesh.n);
     this.spacingKm = mesh.spacing * EARTH_RADIUS_KM;
   }
 
-  /** Smooth noise value (≈ [−1, 1]) of cell i. */
-  noiseAt(i: number): number {
-    let v = this.noiseCache[i];
-    if (v !== v) {
+  /** Relief noise of cell i (cached; the returned object is reused by the next call). */
+  noiseAt(i: number): ReliefNoise {
+    const c = this.noiseCache;
+    const o = 6 * i;
+    if (c[o] !== c[o]) {
       const x = this.mesh.xyz[3 * i], y = this.mesh.xyz[3 * i + 1], z = this.mesh.xyz[3 * i + 2];
-      v = fbm3(this.noise, 2.2 * x, 2.2 * y, 2.2 * z, 5) * 1.6;
-      this.noiseCache[i] = v;
+      const cl = (v: number) => (v < -1 ? -1 : v > 1 ? 1 : v);
+      c[o] = cl(1.6 * fbm3(this.nLow, 2.5 * x, 2.5 * y, 2.5 * z, 4));
+      c[o + 1] = cl(1.6 * fbm3(this.nMid, 11 * x, 11 * y, 11 * z, 3));
+      c[o + 2] = cl(1.6 * fbm3(this.nUnd, 3.2 * x + 7, 3.2 * y, 3.2 * z, 4));
+      c[o + 3] = cl(1.6 * (fbm3(this.nUp, 1.5 * x, 1.5 * y, 1.5 * z, 2) + 0.25 * fbm3(this.nMid, 6 * x + 3, 6 * y, 6 * z, 3)));
+      // Ridged: 1 on the zero set of a band-limited field → sinuous belts ~300 km wide.
+      c[o + 4] = 1 - Math.min(1, Math.abs(2.2 * fbm3(this.nRidge, 4.5 * x, 4.5 * y, 4.5 * z, 3)));
+      c[o + 5] = cl(1.6 * fbm3(this.nRidge, 1.3 * x + 11, 1.3 * y, 1.3 * z, 2));
     }
-    return v;
+    const nz = this.nz;
+    nz.low = c[o];
+    nz.mid = c[o + 1];
+    nz.und = c[o + 2];
+    nz.up = c[o + 3];
+    nz.ridge = c[o + 4];
+    nz.gate = c[o + 5];
+    return nz;
   }
 
   /** Noise function (for rough dab footprints). */

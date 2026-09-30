@@ -1,5 +1,5 @@
 /**
- * Climates received by the sim/paint worker, bounded in bytes. The newest one paints the live
+ * Climates received by the paint worker, bounded in bytes. The newest one paints the live
  * state; a history keyframe is painted with the nearest OLDER climate (by source time), so the
  * scrubber never shows a climate from the future of the frame it displays.
  */

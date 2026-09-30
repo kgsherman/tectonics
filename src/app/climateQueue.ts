@@ -74,3 +74,18 @@ export function liveClimateDue(time: number, lastRequestTime: number | null, int
   if (lastRequestTime === null) return true;
   return Math.abs(time - lastRequestTime) >= intervalMyr - 1e-9;
 }
+
+/**
+ * Overall progress of a climate job from the model's per-stage progress (each stage reports 0..1):
+ * stages weighted by their typical share of the run time, so the bar never jumps back.
+ */
+const STAGE_SPANS: Record<string, [number, number]> = {
+  input: [0, 0.03], dynamics: [0.03, 0.51], hydrology: [0.51, 0.97], koppen: [0.97, 1], done: [1, 1],
+};
+
+export function overallClimateProgress(stage: string, fraction: number): number {
+  const span = STAGE_SPANS[stage];
+  const f = Number.isFinite(fraction) ? Math.max(0, Math.min(1, fraction)) : 0;
+  if (!span) return f;
+  return span[0] + (span[1] - span[0]) * f;
+}

@@ -23,6 +23,13 @@ export interface Circulation {
   /** Steering wind for moisture, m/s. */
   steerU: Float64Array;
   steerV: Float64Array;
+  /**
+   * Boundary-layer air-mass flow for heat advection, m/s: the steering wind without the
+   * thermal-wind shear share (heatThermalShare of it), since near-surface air masses move with the
+   * low-level flow.
+   */
+  heatU: Float64Array;
+  heatV: Float64Array;
   /** Normalized large-scale ascent (frictional convergence), ~O(1). */
   ascent: Float64Array;
   /** Normalized storm-track proxy ≥ 0. */
@@ -107,6 +114,33 @@ function thermalEquator(g: LatLonGrid, Ts: Float64Array, tiltDeg: number, out: F
   for (let c = 0; c < nx; c++) out[off + c] = Math.max(-clamp, Math.min(clamp, row[c]));
 }
 
+/**
+ * Subpolar-trough deepening [north, south] over a zonally open storm-track ocean: where the latitude
+ * circle of the subpolar belt is (almost) all ocean, the storm track is zonally uniform and not
+ * disrupted by continents and stationary waves, and the circumpolar trough is much deeper than the
+ * NH's regional lows (Earth: ~985 hPa at 65°S vs ~1005 hPa for the Aleutian/Icelandic lows).
+ * Factor 1 + channelBoost·clamp((f_ocean − channelStart)/(1 − channelStart)) with f_ocean the
+ * area-mean ocean fraction of the band [subpolarLat − channelBandLow, subpolarLat + channelBandHigh].
+ */
+function subpolarChannelFactors(g: LatLonGrid, landFrac: Float64Array): [number, number] {
+  const P = pressureTuning;
+  const band = (sign: number): number => {
+    let s = 0, w = 0;
+    for (let j = 0; j < g.ny; j++) {
+      const la = (g.lat[j] / DEG) * sign;
+      if (la < P.subpolarLat - P.channelBandLow || la > P.subpolarLat + P.channelBandHigh) continue;
+      let r = 0;
+      for (let c = 0; c < g.nx; c++) r += 1 - landFrac[j * g.nx + c];
+      s += (r / g.nx) * g.area[j];
+      w += g.area[j];
+    }
+    const f = w > 0 ? s / w : 0;
+    const x = Math.min(1, Math.max(0, (f - P.channelStart) / Math.max(1e-6, 1 - P.channelStart)));
+    return 1 + P.channelBoost * x;
+  };
+  return [band(1), band(-1)];
+}
+
 /** Hemispheric gradient scale factors [north, south] from the zonal-mean temperature. */
 function gradientScales(g: LatLonGrid, T: Float64Array, off: number): [number, number] {
   const P = pressureTuning;
@@ -144,12 +178,15 @@ export function computeCirculation(g: LatLonGrid, tSl: Float64Array, land: Uint8
   const windV = new Float64Array(12 * n);
   const steerU = new Float64Array(12 * n);
   const steerV = new Float64Array(12 * n);
+  const heatU = new Float64Array(12 * n);
+  const heatV = new Float64Array(12 * n);
   const ascent = new Float64Array(12 * n);
   const baroclinic = new Float64Array(12 * n);
   const thermalEq = new Float64Array(12 * nx);
 
   // Static fields: smoothed land fraction for belt amplitudes and for friction across coasts.
   const lfBelt = Float64Array.from(landFrac);
+  const [openN, openS] = subpolarChannelFactors(g, landFrac);
   smoothField(g, lfBelt, P.beltLandSmoothKm, 3);
   const lfCoast = Float64Array.from(landFrac);
   smoothField(g, lfCoast, W.coastSmoothKm, 3);
@@ -161,9 +198,9 @@ export function computeCirculation(g: LatLonGrid, tSl: Float64Array, land: Uint8
   for (let m = 0; m < 12; m++) {
     const off = m * n;
     // Thermal term.
-    // Reference: zonal ocean mean blended with the all-cell zonal mean, so that continental
-    // heating/cooling also imprints the opposite anomaly on the oceans (summer oceanic highs,
-    // deepened winter oceanic lows).
+    // Reference: zonal ocean mean, optionally blended (refAllCellWeight; currently 0 = the SPEC's
+    // ocean-only reference) with the all-cell zonal mean, which would also imprint the opposite
+    // of the continental heating/cooling on the oceans.
     referenceTemperature(g, tSl, off, land, Tref);
     for (let j = 0; j < ny; j++) {
       let s = 0;
@@ -193,10 +230,13 @@ export function computeCirculation(g: LatLonGrid, tSl: Float64Array, land: Uint8
         const phiE = la - te * Math.exp(-(d * d) / (P.shiftDecay * P.shiftDecay));
         const a = Math.abs(phiE);
         const sH = phiE >= 0 ? sN : sS;
-        const ampSp = P.subpolarAmpLand + (P.subpolarAmpOcean - P.subpolarAmpLand) * (1 - lfBelt[i]);
+        // Subtropical anticyclones are oceanic cells; over continents the thermal term takes over
+        // (winter continental highs, summer heat lows).
+        const ampSt = P.subtropicalAmp * (1 - (1 - P.subtropicalLandFactor) * lfBelt[i]);
+        const ampSp = (P.subpolarAmpLand + (P.subpolarAmpOcean - P.subpolarAmpLand) * (1 - lfBelt[i])) * (phiE >= 0 ? openN : openS);
         const belt =
           -P.itczDepth * sEq * gauss(phiE, 0, P.itczWidth) +
-          sH * (P.subtropicalAmp * gauss(a, P.subtropicalLat, P.subtropicalWidth) - ampSp * gauss(a, P.subpolarLat, P.subpolarWidth) + P.polarAmp * gauss(a, 90, P.polarWidth));
+          sH * (ampSt * gauss(a, P.subtropicalLat, P.subtropicalWidth) - ampSp * gauss(a, P.subpolarLat, P.subpolarWidth) + P.polarAmp * gauss(a, 90, P.polarWidth));
         pressure[off + i] = P.base + belt + th[i];
       }
     }
@@ -205,19 +245,34 @@ export function computeCirculation(g: LatLonGrid, tSl: Float64Array, land: Uint8
     polarFilter(g, windU, off);
     polarFilter(g, windV, off);
     capSpeed(windU, windV, off, n, W.maxSpeed);
-    steering(g, windU, windV, off, f, lfCoast, steerU, steerV);
+    steering(g, windU, windV, off, f, lfCoast, Ts, steerU, steerV, heatU, heatV);
     convergence(g, windU, windV, off, ascent);
     smoothField(g, ascent, W.ascentSmoothKm, 3, off);
     for (let i = 0; i < n; i++) ascent[off + i] /= W.ascentRef;
-    baroclinicity(g, Ts, steerU, off, params.retrograde, baroclinic);
+    baroclinicity(g, Ts, steerU, steerV, off, params.retrograde, baroclinic);
     smoothField(g, baroclinic, W.baroSmoothKm, 3, off);
   }
-  return { pressure, windU, windV, steerU, steerV, ascent, baroclinic, thermalEquator: thermalEq };
+  return { pressure, windU, windV, steerU, steerV, heatU, heatV, ascent, baroclinic, thermalEquator: thermalEq };
 }
 
 function gauss(x: number, mu: number, w: number): number {
   const d = (x - mu) / w;
   return Math.exp(-d * d);
+}
+
+/**
+ * Rayleigh friction r (s⁻¹) for Coriolis parameter f and smoothed land fraction lf: a constant
+ * boundary-layer turning angle α (r = |f|·tan α, the Ekman-layer cross-isobar angle is nearly
+ * independent of latitude) with a floor rMin near the equator, blended ocean → land. With
+ * frictionAngleOcean ≤ 0 the constant rOcean / rLand are used.
+ */
+export function friction(f: number, lf: number): number {
+  const W = windTuning;
+  if (!(W.frictionAngleOcean > 0)) return W.rOcean + (W.rLand - W.rOcean) * lf;
+  const af = Math.abs(f);
+  const ro = Math.max(W.rMinOcean, af * Math.tan(W.frictionAngleOcean * DEG));
+  const rl = Math.max(W.rMinLand, af * Math.tan(W.frictionAngleLand * DEG));
+  return ro + (rl - ro) * lf;
 }
 
 /** Rayleigh-friction balance u = (r·g − f k×g)/(r² + f²), g = −∇p/ρ. */
@@ -246,7 +301,7 @@ export function windsFromPressure(
       // hPa → Pa.
       const px = (100 * (p[off + j * nx + ce] - p[off + j * nx + cw])) / dx;
       const py = (100 * (p[off + jn * nx + c] - p[off + js * nx + c])) / dy;
-      const r = W.rOcean + (W.rLand - W.rOcean) * lfCoast[i];
+      const r = friction(fj, lfCoast[i]);
       const den = W.rhoAir * (r * r + fj * fj);
       U[off + i] = -(r * px + fj * py) / den;
       V[off + i] = -(r * py - fj * px) / den;
@@ -277,22 +332,72 @@ function capSpeed(U: Float64Array, V: Float64Array, off: number, n: number, vmax
   }
 }
 
-/** Steering wind: frictional wind rotated half-way back toward geostrophic, ×steerFactor. */
-function steering(g: LatLonGrid, U: Float64Array, V: Float64Array, off: number, f: Float64Array, lfCoast: Float64Array, SU: Float64Array, SV: Float64Array): void {
+/**
+ * Steering wind (the flow that carries moisture and heat, ~850 hPa): frictional wind rotated
+ * half-way back toward geostrophic, ×steerFactor, plus the thermal wind up to steerThermalHeight
+ * (westerlies strengthen with height over a poleward temperature decrease: the polar vortex aloft
+ * is westerly above shallow surface easterlies).
+ */
+function steering(
+  g: LatLonGrid,
+  U: Float64Array,
+  V: Float64Array,
+  off: number,
+  f: Float64Array,
+  lfCoast: Float64Array,
+  Ts: Float64Array,
+  SU: Float64Array,
+  SV: Float64Array,
+  HU: Float64Array,
+  HV: Float64Array,
+): void {
   const W = windTuning;
   const { nx, ny } = g;
+  const R = EARTH_RADIUS_M;
+  const fMin = 2 * OMEGA_EARTH * Math.sin(W.steerThermalMinLat * DEG);
   for (let j = 0; j < ny; j++) {
     const fj = f[j];
     const taper = Math.min(1, Math.abs(g.lat[j]) / (W.steerEquatorTaper * DEG));
+    // Thermal wind to the moisture-carrying level: Δu = −(g Δz/(f T₀)) ∂T/∂y, Δv = (g Δz/(f T₀)) ∂T/∂x
+    // (|f| floored at f(steerThermalMinLat) and faded toward the equator, where the balance fails).
+    const fEff = fj === 0 ? 0 : Math.sign(fj) * Math.max(fMin, Math.abs(fj));
+    // Extratropical only: equatorward of steerThermalFadeLat the moisture-carrying layer lies below
+    // the trade inversion and follows the low-level (monsoon, trade) flow.
+    const absLat = Math.abs(g.lat[j]) / DEG;
+    const fade = W.steerThermalFadeLat > 0
+      ? Math.min(1, Math.max(0, (absLat - W.steerThermalFadeLat) / W.steerThermalFadeWidth))
+      : Math.min(1, absLat / (2 * W.steerThermalMinLat));
+    const kT = fEff === 0 ? 0 : (fade * 9.81 * W.steerThermalHeight) / (fEff * 273);
+    const jn = j > 0 ? j - 1 : j;
+    const js = j < ny - 1 ? j + 1 : j;
+    const dy = R * g.dLat * (js - jn);
+    const dx = 2 * R * g.cosLat[j] * g.dLon;
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
-      const r = W.rOcean + (W.rLand - W.rOcean) * lfCoast[i];
+      const r = friction(fj, lfCoast[i]);
       // Cross-isobar angle atan(r/|f|); rotate clockwise (NH, f > 0) by half of it.
       const theta = fj === 0 ? 0 : -Math.sign(fj) * 0.5 * Math.atan(r / Math.abs(fj)) * taper;
       const cs = Math.cos(theta), sn = Math.sin(theta);
       const u = U[off + i], v = V[off + i];
-      SU[off + i] = W.steerFactor * (u * cs - v * sn);
-      SV[off + i] = W.steerFactor * (u * sn + v * cs);
+      let du = 0;
+      let dv = 0;
+      if (kT !== 0) {
+        const ce = c === nx - 1 ? 0 : c + 1;
+        const cw = c === 0 ? nx - 1 : c - 1;
+        const dTdy = (Ts[jn * nx + c] - Ts[js * nx + c]) / dy;
+        const dTdx = (Ts[j * nx + ce] - Ts[j * nx + cw]) / dx;
+        du = -kT * dTdy;
+        dv = kT * dTdx;
+        const s = Math.sqrt(du * du + dv * dv);
+        if (s > W.steerThermalMax) {
+          du *= W.steerThermalMax / s;
+          dv *= W.steerThermalMax / s;
+        }
+      }
+      SU[off + i] = W.steerFactor * (u * cs - v * sn) + du;
+      SV[off + i] = W.steerFactor * (u * sn + v * cs) + dv;
+      HU[off + i] = W.steerFactor * (u * cs - v * sn) + W.heatThermalShare * du;
+      HV[off + i] = W.steerFactor * (u * sn + v * cs) + W.heatThermalShare * dv;
     }
   }
 }
@@ -317,8 +422,12 @@ function convergence(g: LatLonGrid, U: Float64Array, V: Float64Array, off: numbe
   }
 }
 
-/** |∂T/∂y| (K per 1000 km) × max(0, westerly component), normalized. */
-function baroclinicity(g: LatLonGrid, Ts: Float64Array, SU: Float64Array, off: number, retrograde: boolean, out: Float64Array): void {
+/**
+ * |∂T/∂y| (K per 1000 km) × (max(0, westerly component) + baroSpeedWeight·|u|), normalized: storms
+ * grow on the meridional temperature gradient and are steered by the flow; the speed term keeps
+ * frontal activity where the mean flow is weak or easterly (polar fronts, the Arctic).
+ */
+function baroclinicity(g: LatLonGrid, Ts: Float64Array, SU: Float64Array, SV: Float64Array, off: number, retrograde: boolean, out: Float64Array): void {
   const W = windTuning;
   const { nx, ny } = g;
   const sgn = retrograde ? -1 : 1;
@@ -329,7 +438,9 @@ function baroclinicity(g: LatLonGrid, Ts: Float64Array, SU: Float64Array, off: n
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
       const grad = Math.abs(Ts[jn * nx + c] - Ts[js * nx + c]) / (dy * (js - jn));
-      out[off + i] = (grad * Math.max(0, sgn * SU[off + i])) / W.baroRef;
+      const su = SU[off + i];
+      const sv = SV[off + i];
+      out[off + i] = (grad * (Math.max(0, sgn * su) + W.baroSpeedWeight * Math.sqrt(su * su + sv * sv))) / W.baroRef;
     }
   }
 }

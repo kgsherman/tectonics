@@ -3,6 +3,7 @@ import { quatIdentity, quatNormalize, quatToMat3 } from '../core/math3';
 import type { Hotspot, PlateSpec, Quat, SphereMesh, TectonicParams, WorldDraft } from '../core/types';
 import { CRUST_CONTINENTAL, CRUST_OCEANIC } from '../core/types';
 import { clonePlateSpec } from './draft';
+import { markAllDirty } from './simDirty';
 import { simMeshOf, type SimMesh } from './simMesh';
 
 /**
@@ -48,6 +49,16 @@ export interface SimCounters {
   continentalClones: number;
   collisionConsumed: number;
   subductionInitiations: number;
+  /** Overriding-plate front cells removed by tectonic erosion (all / continental). */
+  tectonicErosion: number;
+  erodedContinental: number;
+  /** Continental crust created by closing enclosed oceanic cells / oceanic specks. */
+  basinClosures: number;
+  speckClosures: number;
+  /** Continental margin cells built from eroded sediment. */
+  marginAccretions: number;
+  /** Docked terranes (small continental fragments transferred to the overriding plate). */
+  terranes: number;
 }
 
 /** Plate-pair bookkeeping (symmetric, index a*MAX_PLATES+b with a < b). */
@@ -113,6 +124,13 @@ export interface SimState {
   lastSlabPullTime: number;
   /** Myr since the last polarity-rank update. */
   polarityClock: number;
+  /**
+   * Continental volume eroded off the land and not yet redeposited as new margin crust, in metres of
+   * elevation × cells (see accreteMargins). Not part of drafts: a resumed sim starts with none.
+   */
+  sediment: number;
+  /** Myr since the last margin accretion. */
+  marginClock: number;
   warnedSubstepCap: boolean;
 }
 
@@ -171,6 +189,8 @@ export function freeSlotIndex(state: SimState): number {
 
 export function installSlot(state: SimState, p: PlateSlot): void {
   if (state.slots[p.slot]) throw new Error(`installSlot: slot ${p.slot} is in use`);
+  // Plate creation re-labels world cells wholesale: the next settle scans everything.
+  markAllDirty(state);
   state.slots[p.slot] = p;
   state.liveMask = (state.liveMask | slotBit(p.slot)) >>> 0;
 }
@@ -189,6 +209,7 @@ export function freePlateSlot(state: SimState, k: number): void {
   }
   state.slots[k] = null;
   state.liveMask = (state.liveMask & keep) >>> 0;
+  markAllDirty(state);
   const { pairs } = state;
   for (let o = 0; o < MAX_PLATES; o++) {
     if (o === k) continue;
@@ -295,22 +316,28 @@ export function createSimState(mesh: SphereMesh, draft: WorldDraft, params: Tect
     counters: {
       continentalCreated: 0, continentalDestroyed: 0, subductedCells: 0, ridgeCells: 0, rifts: 0, merges: 0,
       arcConversions: 0, continentalClones: 0, collisionConsumed: 0, subductionInitiations: 0,
+      tectonicErosion: 0, erodedContinental: 0, basinClosures: 0, speckClosures: 0, marginAccretions: 0, terranes: 0,
     },
     substepSerial: 0,
     lastSlabPullTime: draft.time,
     polarityClock: 0,
+    sediment: 0,
+    marginClock: 0,
     warnedSubstepCap: false,
   };
   for (let k = 0; k < np; k++) installSlot(state, createPlateSlot(k, n, clonePlateSpec(draft.plates[k]), quatIdentity()));
   const orogeny = draft.orogeny;
+  const toExt = sm.toExt;
   for (let i = 0; i < n; i++) {
-    const k = draft.plate[i];
+    // Sim arrays use the internal (renumbered) cell order; the draft is in the caller's order.
+    const e = toExt[i];
+    const k = draft.plate[e];
     const p = state.slots[k] as PlateSlot;
     p.owned[i] = 1;
-    p.crust[i] = draft.crust[i];
-    p.elev[i] = draft.elev[i];
-    p.age[i] = draft.age[i];
-    p.orogeny[i] = orogeny ? orogeny[i] : 0;
+    p.crust[i] = draft.crust[e];
+    p.elev[i] = draft.elev[e];
+    p.age[i] = draft.age[e];
+    p.orogeny[i] = orogeny ? orogeny[e] : 0;
     p.ownedCount++;
     state.top[i] = k;
     state.topPrev[i] = k;

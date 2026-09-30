@@ -6,6 +6,7 @@ import { canNest, downMonthly, downsampleDynamics, upsampleMonthly } from './hyd
 import { computeSnowCover } from './hydroSnow';
 import { resolveHydroTuning } from './hydroTuning';
 import type { HydroTuning } from './hydroTuning';
+import { rmsAllMonths } from './moistureForcing';
 import { globalMean, makeHydroGrid } from './moistureGrid';
 
 const now = (): number => globalThis.performance?.now?.() ?? Date.now();
@@ -172,7 +173,21 @@ export function computeHydrology(
   const snow = new Float32Array(12 * n);
   computeSnowCover({ n, temp: dyn.temp, precip: sol.precip, land: dyn.land, seaIce: dyn.seaIce }, t, snow);
   const cloud = new Float32Array(12 * n);
-  computeCloudCover({ n, rh: sol.rh, precip: sol.precip, stab: sol.stab, landFraction: dyn.landFraction, seaIce: dyn.seaIce }, t, cloud);
+  // Normalized ascent / storm-track index (as in the precipitation multiplier) for the cloud regimes.
+  const hg = makeHydroGrid(dyn.w, dyn.h);
+  const aRms = rmsAllMonths(hg, dyn.ascent) * t.ascentRmsScale;
+  const bRms = rmsAllMonths(hg, dyn.baroclinic) * t.baroclinicRmsScale;
+  const ascN = new Float32Array(12 * n);
+  const stormN = new Float32Array(12 * n);
+  for (let k = 0; k < 12 * n; k++) {
+    ascN[k] = aRms > 1e-30 ? dyn.ascent[k] / aRms : 0;
+    stormN[k] = bRms > 1e-30 ? Math.max(0, dyn.baroclinic[k] / bRms) : 0;
+  }
+  computeCloudCover(
+    { n, rh: sol.rh, precip: sol.precip, stab: sol.stab, landFraction: dyn.landFraction, seaIce: dyn.seaIce, ascent: ascN, storm: stormN, temp: dyn.temp },
+    t,
+    cloud,
+  );
   timings.hydroPost = now() - tPost;
 
   for (const [name, a] of [['precip', sol.precip], ['evap', sol.evap], ['rh', sol.rh], ['snow', snow], ['cloud', cloud]] as const) {

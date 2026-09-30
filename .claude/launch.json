@@ -7,10 +7,10 @@
       "runtimeArgs": [
         "vite",
         "--port",
-        "5173",
+        "5188",
         "--strictPort"
       ],
-      "port": 5173
+      "port": 5188
     },
     {
       "name": "worldgen-preview",

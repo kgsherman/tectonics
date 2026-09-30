@@ -101,15 +101,23 @@ export function dabCells(mesh: SphereMesh, center: Vec3, radius: number, out: nu
   const reach = rough ? r * (1 + rough.amp) : r;
   cellsWithinRadius(mesh, center, reach, out);
   if (rough) {
+    // The reach varies with a noise field evaluated at each cell's own position: every dab of a
+    // stroke sees the same field, so the union of the dabs has one coherent, organic edge (a noise
+    // contour) instead of a string of overlapping bumpy discs. Cells within r·(1 − amp) are always
+    // painted. (Isolated pinholes / specks this can leave along the rim are tidied at stroke end.)
     const { xyz } = mesh;
+    const f = rough.freq;
     let w = 0;
     for (let k = 0; k < out.length; k++) {
       const i = out[k];
       const px = xyz[3 * i], py = xyz[3 * i + 1], pz = xyz[3 * i + 2];
       const d = Math.acos(Math.max(-1, Math.min(1, px * center[0] + py * center[1] + pz * center[2])));
-      const f = rough.freq;
-      const lim = r * (1 + rough.amp * fbm3(rough.noise, px * f, py * f, pz * f, 3));
-      if (d <= lim) out[w++] = i;
+      if (d <= r * (1 - rough.amp)) {
+        out[w++] = i;
+        continue;
+      }
+      const n = Math.max(-1, Math.min(1, 1.6 * fbm3(rough.noise, px * f, py * f, pz * f, 3)));
+      if (d <= r * (1 + rough.amp * n)) out[w++] = i;
     }
     out.length = w;
   }

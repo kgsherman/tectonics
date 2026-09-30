@@ -4,12 +4,13 @@ import { CRUST_CONTINENTAL } from '../core/types';
 import {
   ARC_FALL_KM, ARC_OCEANIC_FACTOR, ARC_PEAK_KM, ARC_RISE_KM, COLLISION_MAX_KM, COLLISION_PEAK_KM,
   COLLISION_PEAK_SHARE, COLLISION_PLATEAU_KM, CORDILLERA_FALL_KM, CORDILLERA_PEAK_KM, CORDILLERA_RISE_KM,
-  FRONT_SMOOTH_PASSES, HOTSPOT_CONT_TARGET, HOTSPOT_OCEAN_TARGET, HOTSPOT_RATE, HOTSPOT_REACH,
+  FRONT_SMOOTH_PASSES, HOTSPOT_CONT_TARGET, HOTSPOT_EDIFICE_WIDTH, HOTSPOT_OCEAN_TARGET, HOTSPOT_RATE, HOTSPOT_REACH,
   SUBDUCTION_MAX_KM, SUBDUCTION_UPLIFT_RATE, TRENCH_DEPTH, TRENCH_FULL_SPEED, TRENCH_MAX_KM, TRENCH_WIDTH_KM,
   UPLIFT_SMOOTH_KM, UPLIFT_SOFT_CAP, ARC_CORE_FRACTION,
 } from './simConstants';
 import { FRONT_COLLISION, FRONT_SUBDUCTION, type StepScratch } from './simScratch';
 import type { SimState } from './simState';
+import { profLap, profStart, simProfile } from './simProfile';
 
 /**
  * Great-circle distance (km, chord approximation — < 0.1% error below 1500 km) between world cells a
@@ -57,13 +58,20 @@ export function saturate(raw: number, h: number): number {
  * and the transient trench offset. Requires detectFronts() for this step.
  */
 export function computeFields(state: SimState, sc: StepScratch, dt: number): void {
+  let t = profStart();
   sc.uplift.fill(0);
   sc.hotspotUp.fill(0);
   sc.arcMask.fill(0);
+  sc.subMask.fill(0);
+  t = profLap('E2a.clear', t);
   overridingPlateFields(state, sc, dt);
+  t = profLap('E2b.overriding', t);
   smoothUplift(state, sc);
+  t = profLap('E2c.smoothUplift', t);
   hotspotFields(state, sc, dt);
+  t = profLap('E2d.hotspots', t);
   trenchField(state, sc);
+  profLap('E2e.trench', t);
 }
 
 /** Subduction arcs / cordilleras and collision belts, spread over the overriding plate. */
@@ -71,7 +79,10 @@ function overridingPlateFields(state: SimState, sc: StepScratch, dt: number): vo
   const { top, wCrust, params, collisionBudget, budgetCells } = state;
   const { xyz } = state.sm;
   const { frontV, frontKind, frontList, uplift, arcMask, budgetAt, norm, dijkstra: dj } = sc;
+  let t = profStart();
   dj.run(state.sm, top, frontList, sc.frontCount, Math.max(SUBDUCTION_MAX_KM, COLLISION_MAX_KM));
+  profLap('E2b1.dijkstra', t);
+  if (simProfile.enabled) simProfile.ms['E2b1.reached'] = (simProfile.ms['E2b1.reached'] ?? 0) + dj.reachedCount;
   const { srcOf, reached } = dj;
 
   // Subduction: uplift ∝ convergence speed, peaking at the arc distance from the front.
@@ -91,6 +102,7 @@ function overridingPlateFields(state: SimState, sc: StepScratch, dt: number): vo
     const du = subK * frontV[s] * f * arcFactor;
     if (!(du > 0)) continue;
     uplift[c] += du;
+    sc.subMask[c] = 1;
     if (f >= ARC_CORE_FRACTION) arcMask[c] = 1;
   }
 
@@ -107,15 +119,19 @@ function overridingPlateFields(state: SimState, sc: StepScratch, dt: number): vo
     else uplift[b] += vol;
   }
   smoothBudgets(state, sc);
+  // Only continental crust thickens: strong oceanic lithosphere next to a colliding fragment takes no
+  // share, so the consumed volume stays in continental relief (and returns to area as sediment).
   for (let r = 0; r < dj.reachedCount; r++) {
     const c = reached[r];
     const s = srcOf[c];
-    if (frontKind[s] === FRONT_COLLISION && budgetAt[s] > 0) norm[s] += collisionKernel(distanceKm(xyz, c, s));
+    if (frontKind[s] === FRONT_COLLISION && budgetAt[s] > 0 && wCrust[c] === CRUST_CONTINENTAL) {
+      norm[s] += collisionKernel(distanceKm(xyz, c, s));
+    }
   }
   for (let r = 0; r < dj.reachedCount; r++) {
     const c = reached[r];
     const s = srcOf[c];
-    if (frontKind[s] !== FRONT_COLLISION || !(budgetAt[s] > 0) || !(norm[s] > 0)) continue;
+    if (frontKind[s] !== FRONT_COLLISION || !(budgetAt[s] > 0) || !(norm[s] > 0) || wCrust[c] !== CRUST_CONTINENTAL) continue;
     uplift[c] += (budgetAt[s] * collisionKernel(distanceKm(xyz, c, s))) / norm[s];
   }
   for (let q = 0; q < sc.frontCount; q++) {
@@ -201,8 +217,8 @@ function hotspotFootprints(state: SimState, sc: StepScratch): { cells: Int32Arra
     for (let k = 0; k < list.length; k++) {
       const c = list[k];
       const d = (xyz[3 * c] * h.pos[0] + xyz[3 * c + 1] * h.pos[1] + xyz[3 * c + 2] * h.pos[2]) / len;
-      const x = Math.acos(Math.max(-1, Math.min(1, d))) / h.radius;
-      w[k] = Math.exp(-x * x);
+      // Normalized distance from the plume axis (the edifice and swell kernels derive from it).
+      w[k] = Math.acos(Math.max(-1, Math.min(1, d))) / h.radius;
     }
     cells.push(list);
     weights.push(w);
@@ -229,7 +245,8 @@ function hotspotFields(state: SimState, sc: StepScratch, dt: number): void {
       const target = wCrust[c] === CRUST_CONTINENTAL ? targetCont : targetOcean;
       const h0 = wElev[c] + hotspotUp[c];
       if (h0 >= target) continue;
-      const k = HOTSPOT_RATE * s * act * weight[q];
+      const x = weight[q] / HOTSPOT_EDIFICE_WIDTH;
+      const k = HOTSPOT_RATE * s * act * Math.exp(-x * x);
       hotspotUp[c] += (target - h0) * (1 - Math.exp(-k * dt));
     }
   }
@@ -240,10 +257,14 @@ function hotspotFields(state: SimState, sc: StepScratch, dt: number): void {
  * are pulled toward TRENCH_DEPTH, scaled by min(1, v_conv / TRENCH_FULL_SPEED). Requires detectFronts().
  */
 export function trenchField(state: SimState, sc: StepScratch): void {
+  state.trench.fill(0);
+  trenches(state, sc);
+}
+
+function trenches(state: SimState, sc: StepScratch): void {
   const { top, wElev, trench } = state;
   const { adjOffset, adj } = state.sm;
   const { frontV, frontKind, frontUnder, frontList, sources, trenchV, dijkstra: dj } = sc;
-  trench.fill(0);
   let count = 0;
   for (let q = 0; q < sc.frontCount; q++) {
     const i = frontList[q];
@@ -265,7 +286,7 @@ export function trenchField(state: SimState, sc: StepScratch): void {
     const d = dist[c];
     const x = d / TRENCH_WIDTH_KM;
     const w = Math.exp(-x * x) * Math.min(1, trenchV[srcOf[c]] / TRENCH_FULL_SPEED);
-    trench[c] = (TRENCH_DEPTH - wElev[c]) * w;
+    trench[c] += (TRENCH_DEPTH - wElev[c]) * w;
   }
   for (let q = 0; q < count; q++) trenchV[sources[q]] = 0;
 }

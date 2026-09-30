@@ -107,10 +107,11 @@ describe('plate brush', () => {
 
   it('crosses the antimeridian the short way and breaks on null picks', () => {
     const core = new EditorCore(mesh, capDraft(mesh, ll(-60, 0), 10));
-    // Both painted strips are detached from the cap, so each becomes its own plate at stroke end.
+    // Both painted strips are detached from the cap; they stay the brush's plate (no new plates).
     stroke(core, [ll(30, 170), ll(30, -170), null, ll(-10, 170), ll(-10, -170)], 'plate', { radius: km(500), plate: 1 });
-    expect(core.plateAt(ll(30, 180))).not.toBe(0);
-    expect(core.plateAt(ll(-10, 180))).not.toBe(0);
+    expect(core.plates.length).toBe(2);
+    expect(core.plateAt(ll(30, 180))).toBe(1);
+    expect(core.plateAt(ll(-10, 180))).toBe(1);
     // Neither the long way round nor the gap between the two segments was painted.
     expect(core.plateAt(ll(30, 0))).toBe(0);
     expect(core.plateAt(ll(10, 180))).toBe(0);
@@ -123,11 +124,14 @@ describe('plate brush', () => {
     core.beginStroke('plate', { radius: 1e-9, plate: 1 });
     core.strokeTo(p);
     expect(core.draft.plate[nearestCell(mesh, p[0], p[1], p[2])]).toBe(1);
-    // A detached fragment that small merges back into its surroundings when the stroke ends.
+    // Painted cells keep the brush's plate, even a one-cell detached island (it merges only on "Simulate").
     const res = core.endStroke();
     expect(res.ok).toBe(true);
-    expect(res.message).toMatch(/merged/);
-    expect(core.draft.plate[nearestCell(mesh, p[0], p[1], p[2])]).toBe(0);
+    expect(res.message).not.toMatch(/merged|tidied/);
+    expect(core.draft.plate[nearestCell(mesh, p[0], p[1], p[2])]).toBe(1);
+    expect(core.pieces().pieces[1]).toBe(2);
+    expect(core.pieces().tiny[1]).toBe(1);
+    expect(core.finalize(3).plate[nearestCell(mesh, p[0], p[1], p[2])]).toBe(0);
     // Next to the plate the same tiny dab sticks.
     const q = ll(0, 20.5);
     const qi = nearestCell(mesh, q[0], q[1], q[2]);
@@ -151,30 +155,35 @@ describe('plate brush', () => {
 });
 
 describe('topology maintenance', () => {
-  it('auto-splits a plate cut in two and removes plates that were painted over', () => {
+  // Strokes never create or remove plates (they used to auto-split detached pieces into new plates
+  // and delete painted-over plates; the plate list now only changes through explicit tools).
+  it('cutting a plate in two keeps both halves on the plate; painting a plate over leaves it empty', () => {
     // Northern plate cut by a meridional band of the southern plate over the pole.
     const core = new EditorCore(mesh, twoPlateDraft(mesh, 'transform'));
     const north = core.plates[1];
     const res = stroke(core, [ll(0, 0), ll(90, 0), ll(0, 180)], 'plate', { radius: km(400), plate: 0 });
     expect(res.ok).toBe(true);
-    expect(res.created.length).toBe(1);
-    expect(core.plates.length).toBe(3);
-    const child = core.plates[2];
-    expect(child.omega).toEqual(north.omega);
-    expect(child.id).not.toBe(north.id);
-    const comps = labelComponents(mesh, core.draft.plate);
-    expect(comps.size.length).toBe(3);
+    expect(res.created.length).toBe(0);
+    expect(core.plates.length).toBe(2);
+    expect(core.plates[1].id).toBe(north.id);
+    expect(core.plateAt(ll(45, 90))).toBe(1);
+    expect(core.plateAt(ll(45, -90))).toBe(1);
+    expect(core.pieces().pieces[1]).toBe(2);
     checkInvariants(core);
-    // Paint the child over completely: it is removed.
-    const c = core.anchors()[2]!;
-    const res2 = stroke(core, [c], 'plate', { radius: 95 * DEG, plate: 0 });
-    expect(res2.removed).toContain(child.id);
-    expect(core.plates.find((p) => p.id === child.id)).toBeUndefined();
+    // Paint the northern plate over completely: it stays in the list, empty, until deleted.
+    const res2 = stroke(core, [ll(90, 0)], 'plate', { radius: 95 * DEG, plate: 0 });
+    expect(res2.removed.length).toBe(0);
+    expect(res2.message).toMatch(/now empty/);
+    expect(core.plates.length).toBe(2);
+    expect(core.counts()[1]).toBe(0);
     checkInvariants(core);
+    expect(core.removeEmptyPlates().ok).toBe(true);
+    expect(core.plates.map((p) => p.id)).toEqual([core.plates[0].id]);
+    expect(core.removeEmptyPlates().ok).toBe(false);
   });
 
-  it('merges small fragments (< MIN_FRAGMENT_CELLS) and promotes large ones', () => {
-    // Plate 1: a main cap plus a large island and a tiny island inside plate 0.
+  it('tidies slivers the stroke cut off other plates, never pieces of the brush plate or distant ones', () => {
+    // Plate 1: a main cap plus a large island and a tiny island inside plate 0, far from the stroke.
     const bigIsland = ll(-40, 120), tinyIsland = ll(-10, -100);
     const tinyCells = new Set<number>();
     const t0 = nearestCell(mesh, tinyIsland[0], tinyIsland[1], tinyIsland[2]);
@@ -183,14 +192,25 @@ describe('topology maintenance', () => {
     expect(tinyCells.size).toBeLessThan(MIN_FRAGMENT_CELLS);
     const d = capDraft(mesh, ll(40, 0), 25, (i, p) => (tinyCells.has(i) || angleBetween(p, bigIsland) < 10 * DEG ? 1 : undefined));
     const core = new EditorCore(mesh, d);
-    // Any plate edit re-normalizes the whole topology.
     const res = stroke(core, [ll(-70, -60)], 'plate', { radius: km(100), plate: 0 });
-    expect(res.created.length).toBe(1);
-    expect(core.plates.length).toBe(3);
-    for (const i of tinyCells) expect(core.draft.plate[i]).toBe(0);
-    expect(core.plateAt(bigIsland)).toBe(2);
-    expect(core.plates[2].omega).toEqual(core.plates[1].omega);
-    expect(labelComponents(mesh, core.draft.plate).size.length).toBe(3);
+    expect(res.created.length).toBe(0);
+    expect(core.plates.length).toBe(2);
+    // Distant pieces are left alone.
+    for (const i of tinyCells) expect(core.draft.plate[i]).toBe(1);
+    expect(core.plateAt(bigIsland)).toBe(1);
+    expect(core.pieces().pieces[1]).toBe(3);
+    // Painting over the cap's edge never adds plates (sliver tidying: see polish.editor-ux.test.ts).
+    const before = core.counts()[1];
+    const res2 = stroke(core, [ll(40, 25 / Math.cos(40 * DEG) - 5.5), ll(47, 22), ll(33, 22)], 'plate', { radius: km(250), plate: 0 });
+    expect(res2.created.length).toBe(0);
+    expect(core.plates.length).toBe(2);
+    expect(core.counts()[1]).toBeLessThan(before);
+    // Finalize keeps the island as part of plate 1 and merges only the tiny one.
+    const fin = core.finalize(5);
+    expect(fin.plates.length).toBe(2);
+    const fi = nearestCell(mesh, bigIsland[0], bigIsland[1], bigIsland[2]);
+    expect(fin.plates[fin.plate[fi]].id).toBe(core.plates[1].id);
+    for (const i of tinyCells) expect(fin.plate[i]).toBe(0);
   });
 
   it('deleting a plate merges it into the neighbour with the longest shared boundary', () => {
@@ -220,11 +240,12 @@ describe('region tools', () => {
     core.addPlate();
     const res = core.fill(ll(0, 0), 2);
     expect(res.ok).toBe(true);
-    // The cap plate lost all its cells and was removed; the new plate took them.
-    expect(core.plates.length).toBe(2);
-    expect(core.plateAt(ll(0, 0))).toBe(1);
+    // The cap plate lost all its cells and stays in the list, empty; the new plate took them.
+    expect(core.plates.length).toBe(3);
+    expect(core.counts()[1]).toBe(0);
+    expect(core.plateAt(ll(0, 0))).toBe(2);
     expect(core.plateAt(ll(0, 90))).toBe(0);
-    expect(core.fill(ll(0, 0), 1).ok).toBe(false);
+    expect(core.fill(ll(0, 0), 2).ok).toBe(false);
   });
 
   it('split along a stroke that crosses a plate edge to edge', () => {
@@ -240,12 +261,19 @@ describe('region tools', () => {
     checkInvariants(core);
   });
 
-  it('refuses a split that does not reach the plate edges', () => {
+  it('a short cut extends straight to the plate edges (and is refused without extension)', () => {
     const core = new EditorCore(mesh, twoPlateDraft(mesh, 'transform'));
-    const res = core.split([ll(20, 0), ll(60, 0)]);
-    expect(res.ok).toBe(false);
+    const res0 = core.split([ll(20, 0), ll(60, 0)], { extend: false });
+    expect(res0.ok).toBe(false);
     expect(core.plates.length).toBe(2);
     expect(core.canUndo).toBe(false);
+    // Default: the line continues along its great circle (the 0°/180° meridian) to the equator.
+    const res = core.split([ll(20, 0), ll(60, 0)]);
+    expect(res.ok).toBe(true);
+    expect(core.plates.length).toBe(3);
+    expect(core.plateAt(ll(45, 90))).not.toBe(core.plateAt(ll(45, -90)));
+    // The southern plate is untouched.
+    expect(core.plateAt(ll(-45, 90))).toBe(core.plateAt(ll(-45, -90)));
   });
 
   it('lasso creates a new plate from the enclosed cells', () => {
@@ -419,18 +447,17 @@ describe('history', () => {
 });
 
 describe('plate cap', () => {
-  it('never exceeds the cap: add, lasso, seeds and auto-split all respect it', () => {
+  it('never exceeds the cap: add, lasso, split and seeds all respect it', () => {
     const core = new EditorCore(mesh, twoPlateDraft(mesh, 'transform'), { maxPlates: 3 });
     expect(core.addPlate().ok).toBe(true);
     expect(core.addPlate().ok).toBe(false);
     expect(core.lasso([ll(10, 0), ll(10, 20), ll(30, 20), ll(30, 0)], 'new').ok).toBe(false);
     expect(core.applySeeds([ll(0, 0), ll(0, 90), ll(0, 180), ll(0, -90)], 0.3).ok).toBe(false);
-    // Auto-split at the cap merges the detached half instead of creating a 4th plate.
+    expect(core.split([ll(-1, 0), ll(90, 0), ll(-1, 180)]).ok).toBe(false);
+    // Cutting a plate in two with the brush at the cap is fine: strokes never add plates.
     stroke(core, [ll(0, 0), ll(90, 0), ll(0, 180)], 'plate', { radius: km(400), plate: 0 });
-    expect(core.plates.length).toBeLessThanOrEqual(3);
+    expect(core.plates.length).toBe(3);
     checkInvariants(core);
-    const comps = labelComponents(mesh, core.draft.plate);
-    expect(new Set(comps.label).size).toBe(comps.label.length);
     expect(new EditorCore(mesh, blankDraft(mesh, 1)).cap).toBe(MAX_PLATES);
   });
 });
@@ -533,9 +560,10 @@ describe('continent / ocean / relief brushes', () => {
 });
 
 describe('review regressions', () => {
-  it('fragments merged in any order leave every plate in one piece', () => {
+  it('finalize merges tiny fragments in any order and leaves every plate in one piece', () => {
     // A small island of plate A (FA) half-ringed by a smaller island of plate B (FB): FA is resolved
-    // first and borders FB most, then FB itself merges away. Every plate must still be one region.
+    // first and borders FB most, then FB itself merges away. Strokes elsewhere leave such pre-existing
+    // pieces alone; "Simulate" (finalize) must leave every plate as one region.
     const c0 = ll(0, 0);
     const east: Vec3 = [0, 1, 0], north: Vec3 = [0, 0, 1];
     let checked = 0;
@@ -562,9 +590,11 @@ describe('review regressions', () => {
       checked++;
       const core = new EditorCore(mesh, d);
       stroke(core, [ll(0, 120)], 'plate', { radius: 1e-9, plate: 0 });
-      const comps = labelComponents(mesh, core.draft.plate);
-      expect(new Set(comps.label).size).toBe(comps.label.length);
       checkInvariants(core);
+      const fin = core.finalize(1);
+      const comps = labelComponents(mesh, fin.plate);
+      expect(new Set(comps.label).size).toBe(comps.label.length);
+      expect(fin.plates.length).toBe(3);
     }
     expect(checked).toBeGreaterThan(0);
   });

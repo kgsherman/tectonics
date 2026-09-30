@@ -1,7 +1,7 @@
 /**
  * Main-thread client of the climate worker. One job at a time (the ClimateQueue decides what runs);
  * cancel = terminate() + respawn (a running computeClimate cannot be interrupted otherwise). Each
- * (re)spawn creates a fresh MessageChannel: port1 → climate worker, port2 → sim/paint worker.
+ * (re)spawn creates a fresh MessageChannel: port1 → climate worker, port2 → paint worker.
  */
 import type { ClimateInput, ClimateParams, ClimateResult } from '../core/types';
 import { climateInputTransfers, type ClimateEvent, type ClimatePurpose, type ClimateRequest } from '../worker/protocol';
@@ -39,7 +39,7 @@ export class ClimateClient {
 
   constructor(
     private readonly spawnWorker: () => WorkerLike,
-    /** Hand the sim-side port to the sim/paint worker. */
+    /** Hand the other end of the channel to the paint worker. */
     private readonly connectSim: (port: MessagePort) => void,
     private readonly createChannel: () => PortPair = () => new MessageChannel(),
   ) {

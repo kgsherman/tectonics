@@ -4,7 +4,8 @@
  * each basin (equatorial cold tongues, eastern-boundary upwelling off California, Peru, Namibia,
  * the Canaries) and deepens toward the west (warm pools, western-intensified gyres), so T_sub is
  * colder in the east and warmer in the west of each row segment of ocean. On a retrograde planet
- * everything is mirrored (trades blow from the west, gyres intensify in the east).
+ * everything is mirrored (trades blow from the west, gyres intensify in the east). Where the surface
+ * is colder than the deep water (polar oceans: T_sub ≥ deepWaterT), upwelling warms the surface.
  */
 import type { LatLonGrid } from './dynGrid';
 import { ebmTuning, oceanTuning, windTuning } from './tuning';
@@ -35,7 +36,9 @@ export function subsurfaceTemperature(g: LatLonGrid, land: Uint8Array, sst: Floa
       cnt += 12;
     }
     const zonal = cnt > 0 ? s / cnt : t.freezeT;
-    const base = zonal - t.upwellingDeltaT;
+    // Polar oceans are temperature-inverted: cold, fresh surface water lies on warmer, saltier
+    // deep water (Circumpolar Deep Water, the Atlantic layer), so upwelling there brings heat up.
+    const base = Math.max(zonal - t.upwellingDeltaT, Math.min(zonal + t.upwellingDeltaT, t.deepWaterT));
     // Trade-wind stress (easterly on a prograde planet) tilts the thermocline (weight 0..1);
     // positive tilt makes the eastern side (prograde) / western side (retrograde) colder.
     const trade = cnt > 0 ? Math.min(1, Math.max(0, (-rot * tau) / cnt / tauRef)) : 0;

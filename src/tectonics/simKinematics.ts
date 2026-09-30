@@ -4,9 +4,11 @@ import { CRUST_CONTINENTAL } from '../core/types';
 import {
   COLLISION_THICKNESS_PROXY, CONSUME_MIN_VCONV, MAX_SUBSTEPS, SUBSTEP_MAX_DISPLACEMENT,
 } from './simConstants';
+import { dirtySet, markReleased, markTopChanged, settleDebug } from './simDirty';
 import { fillGaps, markOrphanedTops } from './simGaps';
 import { convergenceAt } from './simGeometry';
-import { walkNearest } from './simMesh';
+import { walkFrom } from './simMesh';
+import { profLap, profStart } from './simProfile';
 import { resolveSpecks } from './simSpecks';
 import { setPlateRotation, slotBit, type PlateSlot, type SimState } from './simState';
 
@@ -39,13 +41,109 @@ export function substepCount(state: SimState, dt: number): { count: number; capp
   return { count, capped: need > MAX_SUBSTEPS };
 }
 
-/** Steps A–D for one substep of dtSub Myr. */
-export function runSubstep(state: SimState, dtSub: number): void {
+/**
+ * Steps A–D for one substep of dtSub Myr. `deep` (intermediate substeps of a multi-substep step
+ * only, see markDeepInterior): world cells flagged 0 there are skipped by the world pass, and plate
+ * cells pushing into them by the plate pass. Nothing can change for them before the step's last
+ * substep, which runs in full, so the step's result is exactly the same as without skipping.
+ */
+export function runSubstep(state: SimState, dtSub: number, deep: Uint8Array | null = null): void {
+  let t = profStart();
   movePlates(state, dtSub);
   beginSubstep(state);
-  worldPass(state);
-  platePass(state);
-  settleTops(state);
+  t = profLap('A.move', t);
+  worldPass(state, deep);
+  t = profLap('B.worldPass', t);
+  platePass(state, deep);
+  t = profLap('C.platePass', t);
+  settleTops(state, false);
+  profLap('D.settle', t);
+}
+
+/** Per-state scratch of the interior mask. */
+interface InteriorScratch {
+  /** 0 = deep interior; r + 1 = within r rings of a cell where anything can happen this step. */
+  near: Uint8Array;
+  queue: Int32Array;
+}
+const interiorOf = new WeakMap<SimState, InteriorScratch>();
+
+/**
+ * Before a step of `substeps` > 1 substeps: flag (near[i] = 0) world cells deep inside their top
+ * plate — farther than the step's largest plate displacement plus a safety margin (in lattice rings)
+ * from every cell that has another top plate in its ring, a loser, another plate's presence, or an
+ * unowned lattice cell of its top plate next to the one it shows (interior lattice hole). Plate
+ * edges and holes move at most that far during the step, so such a cell stays covered by the same
+ * plate, alone, with only its source lattice cell changing; that is computed once, in the last substep.
+ * Returns the mask (0 = skippable) or null when nothing may be skipped.
+ */
+export function markDeepInterior(state: SimState, dt: number, substeps: number): Uint8Array | null {
+  if (substeps < 2 || settleDebug.noDeepSkip) return null;
+  let maxW = 0;
+  for (const p of state.slots) {
+    if (!p) continue;
+    const w = p.spec.omega;
+    maxW = Math.max(maxW, Math.hypot(w[0], w[1], w[2]));
+  }
+  // Displacement over the whole step in cell spacings; a ring hop can be as short as ~0.7 spacing on
+  // the Fibonacci lattice, and the passes look up to 3 rings around a cell (boundary normals).
+  const disp = (maxW * dt * Math.abs(state.params.speedScale)) / state.sm.mesh.spacing;
+  const reach = Math.ceil(1.5 * disp) + 5;
+  if (reach > 250) return null;
+  let sc = interiorOf.get(state);
+  if (!sc) {
+    sc = { near: new Uint8Array(state.n), queue: new Int32Array(state.n) };
+    interiorOf.set(state, sc);
+  }
+  const { near, queue } = sc;
+  const { n, top, src, slots, loser, presenceCur } = state;
+  const { adjOffset, adj } = state.sm;
+  near.fill(0);
+  let tail = 0;
+  for (let i = 0; i < n; i++) {
+    const t = top[i];
+    let seed = loser[i] !== 0 || (presenceCur[i] & ~(1 << t)) !== 0;
+    if (!seed) {
+      for (let q = adjOffset[i], e = adjOffset[i + 1]; q < e; q++) {
+        if (top[adj[q]] !== t) {
+          seed = true;
+          break;
+        }
+      }
+    }
+    if (!seed) {
+      // An unowned lattice cell next to the one shown here (an interior lattice hole, left by a
+      // merge, terrane transfer or speck hand-over that no world cell maps onto yet) opens as a gap
+      // wherever it surfaces during the step; the full passes fill it in the first substep it
+      // shows, so its surroundings must not be skipped either.
+      const owned = (slots[t] as PlateSlot).owned;
+      const j = src[i];
+      if (!owned[j]) seed = true;
+      for (let q = adjOffset[j], e = adjOffset[j + 1]; q < e && !seed; q++) {
+        if (!owned[adj[q]]) {
+          seed = true;
+          break;
+        }
+      }
+    }
+    if (seed) {
+      near[i] = 1;
+      queue[tail++] = i;
+    }
+  }
+  for (let head = 0; head < tail; head++) {
+    const c = queue[head];
+    const r = near[c];
+    if (r > reach) continue;
+    for (let q = adjOffset[c], e = adjOffset[c + 1]; q < e; q++) {
+      const a = adj[q];
+      if (near[a] === 0) {
+        near[a] = r + 1;
+        queue[tail++] = a;
+      }
+    }
+  }
+  return near;
 }
 
 /**
@@ -54,11 +152,19 @@ export function runSubstep(state: SimState, dtSub: number): void {
  * disappeared). Repeats while that could have produced new specks (speck hand-overs, or a refilled
  * cell that is itself isolated); one round suffices in the vast majority of substeps.
  */
-export function settleTops(state: SimState): void {
+export function settleTops(state: SimState, full = true): void {
+  const dirty = dirtySet(state);
   for (let round = 0; round < 4; round++) {
-    const handedOver = resolveSpecks(state);
-    markOrphanedTops(state);
+    // The first round scans every cell after untracked edits; otherwise only changed neighbourhoods.
+    const scanAll = settleDebug.fullScans || (round === 0 && (full || dirty.full));
+    if (scanAll) dirty.full = false;
+    let t = profStart();
+    const handedOver = resolveSpecks(state, scanAll);
+    t = profLap('D1.specks', t);
+    markOrphanedTops(state, scanAll);
+    t = profLap('D2.orphans', t);
     const newSpeck = fillGaps(state);
+    profLap('D3.fillGaps', t);
     if (handedOver === 0 && !newSpeck) return;
   }
 }
@@ -89,12 +195,14 @@ function beginSubstep(state: SimState): void {
  * top plus the plates whose lattice cells pushed into the cell or its ring last substep (presence).
  * Top = continental over oceanic per cell, otherwise the higher polarity rank; the others are losers.
  */
-function worldPass(state: SimState): void {
+function worldPass(state: SimState, deep: Uint8Array | null): void {
   const { n, top, topPrev, src, loser, presencePrev, slots, rankPos, gaps } = state;
-  const { xyz, adjOffset, adj, mesh } = state.sm;
+  const sm = state.sm;
+  const { xyz, adjOffset, adj, mesh } = sm;
   const liveMask = state.liveMask;
   let gapCount = 0;
   for (let i = 0; i < n; i++) {
+    if (deep !== null && deep[i] === 0) continue;
     const x = xyz[3 * i], y = xyz[3 * i + 1], z = xyz[3 * i + 2];
     const tp = topPrev[i];
     const a0 = adjOffset[i], a1 = adjOffset[i + 1];
@@ -126,7 +234,7 @@ function worldPass(state: SimState): void {
           }
         }
       }
-      const j = h >= 0 ? walkNearest(xyz, adjOffset, adj, lx, ly, lz, h) : nearestCell(mesh, lx, ly, lz);
+      const j = h >= 0 ? walkFrom(sm, lx, ly, lz, h) : nearestCell(mesh, lx, ly, lz);
       if (!P.owned[j]) continue;
       cover |= low;
       const cont = P.crust[j];
@@ -142,11 +250,13 @@ function worldPass(state: SimState): void {
       top[i] = -1;
       loser[i] = 0;
       gaps[gapCount++] = i;
+      if (tp >= 0) markTopChanged(state, i);
       continue;
     }
     top[i] = best;
     src[i] = bestJ;
     loser[i] = cover & ~(1 << best);
+    if (best !== tp) markTopChanged(state, i);
   }
   state.gapCount = gapCount;
 }
@@ -155,9 +265,10 @@ function worldPass(state: SimState): void {
  * C. Plate pass (push): map every owned lattice cell to the world, record presence / push data, and
  * consume cells buried under another plate where the plates converge (v_conv gate, smooth normal).
  */
-function platePass(state: SimState): void {
+function platePass(state: SimState, deep: Uint8Array | null): void {
   const { n, top, presenceCur, slots } = state;
-  const { xyz, adjOffset, adj } = state.sm;
+  const sm = state.sm;
+  const { xyz, adjOffset, adj } = sm;
   const cache = convergenceCache(state);
   for (let k = 0; k < slots.length; k++) {
     const P = slots[k];
@@ -170,11 +281,12 @@ function platePass(state: SimState): void {
         continue;
       }
       if (!owned[j]) continue;
+      if (deep !== null && deep[hint[j]] === 0) continue;
       const x = xyz[3 * j], y = xyz[3 * j + 1], z = xyz[3 * j + 2];
       const wx = m[0] * x + m[1] * y + m[2] * z;
       const wy = m[3] * x + m[4] * y + m[5] * z;
       const wz = m[6] * x + m[7] * y + m[8] * z;
-      const i = walkNearest(xyz, adjOffset, adj, wx, wy, wz, hint[j]);
+      const i = walkFrom(sm, wx, wy, wz, hint[j]);
       hint[j] = i;
       presenceCur[i] |= bit;
       pushInv[i] = j;
@@ -220,6 +332,7 @@ function buriedDeep(state: SimState, i: number, k: number): boolean {
 function consumeCell(state: SimState, P: PlateSlot, j: number, i: number): void {
   P.owned[j] = 0;
   P.ownedCount--;
+  markReleased(state, i);
   if (P.crust[j] === CRUST_CONTINENTAL) {
     // Continental crust cannot sink: its volume feeds the collision belt at this front.
     const vol = Math.max(0, P.elev[j] + 500) + COLLISION_THICKNESS_PROXY;

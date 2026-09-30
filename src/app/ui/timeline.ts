@@ -19,7 +19,7 @@ export function createTimeline(ctx: UiContext): HTMLElement {
   play.classList.add('wg-play');
   const step = button({ icon: 'step', variant: 'ghost', title: 'Step (.)', onClick: () => commands.step() });
   const speed = segmented({
-    options: SPEEDS.map((s) => ({ value: s, label: `${s}×`, title: `${s} step${s > 1 ? 's' : ''} per frame` })),
+    options: SPEEDS.map((s) => ({ value: s, label: `${s}×`, title: `Speed ${s}×: ${s} simulation step${s > 1 ? 's' : ''} per frame` })),
     value: store.getState().settings.speed,
     onChange: (v) => store.dispatch({ type: 'setSpeed', speed: v }),
   });
@@ -33,16 +33,18 @@ export function createTimeline(ctx: UiContext): HTMLElement {
   store.watch((s) => ({
     playing: s.runtime.playing, loaded: s.runtime.worldLoaded, time: displayedTime(s.runtime), live: s.runtime.time,
     viewing: s.runtime.viewingKeyframe !== null, perf: s.runtime.perf, dt: s.settings.tectonic.dt, editing: s.runtime.editorActive,
+    busy: s.runtime.tasks.some((t) => t.id === 'generate'),
   }), (v) => {
     setChildren(play, icon(v.playing ? 'pause' : 'play', 16));
     toggleClass(play, 'is-playing', v.playing);
-    play.disabled = !v.loaded || v.editing;
-    step.disabled = !v.loaded || v.editing;
+    play.disabled = !v.loaded || v.editing || v.busy;
+    step.disabled = !v.loaded || v.editing || v.busy;
+    play.title = v.playing ? 'Pause (Space)' : 'Play (Space)';
     speed.setDisabled?.(!v.loaded);
     setText(timeMain, fmtMyr(v.time));
     setText(timeSub, v.playing
-      ? `${fmtNum(v.perf.stepsPerSec, 1)} steps/s · ${fmtNum(v.perf.framesPerSec, 0)} fps`
-      : v.viewing ? `history · live ${fmtMyr(v.live)}` : `dt ${fmtNum(v.dt, 2)} Myr/step`);
+      ? `${fmtNum(v.perf.stepsPerSec * v.dt, 1)} Myr/s · ${fmtNum(v.perf.framesPerSec, 0)} fps`
+      : v.viewing ? `history · live ${fmtMyr(v.live)}` : `${fmtNum(v.dt, v.dt % 1 ? 2 : 0)} Myr per step`);
   }, { immediate: true, equal: shallowEqual });
 
   /* History scrubber */

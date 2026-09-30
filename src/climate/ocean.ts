@@ -24,14 +24,24 @@ export interface OceanResult {
   stats: Record<string, number>;
 }
 
-/** Wind stress τ = ρ_a C_d sqrt(|u|² + σ²) u, N/m². */
-export function windStress(U: ArrayLike<number>, V: ArrayLike<number>, off: number, n: number, tx: Float64Array, ty: Float64Array): void {
+/**
+ * Wind stress τ = ρ_a C_d sqrt(|u|² + σ²) u, N/m². σ² = gustiness² + (stormGustiness·storm)²: the
+ * sub-monthly wind variance of the storm tracks (optional normalized storm-track index `storm`,
+ * 12·n like U) raises the mean stress of a given monthly-mean wind (⟨|u|u⟩ > |ū|ū).
+ */
+export function windStress(U: ArrayLike<number>, V: ArrayLike<number>, off: number, n: number, tx: Float64Array, ty: Float64Array, storm?: ArrayLike<number> | null): void {
   const T = oceanTuning;
   const k = windTuning.rhoAir * T.dragCoeff;
   const s2 = T.gustiness * T.gustiness;
+  const gs = T.stormGustiness;
   for (let i = 0; i < n; i++) {
     const u = U[off + i], v = V[off + i];
-    const sp = Math.sqrt(u * u + v * v + s2);
+    let g2 = s2;
+    if (storm && gs > 0) {
+      const b = Math.min(T.stormGustinessMax, Math.max(0, storm[off + i])) * gs;
+      g2 += b * b;
+    }
+    const sp = Math.sqrt(u * u + v * v + g2);
     tx[i] = k * sp * u;
     ty[i] = k * sp * v;
   }
@@ -103,15 +113,23 @@ export function ekmanUpwelling(g: LatLonGrid, ocean: Uint8Array, Mx: Float64Arra
   }
 }
 
-/** Surface geostrophic current from Ψ over the effective depth (central differences, wall values at dry cells). */
+/**
+ * Surface geostrophic current from Ψ over the effective depth (central differences, wall values at
+ * dry cells). The zonal part is tapered toward the equator, sin²φ/(sin²φ + sin²φ_t): inside the
+ * equatorial waveguide the zonal Sverdrup transport is carried by the thermocline and undercurrent
+ * (baroclinic, wave-adjusted), not by a surface jet of the barotropic flow.
+ */
 function currentsFromPsi(S: StommelSetup, ocean: Uint8Array, psi: Float64Array, off: number, U: Float64Array, V: Float64Array): void {
   const T = oceanTuning;
   const { g, j0, j1 } = S;
   const { nx } = g;
   const R = EARTH_RADIUS_M;
   const H = T.effectiveDepth;
+  const st2 = Math.sin((T.equatorTaperLat * Math.PI) / 180) ** 2;
   for (let j = j0; j <= j1; j++) {
-    const dy = 2 * R * g.dLat * H;
+    const s2 = g.sinLat[j] * g.sinLat[j];
+    const taper = st2 > 0 ? s2 / (s2 + st2) : 1;
+    const dy = (2 * R * g.dLat * H) / taper;
     const dx = 2 * R * g.cosLat[j] * g.dLon * H;
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
@@ -146,7 +164,14 @@ export function makeOceanContext(g: LatLonGrid, landFraction: Float64Array, land
  * Monthly currents and upwelling from monthly surface winds (12·n). `warm` (a previous result for
  * the same land mask) warm-starts the Stommel solves.
  */
-export function computeOcean(ctx: OceanContext, windU: Float64Array, windV: Float64Array, warm: OceanResult | null, fast = false): OceanResult {
+export function computeOcean(
+  ctx: OceanContext,
+  windU: Float64Array,
+  windV: Float64Array,
+  warm: OceanResult | null,
+  fast = false,
+  storm: Float64Array | null = null,
+): OceanResult {
   const T = oceanTuning;
   const { g, setup, ocean, f } = ctx;
   const n = g.n;
@@ -162,7 +187,7 @@ export function computeOcean(ctx: OceanContext, windU: Float64Array, windV: Floa
 
   // Monthly cell-integrated curl of the wind stress.
   for (let m = 0; m < 12; m++) {
-    windStress(windU, windV, m * n, n, tx, ty);
+    windStress(windU, windV, m * n, n, tx, ty, storm);
     curlRhs(g, tx, ty, rhsM.subarray(m * n, (m + 1) * n));
   }
   // The Stommel operator is linear and the same every month: solve its response to each Fourier
@@ -201,7 +226,7 @@ export function computeOcean(ctx: OceanContext, windU: Float64Array, windV: Floa
     }
     currentsFromPsi(setup, ocean, psi, off, currentU, currentV);
     // Ekman drift and upwelling.
-    windStress(windU, windV, off, n, tx, ty);
+    windStress(windU, windV, off, n, tx, ty, storm);
     ekmanTransport(g, tx, ty, f, Mx, My);
     ekmanUpwelling(g, ocean, Mx, My, w);
     smooth121Masked(g, w, ocean, T.upwellingSmoothPasses);

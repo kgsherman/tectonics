@@ -9,6 +9,7 @@ import { computeHydrology } from './hydrology';
 import type { DynamicsResult, HydrologyResult } from './internal';
 import { KOPPEN_CLASSES, classifyKoppen } from './koppen';
 import { nearestValidIndex } from './numerics';
+import { applySurfaceInversion } from './surfaceInversion';
 
 const now = (): number => globalThis.performance?.now?.() ?? Date.now();
 
@@ -191,6 +192,9 @@ function assemble(input: ClimateInput, params: ClimateParams, dyn: DynamicsResul
   const currentU = monthly('currentU', dyn.currentU);
   const currentV = monthly('currentV', dyn.currentV);
   stats.nonFiniteFilled = filled;
+  // Near-surface temperature under snow-surface inversions (diagnostic; after the hydrology, which
+  // works with the boundary-layer air mass).
+  applySurfaceInversion(temp, snow, dyn.land, w, h, params, dyn.surfaceHeight, cloud);
 
   // Köppen (every cell) and annual means.
   const koppen = new Uint8Array(N);

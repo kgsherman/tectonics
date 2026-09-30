@@ -1,96 +1,72 @@
 /**
- * Sim/paint worker logic (SPEC.md §10), independent of the worker global so it runs in Node tests.
+ * Sim worker logic (SPEC.md §10), independent of the worker global so it runs in Node tests.
  *
- * Owns the mesh, the TectonicSim, the PaintCache, history keyframes and the climates received from
- * the climate worker. Playback: each frame = `stepsPerFrame` steps → preview paint (layer + height
- * map + overlay) → transfer, with at most FrameGate.max unacknowledged frames in flight. Still
- * paints (pause, layer/month changes, scrubbing) are coalesced latest-wins.
+ * Owns the mesh, the TectonicSim, history keyframes and climate-input building. It does not paint:
+ * every state to show (playback steps, paused state, history keyframes) goes to the paint worker as
+ * a structured clone over the sim ⇄ paint channel (the sim keeps its memoized snapshot). Playback:
+ * step `stepsPerFrame` → snapshot → post → wait for the paint worker's credit ('taken', sent when it
+ * starts painting) → step again — so stepping and painting overlap instead of alternating.
  */
 import { climateInputFromSnapshot } from '../climate/climate';
 import { createSphereMesh } from '../core/sphereMesh';
-import type {
-  ClimateResult, PaintSources, SphereMesh, TectonicParams, WorldDraft, WorldSnapshot,
-} from '../core/types';
+import type { SphereMesh, TectonicParams, WorldDraft, WorldSnapshot } from '../core/types';
 import { cloneDraft, draftFromSnapshot } from '../tectonics/draft';
 import { generateRandomDraft } from '../tectonics/generate';
 import { DEFAULT_TECTONIC_PARAMS, TectonicSim } from '../tectonics/sim';
-import { PaintCache } from '../render/paint';
-import { ClimateShelf } from './climateShelf';
-import { FramePainter } from './framePainter';
 import { KeyframeStore } from './keyframes';
-import { layerUsesClimate } from './layerInfo';
+import type { PortLike } from './paintHost';
 import {
-  climateInputTransfers, errorMessage, FrameGate, transferList,
-  type ClimatePortMessage, type DisplaySettings, type FrameMessage, type PaintParts, type PaintQuality, type PerfStats,
-  type PostFn, type SimEvent, type SimReplyMap, type SimRequest, type WorldLoaded,
+  climateInputTransfers, errorMessage, transferList,
+  type DisplaySettings, type PaintQuality, type PaintToSim, type PerfStats, type PostFn, type ShowMessage,
+  type SimEvent, type SimReplyMap, type SimRequest, type SimToPaint, type WorldLoaded,
 } from './protocol';
 
 export interface SimHostEnv {
+  /** To the main thread. */
   post: PostFn<SimEvent>;
-  /** Run `fn` in a later macrotask (lets queued messages — acks, pause — be handled in between). */
+  /** Run `fn` in a later macrotask (lets queued messages — credits, pause — be handled in between). */
   schedule: (fn: () => void) => void;
   now: () => number;
   /** Optional overrides (tests use small budgets). */
   keyframes?: KeyframeStore;
-  climates?: ClimateShelf;
-  paintCache?: PaintCache;
 }
 
 /** Throttle for snapshot/status/history pushes during playback (SPEC: hover data ≤ every 250 ms). */
 const PUSH_INTERVAL_MS = 250;
 const MAX_STEPS_PER_FRAME = 100;
 
-interface StillJob {
-  reqId: number;
-  quality: PaintQuality;
-  parts: PaintParts;
-  /** Paint a quick preview before the full-quality frame (first look after load). */
-  previewFirst: boolean;
-}
-
-/** Minimal MessagePort surface used for the climate channel. */
-interface PortLike {
-  onmessage: ((e: MessageEvent) => void) | null;
-  close?: () => void;
-}
-
 export class SimHost {
   private mesh: SphereMesh | null = null;
+  /** Resolution of the mesh the paint worker holds (0 = none sent yet). */
+  private paintMeshN = 0;
   private sim: TectonicSim | null = null;
   private seed = 1;
   private params: TectonicParams = { ...DEFAULT_TECTONIC_PARAMS };
-  private readonly painter: FramePainter;
   private readonly keyframes: KeyframeStore;
-  private readonly climates: ClimateShelf;
-  private port: PortLike | null = null;
+  private paintPort: PortLike | null = null;
+  /** Messages for the paint worker posted before its channel was connected. */
+  private paintQueue: SimToPaint[] = [];
 
   private epoch = 0;
+  /** Latest display settings relayed from a main-thread request; sent with the next show. */
   private display: DisplaySettings | null = null;
+  private displayDirty = false;
   /** Keyframe shown instead of the live state (null = live). */
   private viewing: number | null = null;
 
   private playing = false;
   private stepsPerFrame = 1;
-  private readonly gate = new FrameGate(2);
-  private frameId = 0;
+  private showSeq = 0;
+  /** Playback snapshot the paint worker has not taken yet (0 = none: free to step). */
+  private awaiting = 0;
   private tickScheduled = false;
-  private still: StillJob | null = null;
-  private pumpScheduled = false;
-  private lastPaintedClimateId = 0;
-  /**
-   * Snapshot id → sim time of every climate input built in the current world (and timeline):
-   * climates for anything else are stale.
-   */
-  private readonly climateSources = new Map<number, number>();
 
   private lastPush = -Infinity;
-  private perf: PerfStats = { stepsPerSec: 0, framesPerSec: 0, lastStepMs: 0, lastPaintMs: 0 };
+  private perf: PerfStats = { stepsPerSec: 0, framesPerSec: 0, lastStepMs: 0, lastPaintMs: 0, lastSnapshotMs: 0 };
   private win = { start: 0, steps: 0, frames: 0 };
 
   constructor(private readonly env: SimHostEnv) {
-    this.painter = new FramePainter(env.paintCache ?? new PaintCache(), env.now);
     this.keyframes = env.keyframes ?? new KeyframeStore();
-    this.climates = env.climates ?? new ClimateShelf();
   }
 
   /* ------------------------------------------------------------------ */
@@ -108,36 +84,53 @@ export class SimHost {
     }
   }
 
-  /** A climate arrived from the climate worker (via the MessageChannel). */
-  receiveClimate(c: ClimateResult): boolean {
-    // A job for a previous world can finish just before the main thread cancels it: ignore it.
-    if (!this.climateSources.has(c.sourceSnapshotId)) return false;
-    this.climates.add(c);
-    this.env.post({ type: 'climateApplied', climateId: c.id, sourceTime: c.sourceTime });
-    if (!this.sim || !this.display || this.playing) return true; // playback picks it up on the next frame
-    if (!layerUsesClimate(this.display.layer)) return true;
-    const shown = this.displayClimate();
-    if (shown && shown.id !== this.lastPaintedClimateId) this.queueStill({ reqId: 0, quality: 'full', parts: 'all', previewFirst: false });
-    return true;
+  /** Connect the channel to the paint worker (also used in-process by InlinePipeline). */
+  connectPaint(port: PortLike): void {
+    if (this.paintPort && this.paintPort !== port) {
+      this.paintPort.onmessage = null;
+      this.paintPort.close?.();
+    }
+    this.paintPort = port;
+    port.onmessage = (e: MessageEvent) => this.receivePaint(e.data as PaintToSim);
+    const queued = this.paintQueue;
+    this.paintQueue = [];
+    for (const m of queued) port.postMessage?.(m);
+  }
+
+  /** A message from the paint worker. */
+  receivePaint(m: PaintToSim): void {
+    if (m?.type !== 'taken' || m.seq !== this.awaiting) return;
+    this.awaiting = 0;
+    if (this.playing) this.scheduleTick();
+  }
+
+  private toPaint(m: SimToPaint): void {
+    if (this.paintPort?.postMessage) this.paintPort.postMessage(m);
+    else this.paintQueue.push(m);
+  }
+
+  private setDisplay(d: DisplaySettings): void {
+    this.display = d;
+    this.displayDirty = true;
   }
 
   private dispatch(msg: SimRequest): void {
     switch (msg.type) {
-      case 'connectClimate':
-        this.connectPort(msg.port);
-        return this.reply(msg.reqId, 'connectClimate', null);
+      case 'connectPaint':
+        this.connectPaint(msg.port);
+        return this.reply(msg.reqId, 'connectPaint', null);
       case 'generate': {
         this.stopPlaying();
         this.ensureMesh(msg.meshN);
         const draft = generateRandomDraft(this.requireMesh(), msg.params);
-        this.display = msg.display;
+        this.setDisplay(msg.display);
         this.params = { ...msg.tectonic };
         return this.reply(msg.reqId, 'generate', this.load(draft));
       }
       case 'loadDraft': {
         this.stopPlaying();
         if (!this.mesh || this.mesh.n !== msg.draft.n) this.ensureMesh(msg.draft.n);
-        this.display = msg.display;
+        this.setDisplay(msg.display);
         this.params = { ...msg.tectonic };
         return this.reply(msg.reqId, 'loadDraft', this.load(msg.draft));
       }
@@ -150,7 +143,7 @@ export class SimHost {
         return this.reply(msg.reqId, 'getDraft', d, draftTransfers(d));
       }
       case 'play':
-        this.display = msg.display;
+        this.setDisplay(msg.display);
         this.setStepsPerFrame(msg.stepsPerFrame);
         this.startPlaying();
         // Playback resumes the live state: tell the main thread now (a keyframe may have been on
@@ -158,13 +151,13 @@ export class SimHost {
         this.pushState(true);
         return this.reply(msg.reqId, 'play', null);
       case 'pause':
-        this.display = msg.display;
+        this.setDisplay(msg.display);
         this.stopPlaying();
         this.pushState(true);
-        this.queueStill({ reqId: msg.reqId, quality: 'full', parts: 'all', previewFirst: false });
+        this.show('still', msg.reqId, 'full', false);
         return this.reply(msg.reqId, 'pause', null);
       case 'step': {
-        this.display = msg.display;
+        this.setDisplay(msg.display);
         this.stopPlaying();
         this.viewing = null;
         const t0 = this.env.now();
@@ -172,40 +165,28 @@ export class SimHost {
         this.perf.lastStepMs = this.env.now() - t0;
         this.recordKeyframe();
         this.pushState(true);
-        this.queueStill({ reqId: msg.reqId, quality: 'full', parts: 'all', previewFirst: false });
+        this.show('still', msg.reqId, 'full', false);
         return this.reply(msg.reqId, 'step', null);
       }
       case 'setSpeed':
         this.setStepsPerFrame(msg.stepsPerFrame);
         return this.reply(msg.reqId, 'setSpeed', null);
-      case 'frameAck':
-        if (this.gate.ack(msg.frameId) && this.playing) this.scheduleTick();
-        return;
       case 'setTectonicParams':
         // The sim validates; invalid parameters must not be kept for later sims either.
         this.sim?.setParams({ ...msg.params, seed: this.sim.params.seed });
         this.params = { ...msg.params };
         return this.reply(msg.reqId, 'setTectonicParams', null);
-      case 'paint':
-        this.display = msg.display;
-        if (this.playing) {
-          // The next playback frame uses the new settings.
-          if (msg.reqId) this.env.post({ type: 'superseded', reqId: msg.reqId });
-          return;
-        }
-        this.queueStill({ reqId: msg.reqId, quality: msg.quality, parts: msg.parts, previewFirst: false });
-        return;
       case 'showKeyframe': {
-        this.display = msg.display;
+        this.setDisplay(msg.display);
         this.stopPlaying();
         if (msg.index !== null) this.keyframes.at(msg.index); // validates
         this.viewing = msg.index;
         this.pushState(true);
-        this.queueStill({ reqId: 0, quality: 'full', parts: 'all', previewFirst: true });
+        this.show('still', 0, 'full', true);
         return this.reply(msg.reqId, 'showKeyframe', null);
       }
       case 'playFromKeyframe': {
-        this.display = msg.display;
+        this.setDisplay(msg.display);
         this.stopPlaying();
         const kf = this.keyframes.at(msg.index);
         // Resume from the exact sim state (toDraft) when the keyframe has it; the display snapshot
@@ -216,25 +197,27 @@ export class SimHost {
         if (this.sim) draft.nextPlateId = Math.max(draft.nextPlateId, this.sim.toDraft().nextPlateId);
         this.sim = new TectonicSim(this.requireMesh(), draft, { ...this.params, seed: this.seed });
         this.keyframes.truncateAfter(msg.index);
-        this.climates.dropAfter(kf.time);
-        // A climate still in flight for a state after the branch point belongs to the discarded future.
-        for (const [id, t] of this.climateSources) if (t > kf.time + 1e-6) this.climateSources.delete(id);
+        // Climates (also those still in flight) for states after the branch point belong to the discarded future.
+        this.toPaint({ type: 'branch', time: kf.time });
         this.viewing = null;
         this.resetPerf();
         this.pushState(true);
-        this.queueStill({ reqId: 0, quality: 'full', parts: 'all', previewFirst: false });
+        this.show('still', 0, 'full', false);
         return this.reply(msg.reqId, 'playFromKeyframe', this.loadedInfo());
       }
       case 'climateInput': {
         const snap = this.displaySnapshot();
         const input = climateInputFromSnapshot(this.requireMesh(), snap, msg.params);
-        if (input.sourceId !== undefined) this.climateSources.set(input.sourceId, snap.time);
+        // Registered before the reply: the climate computed from this input reaches the paint worker later.
+        if (input.sourceId !== undefined) this.toPaint({ type: 'climateSource', snapshotId: input.sourceId, time: snap.time });
         return this.reply(msg.reqId, 'climateInput', input, climateInputTransfers(input));
       }
-      case 'exportImage': {
-        const img = this.painter.exportImage(this.sources(), msg.display, msg.width, msg.height, this.seed);
-        return this.reply(msg.reqId, 'exportImage', img, transferList(img.rgba, img.overlay));
-      }
+      case 'connectClimate':
+      case 'connectSim':
+      case 'frameAck':
+      case 'paint':
+      case 'exportImage':
+        throw new Error(`sim worker: '${msg.type}' belongs to the paint worker`);
       default: {
         const never: never = msg;
         throw new Error(`sim worker: unknown request ${JSON.stringify((never as { type?: unknown }).type)}`);
@@ -255,7 +238,6 @@ export class SimHost {
     if (!(Number.isInteger(n) && n >= 100)) throw new Error(`sim worker: invalid mesh size ${n}`);
     if (this.mesh && this.mesh.n === n) return;
     this.mesh = createSphereMesh(n);
-    this.painter.cache.clear();
     // Structured clone: the worker keeps its own mesh.
     this.env.post({ type: 'mesh', meshN: this.mesh.n, mesh: this.mesh });
   }
@@ -268,14 +250,13 @@ export class SimHost {
     this.seed = draft.seed;
     this.sim = sim;
     this.keyframes.clear();
-    this.climates.clear();
-    this.climateSources.clear();
-    this.lastPaintedClimateId = 0;
     this.viewing = null;
     this.resetPerf();
+    this.toPaint({ type: 'world', epoch: this.epoch, meshN: mesh.n, mesh: this.paintMeshN === mesh.n ? null : mesh, seed: this.seed });
+    this.paintMeshN = mesh.n;
     this.recordKeyframe();
     this.pushState(true);
-    this.queueStill({ reqId: 0, quality: 'full', parts: 'all', previewFirst: true });
+    this.show('still', 0, 'full', true);
     return this.loadedInfo();
   }
 
@@ -291,24 +272,6 @@ export class SimHost {
     this.keyframes.add(sim.time, sim.stats().steps, sim.snapshot(), sim.toDraft());
   }
 
-  private connectPort(port: PortLike): void {
-    if (this.port && this.port !== port) {
-      this.port.onmessage = null;
-      this.port.close?.();
-    }
-    this.port = port;
-    port.onmessage = (e: MessageEvent) => {
-      const m = e.data as ClimatePortMessage;
-      if (m && m.type === 'climate') {
-        try {
-          this.receiveClimate(m.climate);
-        } catch (err) {
-          this.env.post({ type: 'error', reqId: 0, message: `climate update: ${errorMessage(err)}` });
-        }
-      }
-    };
-  }
-
   /* ------------------------------------------------------------------ */
   /* Playback                                                            */
   /* ------------------------------------------------------------------ */
@@ -321,15 +284,15 @@ export class SimHost {
     this.requireSim();
     this.viewing = null;
     this.playing = true;
-    this.gate.reset();
+    this.awaiting = 0;
     this.resetPerf();
-    this.still = null;
     this.scheduleTick();
   }
 
   private stopPlaying(): void {
+    if (this.playing) this.toPaint({ type: 'stop', epoch: this.epoch });
     this.playing = false;
-    this.gate.reset();
+    this.awaiting = 0;
   }
 
   private scheduleTick(): void {
@@ -340,27 +303,29 @@ export class SimHost {
 
   private readonly tick = (): void => {
     this.tickScheduled = false;
-    if (!this.playing || !this.sim || !this.display) return;
-    if (!this.gate.canSend()) return; // resumed by frameAck
+    if (!this.playing || !this.sim) return;
+    if (this.awaiting) return; // resumed by the paint worker's credit
     try {
       const t0 = this.env.now();
       this.sim.step(this.stepsPerFrame);
       const t1 = this.env.now();
       this.perf.lastStepMs = (t1 - t0) / this.stepsPerFrame;
+      this.sim.snapshot();
+      this.perf.lastSnapshotMs = this.env.now() - t1;
+      // Hand the frame to the paint worker first; bookkeeping overlaps with its painting.
+      this.show('play', 0, 'preview', false);
       this.recordKeyframe();
-      const frame = this.paintFrame('play', 'preview', 'all', 0);
-      this.gate.sent(frame.frameId);
       this.win.steps += this.stepsPerFrame;
       this.win.frames++;
       this.updateRates();
       this.pushState(false);
     } catch (e) {
       this.playing = false;
+      this.awaiting = 0;
+      this.toPaint({ type: 'stop', epoch: this.epoch });
       this.env.post({ type: 'error', reqId: 0, message: `playback stopped: ${errorMessage(e)}` });
       this.pushState(true);
-      return;
     }
-    this.scheduleTick();
   };
 
   private resetPerf(): void {
@@ -395,80 +360,25 @@ export class SimHost {
   }
 
   /* ------------------------------------------------------------------ */
-  /* Painting                                                            */
+  /* States for the paint worker                                         */
   /* ------------------------------------------------------------------ */
 
-  private queueStill(job: StillJob): void {
-    const prev = this.still;
-    if (prev) {
-      if (prev.reqId && prev.reqId !== job.reqId) this.env.post({ type: 'superseded', reqId: prev.reqId });
-      job = {
-        reqId: job.reqId,
-        quality: prev.quality === 'full' || job.quality === 'full' ? 'full' : 'preview',
-        parts: prev.parts === 'all' || job.parts === 'all' ? 'all' : 'overlay',
-        previewFirst: prev.previewFirst || job.previewFirst,
-      };
-    }
-    this.still = job;
-    if (!this.pumpScheduled) {
-      this.pumpScheduled = true;
-      this.env.schedule(this.pump);
-    }
+  /** Post the displayed state (live or keyframe) to the paint worker. */
+  private show(kind: ShowMessage['kind'], reqId: number, quality: PaintQuality, previewFirst: boolean): void {
+    const seq = ++this.showSeq;
+    const msg: ShowMessage = {
+      type: 'show', seq, epoch: this.epoch, reqId, kind, snapshot: this.displaySnapshot(), keyframe: this.viewing,
+      display: this.displayDirty ? this.display : null, quality, parts: 'all', previewFirst,
+    };
+    this.displayDirty = false;
+    if (kind === 'play') this.awaiting = seq;
+    this.toPaint(msg);
   }
-
-  private readonly pump = (): void => {
-    this.pumpScheduled = false;
-    const job = this.still;
-    this.still = null;
-    if (!job) return;
-    if (!this.sim || !this.display || this.playing) {
-      if (job.reqId) this.env.post({ type: 'superseded', reqId: job.reqId });
-      return;
-    }
-    try {
-      if (job.previewFirst && job.parts === 'all') {
-        this.paintFrame('still', 'preview', 'all', 0);
-        // Refine unless a newer request already replaced this one.
-        if (!this.still) this.queueStill({ ...job, previewFirst: false });
-        return;
-      }
-      this.paintFrame('still', job.quality, job.parts, job.reqId);
-    } catch (e) {
-      const message = `paint failed: ${errorMessage(e)}`;
-      this.env.post({ type: 'error', reqId: job.reqId, message });
-    }
-  };
 
   private displaySnapshot(): WorldSnapshot {
     const sim = this.requireSim();
     if (this.viewing === null) return sim.snapshot();
     return this.keyframes.at(this.viewing).snapshot;
-  }
-
-  private displayClimate(): ClimateResult | null {
-    if (!this.sim) return null;
-    const t = this.viewing === null ? this.sim.time : this.keyframes.at(this.viewing).time;
-    return this.climates.forTime(t);
-  }
-
-  private sources(): PaintSources {
-    return { mesh: this.requireMesh(), snapshot: this.displaySnapshot(), climate: this.displayClimate() };
-  }
-
-  private paintFrame(kind: FrameMessage['kind'], quality: PaintQuality, parts: PaintParts, reqId: number): FrameMessage {
-    const d = this.display!;
-    const src = this.sources();
-    const p = this.painter.frame(src, d, quality, parts, this.seed);
-    if (parts === 'all') this.lastPaintedClimateId = src.climate?.id ?? 0;
-    this.perf.lastPaintMs = p.ms;
-    const snap = src.snapshot!;
-    const frame: FrameMessage = {
-      type: 'frame', frameId: ++this.frameId, reqId, epoch: this.epoch, kind, quality, layer: d.layer, month: d.month,
-      width: p.width, height: p.height, rgba: p.rgba, heightMap: p.heightMap, overlay: p.overlay, overlayRepainted: true,
-      snapshotId: snap.id, time: snap.time, climateId: src.climate?.id ?? 0, keyframe: this.viewing, paintMs: p.ms,
-    };
-    this.env.post(frame, transferList(p.rgba, p.heightMap, p.overlay));
-    return frame;
   }
 
   /* ------------------------------------------------------------------ */

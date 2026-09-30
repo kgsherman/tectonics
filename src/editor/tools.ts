@@ -22,7 +22,7 @@ export const TOOLS: readonly ToolInfo[] = [
   { id: 'continent', label: 'Continent', key: 'C', hint: 'Paint land (shelf included). Shift paints ocean, X swaps.', brush: true, paint: true },
   { id: 'raise', label: 'Raise / Lower', key: 'R', hint: 'Sculpt elevation. Shift lowers.', brush: true, paint: true },
   { id: 'fill', label: 'Fill', key: 'F', hint: 'Click a region to give it to the selected plate.', brush: false, paint: true },
-  { id: 'split', label: 'Split', key: 'S', hint: 'Drag a line across a plate, edge to edge, to cut it in two.', brush: false, paint: true },
+  { id: 'split', label: 'Split', key: 'S', hint: 'Drag a line on a plate (it continues to the plate\'s edges) to cut it in two.', brush: false, paint: true },
   { id: 'lasso', label: 'Lasso', key: 'L', hint: 'Draw a loop around a region to make it a plate.', brush: false, paint: true },
   { id: 'seeds', label: 'Seeds', key: 'D', hint: 'Click to place seeds, drag to move, Shift+click removes. Enter generates.', brush: false, paint: true },
   { id: 'motion', label: 'Motion', key: 'V', hint: 'Drag from a plate (or its arrow tip) to set its velocity. Shift snaps to 15°.', brush: false, paint: true },

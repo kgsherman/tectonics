@@ -31,6 +31,7 @@ export function createLayerPicker(ctx: UiContext): HTMLElement {
         onClick: () => {
           store.dispatch({ type: 'patchView', patch: { layer } });
           close();
+          btn.focus({ preventScroll: true });
         },
       }, h('i', { class: 'wg-layer-swatch', style: { background: LAYER_SWATCH[layer] } }), h('span', { class: 'wg-layer-name', text: layerLabel(layer) }), need, key ? h('kbd', { text: key }) : null);
       items.set(layer, item);
@@ -43,14 +44,34 @@ export function createLayerPicker(ctx: UiContext): HTMLElement {
   const onDoc = (e: PointerEvent): void => {
     if (!el.contains(e.target as Node)) close();
   };
+  const list = [...items.values()];
   const onKey = (e: KeyboardEvent): void => {
-    if (e.key === 'Escape') close();
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      close();
+      btn.focus();
+      return;
+    }
+    if (e.key === 'Tab') {
+      close();
+      return;
+    }
+    // Arrow keys move through the layers (the digit shortcuts keep working too).
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End') {
+      e.preventDefault();
+      e.stopPropagation();
+      const i = list.indexOf(document.activeElement as HTMLButtonElement);
+      const n = list.length;
+      const next = e.key === 'Home' ? 0 : e.key === 'End' ? n - 1 : e.key === 'ArrowDown' ? (i + 1 + n) % n : (i - 1 + n) % n;
+      list[next].focus();
+    }
   };
   function open(): void {
     el.classList.add('is-open');
     btn.setAttribute('aria-expanded', 'true');
     document.addEventListener('pointerdown', onDoc, true);
     document.addEventListener('keydown', onKey, true);
+    (list.find((b) => b.classList.contains('is-active')) ?? list[0]).focus({ preventScroll: true });
   }
   function close(): void {
     el.classList.remove('is-open');

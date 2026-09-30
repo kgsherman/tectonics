@@ -32,10 +32,10 @@ export function createSimulateTab(ctx: UiContext): SimulateTab {
   const reset = button({ label: 'Reset', icon: 'reset', variant: 'ghost', title: 'Restore default parameters', onClick: () => store.dispatch({ type: 'resetTectonic' }) });
   const playBtn = button({ label: 'Play', icon: 'play', variant: 'primary', wide: true, onClick: () => commands.togglePlay() });
   const stepBtn = button({ label: 'Step', icon: 'step', variant: 'secondary', onClick: () => commands.step() });
-  store.watch((s) => ({ playing: s.runtime.playing, loaded: s.runtime.worldLoaded }), (v) => {
+  store.watch((s) => ({ playing: s.runtime.playing, loaded: s.runtime.worldLoaded, busy: s.runtime.tasks.some((t) => t.id === 'generate') }), (v) => {
     setChildren(playBtn, icon(v.playing ? 'pause' : 'play', 16), h('span', { text: v.playing ? 'Pause' : 'Play' }));
-    playBtn.disabled = !v.loaded;
-    stepBtn.disabled = !v.loaded;
+    playBtn.disabled = !v.loaded || v.busy;
+    stepBtn.disabled = !v.loaded || v.busy;
   }, { immediate: true, equal: shallowEqual });
 
   const stats = statGrid([
@@ -65,7 +65,7 @@ export function createSimulateTab(ctx: UiContext): SimulateTab {
     stats.set('sub', fmtNum(st.subductedCells));
     stats.set('ridge', fmtNum(st.ridgeCells));
     stats.set('events', `${st.rifts} · ${st.merges}`);
-    stats.set('perf', playing ? `${fmtMs(perf.lastStepMs)} · ${fmtNum(perf.stepsPerSec, 1)}/s` : fmtMs(st.lastStepMs));
+    stats.set('perf', playing ? `${fmtMs(perf.lastStepMs)} · ${fmtNum(perf.stepsPerSec, 1)}/s` : st.lastStepMs > 0 ? fmtMs(st.lastStepMs) : '—');
   }, { immediate: true, equal: shallowEqual });
 
   const plateList = h('div', { class: 'wg-plates' });

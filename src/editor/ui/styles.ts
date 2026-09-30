@@ -65,6 +65,46 @@ const CSS = `
 .pe-tool.pe-on { color: #fff; background: color-mix(in srgb, var(--pe-accent) 24%, var(--pe-panel-2)); border-color: var(--pe-accent); }
 .pe-tool .pe-key { position: absolute; right: 4px; bottom: 1px; font-size: 9px; color: var(--pe-dim); font-weight: 600; }
 .pe-tool.pe-on .pe-key { color: color-mix(in srgb, var(--pe-accent) 60%, #fff); }
+.pe-tool.pe-capped::after {
+  content: ''; position: absolute; top: 4px; right: 4px; width: 6px; height: 6px; border-radius: 50%; background: var(--pe-warn);
+}
+.pe-tool.pe-capped:not(.pe-on) { opacity: .55; }
+.pe-hint b { color: var(--pe-text); font-weight: 600; }
+.pe-hint.pe-warn-text { color: var(--pe-warn); }
+.pe-guide {
+  position: relative; border-radius: var(--pe-radius); padding: 10px 12px 10px;
+  background: linear-gradient(160deg, color-mix(in srgb, var(--pe-accent) 16%, var(--pe-panel-2)), var(--pe-panel-2));
+  border: 1px solid color-mix(in srgb, var(--pe-accent) 35%, var(--pe-border));
+}
+.pe-guide-title { font-weight: 600; font-size: 13px; margin-bottom: 2px; padding-right: 22px; }
+.pe-guide-sub { color: var(--pe-dim); font-size: 11.5px; margin-bottom: 8px; }
+.pe-guide ol { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 5px; counter-reset: pe-step; }
+.pe-guide li { display: grid; grid-template-columns: 18px 1fr; gap: 8px; align-items: center; font-size: 12px; color: var(--pe-dim); counter-increment: pe-step; }
+.pe-guide li::before {
+  content: counter(pe-step); width: 18px; height: 18px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-size: 10.5px; font-weight: 700; color: var(--pe-text); background: rgba(255,255,255,.08);
+}
+.pe-guide li.pe-done::before { content: '✓'; color: #031222; background: var(--pe-accent-2); }
+.pe-guide li.pe-done .pe-link { color: var(--pe-dim); }
+.pe-guide .pe-link {
+  appearance: none; border: 0; background: none; padding: 0; font: inherit; font-weight: 600; color: var(--pe-accent); cursor: pointer;
+}
+.pe-guide .pe-link:hover { text-decoration: underline; }
+.pe-guide-close {
+  position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; border: 0; border-radius: 5px; background: transparent;
+  color: var(--pe-dim); cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0;
+}
+.pe-guide-close:hover { color: var(--pe-text); background: rgba(255,255,255,.06); }
+.pe-guide-close svg { width: 14px; height: 14px; }
+.pe-keys {
+  display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 11.5px; color: var(--pe-dim);
+  background: var(--pe-bg); border: 1px solid var(--pe-border); border-radius: var(--pe-radius); padding: 9px 10px;
+}
+.pe-keys kbd { justify-self: start; white-space: nowrap; }
+.pe-keys .pe-keys-h { grid-column: 1 / -1; color: var(--pe-text); font-weight: 600; font-size: 11px; margin-top: 3px; }
+.pe-keys .pe-keys-h:first-child { margin-top: 0; }
+.pe-btn.pe-small { height: 22px; padding: 0 7px; font-size: 11.5px; }
+.pe-icon-btn.pe-active { color: var(--pe-accent); border-color: color-mix(in srgb, var(--pe-accent) 50%, var(--pe-border)); }
 .pe-toolopts {
   background: var(--pe-bg); border: 1px solid var(--pe-border); border-radius: var(--pe-radius);
   padding: 10px; display: flex; flex-direction: column; gap: 9px;
@@ -100,6 +140,14 @@ const CSS = `
 .pe-plate.pe-sel { background: color-mix(in srgb, var(--pe-accent) 11%, transparent); box-shadow: inset 2px 0 0 var(--pe-accent); }
 .pe-swatch { position: relative; width: 14px; height: 14px; border-radius: 4px; box-shadow: inset 0 0 0 1px rgba(255,255,255,.2); cursor: pointer; }
 .pe-swatch input { position: absolute; inset: -2px; opacity: 0; cursor: pointer; width: 18px; height: 18px; padding: 0; border: 0; }
+.pe-name-wrap { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.pe-badge {
+  flex: none; font-size: 10px; line-height: 15px; padding: 0 5px; border-radius: 8px; white-space: nowrap; cursor: help;
+  color: var(--pe-warn); background: color-mix(in srgb, var(--pe-warn) 13%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--pe-warn) 30%, transparent); font-variant-numeric: tabular-nums;
+}
+.pe-plate.pe-empty .pe-name { color: var(--pe-dim); font-style: italic; }
+.pe-plate.pe-empty .pe-area { color: var(--pe-warn); }
 .pe-name {
   background: transparent; border: 1px solid transparent; color: var(--pe-text); font: inherit; padding: 2px 5px;
   border-radius: 4px; min-width: 0; width: 100%; text-overflow: ellipsis; user-select: text;
@@ -155,6 +203,9 @@ const CSS = `
 .pe-root.pe-is-busy .pe-busy { display: flex; }
 .pe-spinner { width: 28px; height: 28px; border-radius: 50%; border: 3px solid rgba(79, 163, 255, .22); border-top-color: var(--pe-accent); animation: pe-spin .8s linear infinite; }
 @keyframes pe-spin { to { transform: rotate(360deg); } }
+/* Pointer feedback on the view while editing (overrides the view's own inline cursor). */
+${['grab', 'grabbing', 'crosshair', 'move', 'copy', 'pointer', 'cell', 'not-allowed']
+  .map((c) => `[data-pe-cursor="${c}"], [data-pe-cursor="${c}"] * { cursor: ${c} !important; }`).join(' ')}
 @media (prefers-reduced-motion: reduce) { .pe-spinner { animation-duration: 2.4s; } }
 `;
 

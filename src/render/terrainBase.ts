@@ -108,11 +108,31 @@ export function scratchFloat32(slot: number, n: number): Float32Array {
   return b.length === n ? b : b.subarray(0, n);
 }
 
+const scratchU8: Uint8Array[] = [];
+
+/** Reusable Uint8 scratch buffer #slot of at least n bytes (same contract as scratchFloat32). */
+export function scratchUint8(slot: number, n: number): Uint8Array {
+  let b = scratchU8[slot];
+  if (!b || b.length < n) {
+    b = new Uint8Array(n);
+    scratchU8[slot] = b;
+  }
+  return b.length === n ? b : b.subarray(0, n);
+}
+
 /** Direct Gaussian kernels are used up to this σ (px); wider blurs use the box-pass approximation. */
 const DIRECT_MAX_SIGMA = 2;
 
-/** Normalized Gaussian taps w[0..R] (symmetric) for σ in pixels, truncated at R = ⌈2.5σ⌉. */
+/**
+ * Normalized Gaussian taps w[0..R] (symmetric) for σ in pixels, truncated at R = ⌈2.5σ⌉. Below
+ * ~0.6 px the sampled Gaussian falls well short of the requested variance (σ = 0.4 → ½ of it): a
+ * 3-tap kernel with exactly σ² of variance is used instead.
+ */
 function gaussTaps(sigma: number): Float64Array {
+  if (sigma < 0.6) {
+    const a = 0.5 * sigma * sigma;
+    return Float64Array.of(1 - 2 * a, a);
+  }
   const R = Math.max(1, Math.ceil(2.5 * sigma));
   const t = new Float64Array(R + 1);
   let sum = 0;

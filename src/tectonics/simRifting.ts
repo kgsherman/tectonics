@@ -3,13 +3,15 @@ import { createNoise3, type Noise3 } from '../core/noise';
 import type { Rng } from '../core/rng';
 import type { Vec3 } from '../core/types';
 import {
-  RIFT_MIN_AREA, RIFT_MIN_SHARE, RIFT_SPEED_MAX, RIFT_SPEED_MIN, RIFT_WARP, RIFT_WARP_FREQ,
+  RIFT_MIN_AREA, RIFT_MIN_SHARE, RIFT_REF_PLATES, RIFT_SIZE_FACTOR_MAX, RIFT_SIZE_FACTOR_MIN, RIFT_SPEED_MAX,
+  RIFT_SPEED_MIN, RIFT_WARP, RIFT_WARP_FREQ,
 } from './simConstants';
 import { splitPlate } from './simSplit';
 import { plateCap, type PlateSlot, type SimState } from './simState';
 
 /**
- * I. Poisson rifting (riftRate events per 100 Myr, only below the plate cap): a plate chosen with
+ * I. Poisson rifting (riftRate events per 100 Myr for a world of RIFT_REF_PLATES equal plates, more when
+ * plates are larger, see sizeFactor; only below the plate cap): a plate chosen with
  * weight area × (1 + continental fraction) splits along a noise-warped bisector between two
  * far-apart seeds; the halves get ω ∓ Δω/2 so they separate at 20–60 km/Myr.
  * Returns true when a rift happened.
@@ -18,10 +20,19 @@ export function maybeRift(state: SimState, rng: Rng, dt: number): boolean {
   const rate = state.params.riftRate;
   if (!(rate > 0)) return false;
   const roll = rng.next();
-  let live = 0;
-  for (const p of state.slots) if (p) live++;
+  let live = 0, sumA2 = 0;
+  for (const p of state.slots) {
+    if (!p) continue;
+    live++;
+    const a = p.visible / state.n;
+    sumA2 += a * a;
+  }
   if (live >= plateCap(state)) return false;
-  if (roll >= 1 - Math.exp((-rate * dt) / 100)) return false;
+  // Large plates break up more readily (a supercontinent insulates the mantle beneath it): the rate
+  // scales with Σ A_k² (area-weighted mean plate size), relative to RIFT_REF_PLATES equal plates, so
+  // a world that has welded into a few large plates starts rifting again (plate count self-regulates).
+  const sizeFactor = Math.min(RIFT_SIZE_FACTOR_MAX, Math.max(RIFT_SIZE_FACTOR_MIN, sumA2 * RIFT_REF_PLATES));
+  if (roll >= 1 - Math.exp((-rate * sizeFactor * dt) / 100)) return false;
   const minCells = RIFT_MIN_AREA * state.n;
   let total = 0;
   const weights: Array<[number, number]> = [];

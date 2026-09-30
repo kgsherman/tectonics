@@ -46,21 +46,29 @@ describe('Stommel ocean', () => {
     const res = computeOcean(ctx, U, V, null);
     const n = g.n;
     // Row at ~30°N: northward flow along the western boundary, weak southward flow in the interior.
+    // The boundary current is ~1–2 cells wide (Stommel width ≈ one grid cell): take the stronger of
+    // the two ocean cells next to the western wall (lon −89°, −87°).
     const j = Math.floor((90 - 29) / 2);
     const westCol = Math.floor((-88 + 180) / 2);
     const midCol = Math.floor((20 + 180) / 2);
-    let vWest = 0, vMid = 0;
+    let vWest = 0, vWest1 = 0, vMid = 0;
     for (let m = 0; m < 12; m++) {
       vWest += res.currentV[m * n + j * g.nx + westCol] / 12;
+      vWest1 += res.currentV[m * n + j * g.nx + westCol - 1] / 12;
       vMid += res.currentV[m * n + j * g.nx + midCol] / 12;
     }
+    vWest = Math.max(vWest, vWest1);
     expect(vWest).toBeGreaterThan(0.1);
     expect(vMid).toBeLessThan(0);
     expect(Math.abs(vWest)).toBeGreaterThan(5 * Math.abs(vMid));
     // Southern hemisphere mirror: southward western boundary current.
     const js = Math.floor((90 + 29) / 2);
-    let vWestS = 0;
-    for (let m = 0; m < 12; m++) vWestS += res.currentV[m * n + js * g.nx + westCol] / 12;
+    let vWestS = 0, vWestS1 = 0;
+    for (let m = 0; m < 12; m++) {
+      vWestS += res.currentV[m * n + js * g.nx + westCol] / 12;
+      vWestS1 += res.currentV[m * n + js * g.nx + westCol - 1] / 12;
+    }
+    vWestS = Math.min(vWestS, vWestS1);
     expect(vWestS).toBeLessThan(-0.1);
     for (let i = 0; i < 12 * n; i++) {
       expect(Number.isFinite(res.currentU[i]) && Number.isFinite(res.currentV[i])).toBe(true);

@@ -54,14 +54,140 @@ export function omegaFromMotion(anchor: Vec3, speed: number, bearingDeg: number,
  * (ARROW_RAD_PER_KM_MYR, capped at MAX_PLATE_SPEED), its initial great-circle direction the bearing.
  * The existing spin is preserved. `snapDeg` rounds the bearing (Shift-drag).
  */
-export function omegaFromDrag(anchor: Vec3, head: Vec3, spin: number, snapDeg = 0): Vec3 {
-  const theta = angleBetween(anchor, head);
-  const speed = Math.min(MAX_PLATE_SPEED, theta / ARROW_RAD_PER_KM_MYR);
-  if (speed < 0.05) return omegaFromMotion(anchor, 0, 0, spin);
-  const { east, north } = tangentBasis(anchor);
-  let bearing = Math.atan2(dot3(head, east), dot3(head, north)) * RAD;
-  if (snapDeg > 0) bearing = Math.round(bearing / snapDeg) * snapDeg;
+export function omegaFromDrag(anchor: Vec3, head: Vec3, spin: number, snapDeg = 0, snapSpeed = 0): Vec3 {
+  const { speed, bearing } = dragMotion(anchor, head, snapDeg, snapSpeed);
   return omegaFromMotion(anchor, speed, bearing, spin);
+}
+
+/**
+ * Speed (km/Myr, capped at MAX_PLATE_SPEED) and bearing (degrees, [0, 360)) of an arrow from
+ * `anchor` to `head`. `snapDeg` rounds the bearing, `snapSpeed` (km/Myr) the speed (Shift-drag).
+ */
+export function dragMotion(anchor: Vec3, head: Vec3, snapDeg = 0, snapSpeed = 0): { speed: number; bearing: number } {
+  const { east, north } = tangentBasis(anchor);
+  const bearing = Math.atan2(dot3(head, east), dot3(head, north)) * RAD;
+  return motionFromArrow(angleBetween(anchor, head), bearing, snapDeg, snapSpeed);
+}
+
+/**
+ * Lever drag of an arrow grabbed on its shaft at `grab` (arrow head then at `head0`): the pointer
+ * `p` moves the grabbed point, and the head follows in proportion — in the anchor's azimuthal
+ * equidistant frame, head = (|head0| / |grab|) · R(φ) · p. Returns the new head's distance
+ * (radians) and bearing (degrees).
+ */
+export function leverHead(anchor: Vec3, grab: Vec3, head0: Vec3, p: Vec3): { dist: number; bearing: number } {
+  const az = (q: Vec3) => {
+    const { east, north } = tangentBasis(anchor);
+    return { d: angleBetween(anchor, q), b: Math.atan2(dot3(q, east), dot3(q, north)) };
+  };
+  const g = az(grab), h = az(head0), c = az(p);
+  const ratio = g.d > 1e-6 ? Math.min(4, h.d / g.d) : 1;
+  let b = (c.b + (h.b - g.b)) * RAD;
+  b = ((b % 360) + 360) % 360;
+  return { dist: ratio * c.d, bearing: b };
+}
+
+/** Speed / bearing for an arrow of arc length `dist` (radians) toward `bearingDeg`, with optional snapping. */
+export function motionFromArrow(dist: number, bearingDeg: number, snapDeg = 0, snapSpeed = 0): { speed: number; bearing: number } {
+  let speed = Math.min(MAX_PLATE_SPEED, dist / ARROW_RAD_PER_KM_MYR);
+  if (snapSpeed > 0) speed = Math.min(MAX_PLATE_SPEED, Math.round(speed / snapSpeed) * snapSpeed);
+  if (speed < 0.05) return { speed: 0, bearing: 0 };
+  let bearing = snapDeg > 0 ? Math.round(bearingDeg / snapDeg) * snapDeg : bearingDeg;
+  bearing = ((bearing % 360) + 360) % 360;
+  return { speed, bearing };
+}
+
+/** The rotation taking unit vector `from` to `to` (about their common normal), applied to `p`. */
+export function rotateFromTo(from: Vec3, to: Vec3, p: Vec3): Vec3 {
+  const ax = cross3(from, to);
+  const s = Math.hypot(ax[0], ax[1], ax[2]);
+  const c = dot3(from, to);
+  if (s < 1e-12) {
+    if (c > 0) return [p[0], p[1], p[2]];
+    // Antipodal: any half-turn about an axis ⟂ from.
+    const t = tangentBasis(from).east;
+    const d = dot3(p, t);
+    return [2 * d * t[0] - p[0], 2 * d * t[1] - p[1], 2 * d * t[2] - p[2]];
+  }
+  const k: Vec3 = [ax[0] / s, ax[1] / s, ax[2] / s];
+  // Rodrigues: p cosθ + (k × p) sinθ + k (k·p)(1 − cosθ).
+  const kxp = cross3(k, p);
+  const kp = dot3(k, p) * (1 - c);
+  const x = p[0] * c + kxp[0] * s + k[0] * kp, y = p[1] * c + kxp[1] * s + k[1] * kp, z = p[2] * c + kxp[2] * s + k[2] * kp;
+  const l = Math.hypot(x, y, z) || 1;
+  return [x / l, y / l, z / l];
+}
+
+/** Angular distance from p to the great-circle arc a → b (radians). */
+export function distanceToArc(p: Vec3, a: Vec3, b: Vec3): number {
+  const ab = angleBetween(a, b);
+  const da = angleBetween(p, a);
+  if (ab < 1e-9) return da;
+  const nrm = cross3(a, b);
+  const nl = Math.hypot(nrm[0], nrm[1], nrm[2]);
+  const n: Vec3 = [nrm[0] / nl, nrm[1] / nl, nrm[2] / nl];
+  const off = dot3(p, n);
+  const q: Vec3 = [p[0] - off * n[0], p[1] - off * n[1], p[2] - off * n[2]];
+  const ql = Math.hypot(q[0], q[1], q[2]);
+  if (ql > 1e-12) {
+    const qn: Vec3 = [q[0] / ql, q[1] / ql, q[2] / ql];
+    if (Math.abs(angleBetween(a, qn) + angleBetween(qn, b) - ab) < 1e-7) return Math.asin(Math.min(1, Math.abs(off)));
+  }
+  return Math.min(da, angleBetween(p, b));
+}
+
+export interface ArrowHandle {
+  plate: number;
+  anchor: Vec3;
+  head: Vec3;
+}
+
+/**
+ * Which motion arrow the pointer at `p` grabs: the head within `headTol` wins (closest first), then
+ * the shaft within `tol` (closest first). Returns the plate index and the part, or null.
+ */
+export function hitArrow(handles: readonly ArrowHandle[], p: Vec3, tol: number, headTol = 1.4 * tol): { plate: number; part: 'head' | 'shaft' } | null {
+  let best = -1, bestD = headTol;
+  for (const h of handles) {
+    if (angleBetween(h.anchor, h.head) < 1e-9) continue;
+    const d = angleBetween(p, h.head);
+    if (d < bestD) {
+      bestD = d;
+      best = h.plate;
+    }
+  }
+  if (best >= 0) return { plate: best, part: 'head' };
+  bestD = tol;
+  for (const h of handles) {
+    const len = angleBetween(h.anchor, h.head);
+    if (len < 1e-9) continue;
+    // The tail third is left to the plate itself (pressing there draws a new arrow): levering the
+    // arrow that close to its pivot would be far too sensitive.
+    const s0 = Math.sin(len);
+    const t = 0.3;
+    const wa = Math.sin((1 - t) * len) / s0, wb = Math.sin(t * len) / s0;
+    const from: Vec3 = [wa * h.anchor[0] + wb * h.head[0], wa * h.anchor[1] + wb * h.head[1], wa * h.anchor[2] + wb * h.head[2]];
+    const d = distanceToArc(p, from, h.head);
+    if (d < bestD) {
+      bestD = d;
+      best = h.plate;
+    }
+  }
+  return best >= 0 ? { plate: best, part: 'shaft' } : null;
+}
+
+const COMPASS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+
+/** 16-point compass name of a bearing in degrees. */
+export function compassPoint(bearingDeg: number): string {
+  const b = ((bearingDeg % 360) + 360) % 360;
+  return COMPASS[Math.round(b / 22.5) % 16];
+}
+
+/** "4.5 cm/yr → 60° ENE" (speed in km/Myr). */
+export function formatMotion(speed: number, bearingDeg: number): string {
+  if (speed < 0.05) return 'stationary';
+  return `${(speed / 10).toFixed(1)} cm/yr → ${Math.round(bearingDeg) % 360}° ${compassPoint(bearingDeg)}`;
 }
 
 /** Where the arrow of a plate with angular velocity ω ends (its drag handle). */

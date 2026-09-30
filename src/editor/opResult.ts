@@ -16,9 +16,9 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
 function withTopology(message: string, topo?: TopologyResult): string {
   if (!topo) return message;
   const parts = [message];
-  if (topo.created.length) parts.push(`${plural(topo.created.length, 'detached piece', 'detached pieces')} became new plate${topo.created.length > 1 ? 's' : ''}`);
-  if (topo.removed.length) parts.push(`${plural(topo.removed.length, 'plate', 'plates')} painted over and removed`);
-  if (topo.merged) parts.push(`${plural(topo.merged, 'small fragment', 'small fragments')} merged into neighbours`);
+  if (topo.created.length) parts.push(`${plural(topo.created.length, 'new plate', 'new plates')}`);
+  if (topo.removed.length) parts.push(`${plural(topo.removed.length, 'empty plate', 'empty plates')} removed`);
+  if (topo.merged) parts.push(`${plural(topo.merged, 'stray sliver', 'stray slivers')} tidied into neighbours`);
   return parts.join(' · ');
 }
 

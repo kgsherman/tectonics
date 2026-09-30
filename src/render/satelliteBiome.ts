@@ -83,13 +83,13 @@ const EM: Record<string, ClassEndmember> = {
   Dsd: { treeCap: 0.75, evergreen: 0.6, sclero: 0, soil: [118, 106, 90] },
   Dwa: { treeCap: 0.85, evergreen: 0.35, sclero: 0, soil: [128, 106, 80] },
   Dwb: { treeCap: 0.9, evergreen: 0.5, sclero: 0, soil: [120, 102, 80] },
-  Dwc: { treeCap: 0.9, evergreen: 0.65, sclero: 0, soil: [112, 100, 84] },
+  Dwc: { treeCap: 0.85, evergreen: 0.65, sclero: 0, soil: [112, 100, 84] },
   Dwd: { treeCap: 0.85, evergreen: 0.25, sclero: 0, soil: [110, 100, 86] },
   Dfa: { treeCap: 0.9, evergreen: 0.3, sclero: 0, soil: [126, 104, 78] },
-  Dfb: { treeCap: 0.95, evergreen: 0.55, sclero: 0, soil: [116, 100, 80] },
-  Dfc: { treeCap: 0.95, evergreen: 0.85, sclero: 0, soil: [106, 98, 84] },
+  Dfb: { treeCap: 0.9, evergreen: 0.55, sclero: 0, soil: [116, 100, 80] },
+  Dfc: { treeCap: 0.85, evergreen: 0.85, sclero: 0, soil: [106, 98, 84] },
   // Dfd: Siberian larch taiga — deciduous needleleaf.
-  Dfd: { treeCap: 0.9, evergreen: 0.25, sclero: 0, soil: [106, 98, 86] },
+  Dfd: { treeCap: 0.8, evergreen: 0.25, sclero: 0, soil: [106, 98, 86] },
   // Polar classes: temperature (applied per pixel) removes trees; structure like the boreal zone.
   ET: { treeCap: 0.85, evergreen: 0.8, sclero: 0, soil: [112, 104, 92] },
   EF: { treeCap: 0.85, evergreen: 0.8, sclero: 0, soil: [122, 116, 108] },
@@ -362,6 +362,10 @@ export function buildSatelliteGrid(climate: SatelliteClimate, month: number): Sa
   }
   dilateLand(land, isLand, cw, ch, LAND_K, 3);
   blurGrid(land, cw, ch, LAND_K, 2);
+  // SST is smoothed; sea ice is not, so its drawn extent is exactly the climate's.
+  const ice = new Float32Array(N);
+  for (let i = 0; i < N; i++) ice[i] = ocean[i * OCEAN_K + O_ICE];
   blurGrid(ocean, cw, ch, OCEAN_K, 1);
+  for (let i = 0; i < N; i++) ocean[i * OCEAN_K + O_ICE] = ice[i];
   return { cw, ch, land: padGrid(land, cw, ch, LAND_K), ocean: padGrid(ocean, cw, ch, OCEAN_K) };
 }

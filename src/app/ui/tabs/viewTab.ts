@@ -29,7 +29,7 @@ export function createViewTab(ctx: UiContext): HTMLElement {
   const lighting = segmented<LightingChoice>({
     label: 'Lighting',
     options: [
-      { value: 'auto', label: 'Auto', title: 'Flat for data layers, relief/sun for the satellite view' },
+      { value: 'auto', label: 'Auto', title: 'Flat for data layers; relief for satellite and elevation, lit by the month’s sun on the globe' },
       { value: 'flat', label: 'Flat', title: 'Exact legend colors' },
       { value: 'relief', label: 'Relief', title: 'Camera-relative light with relief shading' },
       { value: 'sun', label: 'Sun', title: 'Day/night with the month’s solar declination' },
@@ -85,6 +85,6 @@ export function createViewTab(ctx: UiContext): HTMLElement {
     section('Weather', particles.el, count.el, clouds.el, density.el, weatherNote),
     section('Seasons', seasonLen.el, seasonsBtn),
     section('Export', h('div', { class: 'wg-row' }, exportMap, shot)),
-    section('Keyboard', h('dl', { class: 'wg-stats' }, ...SHORTCUTS.flatMap(([k, label]) => [h('dt', null, h('kbd', { text: k })), h('dd', { text: label })]))),
+    section('Keyboard', h('dl', { class: 'wg-keys' }, ...SHORTCUTS.flatMap(([k, label]) => [h('dt', null, h('kbd', { text: k })), h('dd', { text: label })]))),
   );
 }

@@ -40,9 +40,10 @@ function overrides(state: SimState, T: number, crustT: number, K: number, crustK
  * E (part 1). Detect subduction and collision fronts from the persistent boundary geometry: a front
  * is a top-plate cell next to a plate K that goes under it at the contact, converging faster than
  * CONSUME_MIN_VCONV (smooth 3-ring boundary normal). Also fills per-plate perimeters, collision
- * contacts per plate pair and the slab-pull accumulators.
+ * contacts per plate pair and the slab-pull accumulators. `deep` (optional): the interior mask of the
+ * current step, whose flagged cells are skipped.
  */
-export function detectFronts(state: SimState): StepScratch {
+export function detectFronts(state: SimState, deep: Uint8Array | null = null): StepScratch {
   const sc = stepScratch(state);
   const { n, top, wCrust, pairs } = state;
   const { xyz, adjOffset, adj } = state.sm;
@@ -64,6 +65,8 @@ export function detectFronts(state: SimState): StepScratch {
   pairs.vconvSum.fill(0);
 
   for (let i = 0; i < n; i++) {
+    // Cells deep inside a plate at the start of the step (markDeepInterior) cannot be boundary cells.
+    if (deep !== null && deep[i] === 0) continue;
     const T = top[i];
     let handled = 0;
     let boundary = false;

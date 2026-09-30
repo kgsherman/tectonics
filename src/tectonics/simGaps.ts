@@ -4,6 +4,7 @@ import { divergenceAt } from './simGeometry';
 import {
   assignTop, claimCell, copyLatticeCell, createRidgeCrust, latticeDot, nearestOwnedAround, pullLattice, toPlateFrame,
 } from './simLattice';
+import { dirtySet, markTopChanged } from './simDirty';
 import type { PlateSlot, SimState } from './simState';
 
 /** Per-state scratch of the gap pass. */
@@ -31,18 +32,44 @@ const distinct = new Int32Array(16);
  * A lattice cell removed by the plate pass or a speck transfer may still be the pulled source of
  * other world cells (pull and push maps are not inverses): those lose their top and join the gaps.
  */
-export function markOrphanedTops(state: SimState): void {
+export function markOrphanedTops(state: SimState, full = true): void {
   const { n, top, src, slots, gaps } = state;
   const orphanOf = scratch(state).orphanOf;
+  const d = dirtySet(state);
   let count = state.gapCount;
-  for (let i = 0; i < n; i++) {
+  const orphan = (i: number): void => {
     const t = top[i];
-    if (t < 0 || (slots[t] as PlateSlot).owned[src[i]]) continue;
+    if (t < 0 || (slots[t] as PlateSlot).owned[src[i]]) return;
     orphanOf[i] = t;
     top[i] = -1;
     state.loser[i] = 0;
     gaps[count++] = i;
+    markTopChanged(state, i);
+  };
+  if (full) {
+    for (let i = 0; i < n; i++) orphan(i);
+  } else if (d.releaseCount > 0) {
+    // Other world cells pulling a released lattice cell lie within ~2 rings of where it showed or
+    // was pushed (both sit in its Voronoi region): check the 3-ring disks, in index order.
+    const { diskOffset, disk } = state.sm;
+    const cand = d.orphanCand;
+    for (let r = 0; r < d.releaseCount; r++) {
+      const i = d.releases[r];
+      cand[i >>> 5] |= 1 << (i & 31);
+      for (let q = diskOffset[i], e = diskOffset[i + 1]; q < e; q++) cand[disk[q] >>> 5] |= 1 << (disk[q] & 31);
+    }
+    for (let w = 0, words = cand.length; w < words; w++) {
+      let bits = cand[w];
+      if (bits === 0) continue;
+      cand[w] = 0;
+      while (bits !== 0) {
+        const low = bits & -bits;
+        bits ^= low;
+        orphan((w << 5) + 31 - Math.clz32(low));
+      }
+    }
   }
+  d.releaseCount = 0;
   state.gapCount = count;
 }
 
@@ -64,6 +91,7 @@ export function fillGaps(state: SimState): boolean {
       const i = list[q];
       if (state.top[i] >= 0) continue;
       if (!fillGap(state, i, sc.orphanOf)) other[next++] = i;
+      else markTopChanged(state, i);
     }
     if (next === count) throw new Error(`fillGaps: ${count} gap cells have no covered cell nearby`);
     const t = list;

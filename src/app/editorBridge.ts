@@ -20,12 +20,25 @@ export interface EditorBridgeOptions {
   onApply: (draft: WorldDraft) => void;
   seaLevel: () => number;
   onError: (title: string, detail: string) => void;
+  /**
+   * Identity of the live simulation state (e.g. seed + step count). When it changed since the editor
+   * was seeded and the user has not edited the seed, entering the editor reseeds it from the current
+   * simulation — the plates on screen are the ones the user expects to edit.
+   */
+  worldStamp?: () => string;
+}
+
+/** Cheap identity of an editor draft: edits bump the revision; Blank/Random/Current starts change time or plates. */
+function draftFingerprint(d: WorldDraft): string {
+  return `${d.revision ?? 0}|${d.time}|${d.n}|${d.plates.map((p) => p.id).join(',')}`;
 }
 
 export class EditorBridge {
   private editor: PlateEditor | null = null;
   private editorMeshN = 0;
   private seeded = false;
+  private seedStamp = '';
+  private seedFingerprint = '';
   private active = false;
 
   constructor(private readonly o: EditorBridgeOptions) {}
@@ -44,10 +57,15 @@ export class EditorBridge {
     }
     try {
       if (!this.editor || this.editorMeshN !== mesh.n) this.create(mesh);
+      const stamp = this.o.worldStamp?.() ?? '';
+      // The simulation moved on and the editor still holds the untouched old seed: follow it.
+      if (this.seeded && stamp !== this.seedStamp && draftFingerprint(this.editor!.getDraft()) === this.seedFingerprint) this.seeded = false;
       if (!this.seeded) {
         const draft = await this.o.requestDraft('current');
-        this.editor!.setDraft(draft);
+        this.editor!.setDraft(draft, 'current');
         this.seeded = true;
+        this.seedStamp = stamp;
+        this.seedFingerprint = draftFingerprint(this.editor!.getDraft());
       }
       // One sea level (SPEC §2): it may have changed since the editor was created.
       this.editor!.setSeaLevel(this.o.seaLevel());

@@ -13,7 +13,7 @@ import { DEFAULT_TECTONIC_PARAMS } from '../src/tectonics/sim';
 import { ClimateHost } from '../src/worker/climateHost';
 import { KeyframeStore } from '../src/worker/keyframes';
 import type { ClimateEvent, ClimatePortMessage, DisplaySettings, FrameMessage, SimEvent, WorldLoaded } from '../src/worker/protocol';
-import { SimHost } from '../src/worker/simHost';
+import { InlinePipeline } from '../src/worker/inlinePipeline';
 import { zonalClimate } from './helpers/fixtures';
 
 const DISPLAY: DisplaySettings = {
@@ -25,7 +25,7 @@ const GEN = { ...DEFAULT_GENERATE_PARAMS, seed: 5, plateCount: 6 };
 function harness() {
   const events: Array<{ msg: SimEvent; transfer: Transferable[] }> = [];
   const queue: Array<() => void> = [];
-  const host = new SimHost({
+  const host = new InlinePipeline({
     post: (msg, transfer) => events.push({ msg, transfer: transfer ?? [] }),
     schedule: (fn) => queue.push(fn),
     now: () => performance.now(),
@@ -70,7 +70,8 @@ describe('SimHost', () => {
     expect(fullEv.transfer).toContain(full.rgba!.buffer);
     expect(fullEv.transfer).toContain(full.heightMap!.buffer);
 
-    // Play: at most two unacknowledged frames.
+    // Play: at most two unacknowledged frames. The sim steps while a frame is painted, so it runs
+    // one frame ahead of the paint worker, then waits for its credit.
     t.clear();
     t.host.handle({ type: 'play', reqId: 2, epoch: 1, stepsPerFrame: 2, display: DISPLAY });
     t.flush();
@@ -92,9 +93,13 @@ describe('SimHost', () => {
     expect(paused[0]).toMatchObject({ kind: 'still', quality: 'full', reqId: 3, epoch: 2 });
     const status = t.take('status').pop()!.msg;
     expect(status.playing).toBe(false);
-    expect(status.time).toBe(6);
+    // Three frames shown (t = 2, 4, 6); the pipelined sim had already computed t = 8, which the pause
+    // frame shows at full quality. (Serial topology: 6.)
+    expect(frames.map((f) => f.time)).toEqual([2, 4, 6]);
+    expect(status.time).toBe(8);
+    expect(paused[0].time).toBe(8);
     const hist = t.take('history').pop()!.msg;
-    expect(hist.keyframes.map((k) => k.time)).toEqual([0, 2, 4, 6]);
+    expect(hist.keyframes.map((k) => k.time)).toEqual([0, 2, 4, 6, 8]);
 
     // Late acks after pause are harmless and do not restart playback.
     t.host.handle({ type: 'frameAck', reqId: 0, epoch: 2, frameId: frames[2].frameId });
@@ -147,10 +152,25 @@ describe('SimHost', () => {
 
     t.clear();
     t.host.handle({ type: 'play', reqId: 13, epoch: 1, stepsPerFrame: 1, display: DISPLAY });
+    t.flush(); // the paint worker is in playback once the first snapshot arrived
+    const inFlight = t.take('frame').map((e) => e.msg as FrameMessage);
+    expect(inFlight.map((f) => f.layer)).toEqual(['plates', 'plates']);
+    t.clear();
     t.host.handle({ type: 'paint', reqId: 14, epoch: 1, display: { ...DISPLAY, layer: 'crustAge' }, quality: 'full', parts: 'all' });
     expect(t.take('superseded').map((e) => e.msg.reqId)).toEqual([14]);
+    t.host.handle({ type: 'frameAck', reqId: 0, epoch: 1, frameId: 1e9 }); // unknown id: ignored
     t.flush();
-    expect((t.take('frame')[0].msg as FrameMessage).layer).toBe('crustAge');
+    expect(t.take('frame')).toHaveLength(0); // two frames already unacknowledged
+    // Acks free the gate: the next playback frames use the superseded request's display.
+    for (const f of inFlight) t.host.handle({ type: 'frameAck', reqId: 0, epoch: 1, frameId: f.frameId });
+    t.flush();
+    const next = t.take('frame').map((e) => e.msg as FrameMessage);
+    expect(next.length).toBeGreaterThan(0);
+    expect(next.every((f) => f.kind === 'play' && f.layer === 'crustAge')).toBe(true);
+    t.clear();
+    t.host.handle({ type: 'pause', reqId: 15, epoch: 2, display: { ...DISPLAY, layer: 'crustAge', seq: 1 } });
+    t.flush();
+    expect((t.take('frame').pop()!.msg as FrameMessage).layer).toBe('crustAge');
   });
 
   it('builds climate inputs, accepts climates for this world only and repaints with them', () => {
@@ -169,13 +189,16 @@ describe('SimHost', () => {
     const base = zonalClimate(36, 18);
     t.clear();
     expect(t.host.receiveClimate({ ...base, id: 500, sourceSnapshotId: 123456789 })).toBe(false);
-    expect(t.take('climateApplied')).toHaveLength(0);
+    // The source registration travels sim → paint and may arrive after the climate: it waits.
     const climate: ClimateResult = { ...base, id: 501, sourceSnapshotId: input.sourceId!, sourceTime: 0 };
-    expect(t.host.receiveClimate(climate)).toBe(true);
-    expect(t.take('climateApplied')[0].msg).toMatchObject({ climateId: 501 });
+    expect(t.host.receiveClimate(climate)).toBe(false);
+    expect(t.take('climateApplied')).toHaveLength(0);
+    t.flush();
+    expect(t.take('climateApplied').map((e) => e.msg.climateId)).toEqual([501]); // never 500
+    expect(t.host.receiveClimate({ ...climate, id: 502 })).toBe(true);
     t.flush();
     const f = t.take('frame').pop()!.msg as FrameMessage;
-    expect(f.climateId).toBe(501);
+    expect(f.climateId).toBe(502);
     expect(f.layer).toBe('temperature');
   });
 
@@ -194,6 +217,7 @@ describe('SimHost', () => {
     expect(d.n).toBe(4000);
     expect(t.events.find((e) => e.msg.type === 'reply' && e.msg.reqId === 3)!.transfer).toContain(d.plate.buffer);
     t.host.handle({ type: 'exportImage', reqId: 4, epoch: 1, display: { ...DISPLAY, overlays: { boundaries: false, graticule: true, coastlines: false } }, width: 96, height: 48 });
+    t.flush(); // the paint worker receives the world over the sim channel
     const img = (t.reply(4) as { data: { rgba: Uint8ClampedArray; overlay: Uint8ClampedArray | null } }).data;
     expect(img.rgba.length).toBe(96 * 48 * 4);
     expect(img.overlay!.length).toBe(96 * 48 * 4);
@@ -244,12 +268,12 @@ function fakeSimWorker(): WorkerLike {
     onmessage: null,
     onerror: null,
     postMessage(msg: unknown, transfer?: Transferable[]) {
-      const m = structuredClone(msg, { transfer: transfer ?? [] }) as Parameters<SimHost['handle']>[0];
+      const m = structuredClone(msg, { transfer: transfer ?? [] }) as Parameters<InlinePipeline['handle']>[0];
       later(() => host.handle(m));
     },
     terminate() {},
   };
-  const host = new SimHost({
+  const host = new InlinePipeline({
     post: (m, tr) => {
       const c = structuredClone(m, { transfer: tr ?? [] });
       later(() => worker.onmessage?.({ data: c } as MessageEvent));

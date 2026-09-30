@@ -70,7 +70,7 @@ export const VIEW_SPECS: Record<ViewNumKey, NumSpec> = {
   reliefScale: { min: 0, max: 4, step: 0.1, label: 'Relief exaggeration', unit: '×' },
   particleCount: { min: 1000, max: 16000, step: 500, label: 'Particles' },
   detail: { min: 0, max: 2, step: 0.05, label: 'Terrain detail', unit: '×', hint: 'Procedural terrain amplification' },
-  cloudDensity: { min: 0.1, max: 1, step: 0.05, label: 'Cloud density', unit: '×', hint: 'Display scale on the climate’s cloud cover (1 = all cloud, incl. thin cloud, drawn opaque)' },
+  cloudDensity: { min: 0, max: 1, step: 0.05, label: 'Cloud density', unit: '×', hint: 'Cloudiness: 0.4 ≈ Earth-like, 1 = stormy' },
 };
 
 export const SEASON_SECONDS_SPEC: NumSpec = { min: 0.4, max: 3, step: 0.1, label: 'Month duration', unit: 's' };

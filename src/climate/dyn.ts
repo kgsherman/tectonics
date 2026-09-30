@@ -4,10 +4,10 @@
  *   input → output surface (gridW×gridH) → core grid (2°, 3° fast)
  *   pass 1: energy balance without currents (steady solve → periodic init → years + Aitken)
  *           → pressure & winds → Stommel currents, Ekman upwelling
- *   pass 2: energy balance with air advection by the steering wind (terrain-aware), mixed-layer
- *           advection by currents, upwelling cooling toward a tilted-thermocline T_sub and a
- *           subsidence (clear-sky) land albedo, started from the pass-1 state (years + Aitken) or
- *           from a previous result (warm start)
+ *   pass 2: energy balance with air advection by the boundary-layer flow (terrain-aware),
+ *           mixed-layer advection by currents, upwelling cooling toward a tilted-thermocline T_sub
+ *           and cloud-regime albedo offsets (dynCloud.ts), started from the pass-1 state (years +
+ *           Aitken) or from a previous result (warm start)
  *   → final pressure/winds/currents from the pass-2 temperatures → output grid.
  */
 import { LAPSE_RATE } from '../core/constants';
@@ -15,6 +15,7 @@ import type { ClimateInput, ClimateParams } from '../core/types';
 import type { DynamicsResult } from './internal';
 import { computeCirculation, type Circulation } from './circulation';
 import { applyStencil, buildStencil, type SLStencil } from './dynAdvect';
+import { cloudAlbedoOffset } from './dynCloud';
 import { globalMean } from './dynGrid';
 import { prepareCoreSurface, prepareOutputSurface, warmState, type WarmFields } from './dynInput';
 import { assembleOutput } from './dynOutput';
@@ -94,7 +95,7 @@ export function computeDynamics(
   let circ = computeCirculation(g, mon1.tAir, core.land, core.landFraction, params);
   lap('dyn.circulation');
   const oceanCtx = makeOceanContext(g, core.landFraction, core.land, params.retrograde);
-  let ocean = computeOcean(oceanCtx, circ.windU, circ.windV, null, params.fast);
+  let ocean = computeOcean(oceanCtx, circ.windU, circ.windV, null, params.fast, circ.baroclinic);
   lap('dyn.ocean');
   progress(0.5);
 
@@ -110,7 +111,7 @@ export function computeDynamics(
   // ---- Final circulation consistent with the output temperatures.
   circ = computeCirculation(g, mon2.tAir, core.land, core.landFraction, params);
   lap('dyn.circulation');
-  ocean = computeOcean(oceanCtx, circ.windU, circ.windV, ocean, params.fast);
+  ocean = computeOcean(oceanCtx, circ.windU, circ.windV, ocean, params.fast, circ.baroclinic);
   lap('dyn.ocean');
   for (const [k, v] of Object.entries(ocean.stats)) stats[`ocean.${k}`] = v;
 
@@ -182,7 +183,7 @@ export function makeCoupling(M: EbmModel, land: Uint8Array, circ: Circulation, o
   const sea: SLStencil[] = [];
   const oceanScale = Math.max(0, params.oceanCurrents);
   for (let m = 0; m < 12; m++) {
-    air.push(buildStencil(g, circ.steerU, circ.steerV, m * n, t.heatAdvectionFactor, M.dt, t.cellsPerSubstep, t.maxSubsteps));
+    air.push(buildStencil(g, circ.heatU, circ.heatV, m * n, t.heatAdvectionFactor, M.dt, t.cellsPerSubstep, t.maxSubsteps));
     sea.push(buildStencil(g, ocean.currentU, ocean.currentV, m * n, t.sstAdvectionFactor * oceanScale, M.dt, t.cellsPerSubstep, t.maxSubsteps));
   }
   // Land coupling of advected air from the terrain rise dh along one air sub-step: cold air
@@ -210,16 +211,10 @@ export function makeCoupling(M: EbmModel, land: Uint8Array, circ: Circulation, o
   const k = t.rhoCpWater * t.upwellingEfficiency * oceanScale;
   for (let i = 0; i < 12 * n; i++) upwellLambda[i] = k * ocean.upwelling[i];
   const tSub = subsurfaceTemperature(g, land, mon1.sst, circ.windU, params.retrograde);
-  // Cloud proxy over land: large-scale subsidence (negative ascent) means clear, darker skies.
-  const landAlbedoOffset = new Float64Array(12 * n);
-  for (let m = 0; m < 12; m++) {
-    for (let i = 0; i < n; i++) {
-      if (!land[i]) continue;
-      const sub = Math.min(t.subsidenceMax, Math.max(0, -circ.ascent[m * n + i]));
-      landAlbedoOffset[m * n + i] = -t.subsidenceAlbedo * sub;
-    }
-  }
-  return { air, airWarm, airCold, landAlbedoOffset, sea: hasOcean ? sea : null, nearestOcean: hasOcean ? nearestOcean : null, upwellLambda, tSub };
+  // Cloud regimes of the circulation: clear skies under subsidence, bright storm tracks and
+  // stratocumulus over cold water (dynCloud.ts).
+  const albedoOffset = cloudAlbedoOffset(g, land, circ, mon1.sst, upwellLambda, tSub);
+  return { air, airWarm, airCold, albedoOffset, sea: hasOcean ? sea : null, nearestOcean: hasOcean ? nearestOcean : null, upwellLambda, tSub };
 }
 
 function collectStats(g: EbmModel['g'], mon: EbmMonthly, land: Uint8Array, stats: Record<string, number>): void {

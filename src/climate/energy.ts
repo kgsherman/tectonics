@@ -35,6 +35,7 @@ import type { SLStencil } from './dynAdvect';
 import type { LatLonGrid } from './dynGrid';
 import { insolationTable } from './insolation';
 import { makeCyclicWork, type CyclicWork } from './numerics';
+import { overturningHeating } from './energyOverturning';
 import { ebmTuning } from './tuning';
 
 export const SECONDS_PER_YEAR = 365.2422 * 86400;
@@ -73,6 +74,8 @@ export interface EbmModel {
   oN: Float64Array;
   oS: Float64Array;
   /** Sea-ice enthalpy at full cover and at the thickness cap, J/m² (positive numbers). */
+  /** Interhemispheric overturning heat source per ocean cell (W/m²), or null (energyOverturning.ts). */
+  overturning: Float64Array | null;
   eFull: number;
   eMax: number;
   work: EbmWork;
@@ -81,6 +84,12 @@ export interface EbmModel {
 export interface EbmState {
   T: Float64Array;
   E: Float64Array;
+  /**
+   * Heat (J/m², ≥ 0) of the seasonal stratified surface layer above the (winter-depth) mixed layer:
+   * spring/summer heating warms a thin layer (stratDepth) that the wind and autumn convection mix
+   * back down; the surface temperature is T_f + E/C_o + Es/C_s.
+   */
+  Es: Float64Array;
   Ti: Float64Array;
   /** Running annual mean of the surface temperature (1-year e-folding), °C: tells ice sheets from seasonal snow. */
   Tann: Float64Array;
@@ -97,8 +106,11 @@ export interface EbmCoupling {
    */
   airWarm: Float32Array | null;
   airCold: Float32Array | null;
-  /** Per month (12·n): planetary-albedo offset over land from cloudiness (clear skies under subsidence). */
-  landAlbedoOffset: Float64Array | null;
+  /**
+   * Per month (12·n): planetary-albedo offset from the dynamics' cloud structure (land and open
+   * water): clear skies under subsidence, persistent storm-track and marine stratocumulus decks.
+   */
+  albedoOffset: Float64Array | null;
   sea: SLStencil[] | null;
   /** Nearest ocean cell per cell (extends SST under land before advection). */
   nearestOcean: Int32Array | null;
@@ -108,7 +120,7 @@ export interface EbmCoupling {
   tSub: Float64Array | null;
 }
 
-export const NO_COUPLING: EbmCoupling = { air: null, airWarm: null, airCold: null, landAlbedoOffset: null, sea: null, nearestOcean: null, upwellLambda: null, tSub: null };
+export const NO_COUPLING: EbmCoupling = { air: null, airWarm: null, airCold: null, albedoOffset: null, sea: null, nearestOcean: null, upwellLambda: null, tSub: null };
 
 /** Monthly means (12·n each): air temperature (sea-level reduced over land), SST, sea-ice fraction. */
 export interface EbmMonthly {
@@ -123,6 +135,11 @@ export interface EbmWork {
   dep: Float64Array;
   To: Float64Array;
   tAirMean: Float64Array;
+  /** Per-cell stability factor and the scaled air diffusion couplings (stable land surfaces). */
+  stab: Float64Array;
+  kE2: Float64Array;
+  kN2: Float64Array;
+  kS2: Float64Array;
   cEff: Float64Array;
   ice: Float64Array;
   ra: Float64Array;
@@ -139,11 +156,25 @@ export interface EbmWork {
   cyc: CyclicWork;
 }
 
-/** Diffusivity D(φ) on the unit sphere (W/m²/K). */
-export function diffusivity(sinPhi: number): number {
+/**
+ * Diffusivity D(φ) on the unit sphere (W/m²/K). `meridional` faces carry the Hadley enhancement:
+ * the thermally direct tropical overturning moves heat across a nearly flat temperature profile
+ * (weak temperature gradients in the tropics, Lindzen & Farrell 1977), i.e. a large effective
+ * diffusivity inside |φ| ≲ hadleyLat with a sharp (super-Gaussian) edge.
+ */
+export function diffusivity(sinPhi: number, meridional = false, tiltDeg = 23.44): number {
   const s2 = sinPhi * sinPhi;
   const t = ebmTuning;
-  return t.diffusion * Math.max(0.05, 1 + t.diffusionD2 * s2 + t.diffusionD4 * s2 * s2);
+  let d = t.diffusion * Math.max(0.05, 1 + t.diffusionD2 * s2 + t.diffusionD4 * s2 * s2);
+  // At high obliquity the annual-mean insolation maximum leaves the equator and the overturning
+  // follows the sun across the hemisphere: the fixed equatorial enhancement fades out.
+  const tiltFade = Math.min(1, Math.max(0, (t.hadleyTiltMax - tiltDeg) / (t.hadleyTiltMax - t.hadleyTiltFull)));
+  if (t.hadleyBoost > 0 && tiltFade > 0) {
+    const x = Math.asin(Math.max(-1, Math.min(1, sinPhi))) / ((t.hadleyLat * Math.PI) / 180);
+    const w = Math.exp(-Math.pow(x * x, t.hadleyPower / 2));
+    d *= 1 + tiltFade * (meridional ? t.hadleyBoost : t.hadleyBoost * t.hadleyZonalFactor) * w;
+  }
+  return d;
 }
 
 export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Array, params: ClimateParams, stepsPerMonth: number): EbmModel {
@@ -178,7 +209,7 @@ export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Arr
     albWater[j] = albLand[j] + t.albedoOceanOffset;
     cOcean[j] = t.rhoCpWater * (t.mixedLayerMin + (t.mixedLayerMax - t.mixedLayerMin) * s * s);
     // Zonal faces: length dφ, center distance cosφ·dλ; per unit cell area.
-    const kx = (diffusivity(s) * g.dLat) / (g.cosLat[j] * g.dLon * g.area[j]);
+    const kx = (diffusivity(s, false, params.axialTilt) * g.dLat) / (g.cosLat[j] * g.dLon * g.area[j]);
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
       const e = j * nx + (c === nx - 1 ? 0 : c + 1);
@@ -187,7 +218,7 @@ export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Arr
   }
   for (let j = 0; j + 1 < ny; j++) {
     // Face between rows j and j+1 at faceSin[j+1]: length dλ·cosφ_f, center distance dφ.
-    const flux = (diffusivity(g.faceSin[j + 1]) * g.dLon * g.faceCos[j + 1]) / g.dLat;
+    const flux = (diffusivity(g.faceSin[j + 1], true, params.axialTilt) * g.dLon * g.faceCos[j + 1]) / g.dLat;
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
       const f = flux * 0.5 * (fc(i) + fc(i + nx));
@@ -201,15 +232,37 @@ export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Arr
   const oS = new Float64Array(n);
   const Do = t.oceanDiffusion;
   for (let j = 0; j < ny; j++) {
-    const kx = (Do * g.dLat) / (g.cosLat[j] * g.dLon * g.area[j]);
+    // Zonal SST contrasts (upwelling tongues, warm pools) are set by currents and upwelling, which
+    // the model resolves; the diffusion mainly stands in for unresolved meridional transport.
+    const kx = (Do * t.oceanZonalDiffusionFactor * g.dLat) / (g.cosLat[j] * g.dLon * g.area[j]);
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
       const e = j * nx + (c === nx - 1 ? 0 : c + 1);
       if (!land[i] && !land[e]) oE[i] = kx;
     }
   }
+  // Zonally open channels (a circumpolar ocean) block meridional ocean heat transport: no zonal
+  // pressure gradient can support a mean geostrophic meridional flow and there are no western
+  // boundary currents, so only eddies cross the channel (the Drake Passage effect).
+  const open = new Float64Array(ny);
+  for (let j = 0; j < ny; j++) {
+    let best = 0;
+    let run = 0;
+    let all = true;
+    for (let k = 0; k < 2 * nx; k++) {
+      if (!land[j * nx + (k % nx)]) {
+        run++;
+        if (run > best) best = run;
+      } else {
+        run = 0;
+        all = false;
+      }
+    }
+    open[j] = all ? 1 : Math.min(1, best / nx);
+  }
   for (let j = 0; j + 1 < ny; j++) {
-    const flux = (Do * g.dLon * g.faceCos[j + 1]) / g.dLat;
+    const o = Math.pow(Math.max(open[j], open[j + 1]), t.channelDiffusionPower);
+    const flux = ((Do * g.dLon * g.faceCos[j + 1]) / g.dLat) * (1 - (1 - t.channelDiffusionFactor) * o);
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
       if (land[i] || land[i + nx]) continue;
@@ -222,6 +275,7 @@ export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Arr
   const m = Math.max(nx, ny);
   const work: EbmWork = {
     F: new Float64Array(n), dep: new Float64Array(n), To: new Float64Array(n), tAirMean: new Float64Array(n),
+    stab: new Float64Array(n), kE2: new Float64Array(n), kN2: new Float64Array(n), kS2: new Float64Array(n),
     cEff: new Float64Array(n), ice: new Float64Array(n),
     ra: new Float64Array(m), rb: new Float64Array(m), rc: new Float64Array(m), rd: new Float64Array(m), rx: new Float64Array(m),
     ca: new Float64Array(m), cb: new Float64Array(m), cc: new Float64Array(m), cd: new Float64Array(m), cx: new Float64Array(m),
@@ -230,16 +284,22 @@ export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Arr
   return {
     g, land, lapse, freeTrop, stepsPerMonth, stepsPerYear, dt: SECONDS_PER_YEAR / stepsPerYear,
     insol: insolationTable(g, stepsPerYear, params.axialTilt, params.solarMultiplier),
-    albLand, albWater, cOcean, kE, kN, kS, oE, oN, oS, eFull, eMax, work,
+    albLand, albWater, cOcean, kE, kN, kS, oE, oN, oS, overturning: scaleOverturning(overturningHeating(g, land), params.oceanCurrents), eFull, eMax, work,
   };
 }
 
+function scaleOverturning(q: Float64Array | null, scale: number): Float64Array | null {
+  if (!q || !(scale > 0)) return null;
+  if (scale !== 1) for (let i = 0; i < q.length; i++) q[i] *= scale;
+  return q;
+}
+
 export function makeState(n: number): EbmState {
-  return { T: new Float64Array(n), E: new Float64Array(n), Ti: new Float64Array(n), Tann: new Float64Array(n) };
+  return { T: new Float64Array(n), E: new Float64Array(n), Es: new Float64Array(n), Ti: new Float64Array(n), Tann: new Float64Array(n) };
 }
 
 export function cloneState(s: EbmState): EbmState {
-  return { T: s.T.slice(), E: s.E.slice(), Ti: s.Ti.slice(), Tann: s.Tann.slice() };
+  return { T: s.T.slice(), E: s.E.slice(), Es: s.Es.slice(), Ti: s.Ti.slice(), Tann: s.Tann.slice() };
 }
 
 export function makeMonthly(n: number): EbmMonthly {
@@ -274,6 +334,12 @@ export function iceFraction(E: number, eFull: number): number {
   return E >= 0 ? 0 : Math.min(1, -E / eFull);
 }
 
+/** Surface warming (K) of the seasonal stratified layer holding heat Es (J/m²); 0 when disabled. */
+export function stratTemperature(es: number): number {
+  const t = ebmTuning;
+  return t.stratDepth > 0 && es > 0 ? es / (t.rhoCpWater * t.stratDepth) : 0;
+}
+
 /** Set the ocean cells' air temperature to their surface temperature (initialization). */
 export function syncOceanAirT(M: EbmModel, S: EbmState): void {
   const { g, land, cOcean, eFull } = M;
@@ -285,7 +351,7 @@ export function syncOceanAirT(M: EbmModel, S: EbmState): void {
       if (land[i]) continue;
       const E = S.E[i];
       const a = iceFraction(E, eFull);
-      S.T[i] = (1 - a) * (Tf + Math.max(0, E) / Co) + a * S.Ti[i];
+      S.T[i] = (1 - a) * (Tf + Math.max(0, E) / Co + stratTemperature(S.Es[i])) + a * S.Ti[i];
     }
   }
 }

@@ -17,8 +17,18 @@ export function createHeader(ctx: UiContext): HTMLElement {
     TABS.forEach((t, i) => {
       toggleClass(tabs[i], 'is-active', t.id === tab);
       tabs[i].setAttribute('aria-selected', String(t.id === tab));
+      // Roving tab index: Tab enters the tab bar once, arrows move within it.
+      tabs[i].tabIndex = t.id === tab ? 0 : -1;
     });
   }, { immediate: true });
+  tabs.forEach((el, i) => el.addEventListener('keydown', (e) => {
+    const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+    if (!d) return;
+    e.preventDefault();
+    const j = (i + d + TABS.length) % TABS.length;
+    store.dispatch({ type: 'setTab', tab: TABS[j].id });
+    tabs[j].focus();
+  }));
 
   // World chip.
   const worldDot = h('i', { class: 'wg-dot' });

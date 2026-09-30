@@ -4,9 +4,12 @@ import type { DisplaySettings } from '../worker/protocol';
 import { PAINT_FULL, PAINT_PREVIEW } from './schema';
 import type { AppState, WorldSettings } from './state';
 
-/** What the painter needs to render the current layer/month/overlays. */
+let displaySeq = 0;
+
+/** What the painter needs to render the current layer/month/overlays (stamped with a creation order). */
 export function displaySettings(s: AppState): DisplaySettings {
   return {
+    seq: ++displaySeq,
     layer: s.settings.view.layer,
     month: s.runtime.month,
     overlays: { ...s.settings.view.overlays },

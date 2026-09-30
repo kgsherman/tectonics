@@ -3,11 +3,13 @@ import type {
 } from '../core/types';
 import { MapClouds } from './cloudsMap';
 import { context2d, ImageCanvas, makeLayerCanvas } from './mapCanvas';
+import { MapGlBase } from './mapGl';
 import { MapInput } from './mapInput';
 import { drawArrows, drawBrush, drawGraticule, drawMarkers } from './mapLayers';
 import { applyShade, hillshade, nightShade } from './mapShading';
 import { copyVectorField, DEFAULT_PARTICLE_COUNT, ParticleSystem } from './particles';
 import { MapParticles } from './particlesMap';
+import { DetailFader, heightSignature } from './viewDetail';
 import { HeightField } from './viewHeight';
 import {
   mapClamp, mapMinScale, mapProject, mapUnproject, mapWorldCopies, mapWorldRect, type MapTransform,
@@ -25,7 +27,11 @@ const NIGHT_H = 180;
  * Layers (bottom → top): base canvas (image or relief-shaded image, clouds, night shade, overlay,
  * graticule; redrawn on view/data change), particle trails (faded every frame) and annotations
  * (arrows, brush, markers; redrawn on change). In 'relief'/'sun' lighting with a height map the base
- * is hillshaded on the CPU, so feed the map the unshaded image (the same one the globe gets).
+ * is hillshaded, so feed the map the unshaded image (the same one the globe gets).
+ *
+ * The base image itself is rendered on the GPU when WebGL2 is available (MapGlBase: smooth
+ * anti-aliased coastlines from the height map and crisp relief at any zoom, shading in the shader);
+ * otherwise (or after a context loss) it is drawn with Canvas 2D and hillshaded on the CPU.
  */
 export class MapView implements WorldView {
   readonly kind = 'map' as const;
@@ -46,6 +52,17 @@ export class MapView implements WorldView {
   private readonly pointers = new PointerHub();
   private readonly input: MapInput;
   private readonly resizeObserver: ResizeObserver;
+  private readonly gpu: MapGlBase | null;
+  private readonly detailFader = new DetailFader();
+  private detailAmount = 1;
+  /** Detail strength of the last GPU base draw. */
+  private drawnDetail = -1;
+  /** The Canvas 2D copy of the base image is stale (only maintained for the CPU fallback). */
+  private baseImageStale = false;
+  /** Size (CSS px) and DPR last applied to the canvases; 0 = never. */
+  private appliedW = 0;
+  private appliedH = 0;
+  private appliedDpr = 0;
 
   private t: MapTransform = { width: 1, height: 1, centerLon: 0, centerLat: 0, scale: 1 };
   /** Zoom relative to fit-the-world (kept across resizes). */
@@ -87,6 +104,7 @@ export class MapView implements WorldView {
     this.topCtx = context2d(this.topCanvas);
     this.root.append(this.baseCanvas, this.particleLayer.canvas, this.topCanvas);
     container.appendChild(this.root);
+    this.gpu = MapGlBase.create();
 
     this.input = new MapInput({
       root: this.root,
@@ -96,8 +114,12 @@ export class MapView implements WorldView {
       setTransform: (t) => this.setTransform(t),
       pick: (x, y) => this.pick(x, y),
     });
+    // Size tracking: ResizeObserver plus visibility/window resizes and a per-frame / per-export check,
+    // so a view created in a hidden or zero-size container never keeps a stale canvas size.
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(this.root);
+    document.addEventListener('visibilitychange', this.onVisibility);
+    window.addEventListener('resize', this.onVisibility);
     this.resize();
     this.raf = requestAnimationFrame(this.frame);
   }
@@ -113,13 +135,25 @@ export class MapView implements WorldView {
     this.baseRgba.set(rgba.subarray(0, n));
     this.baseW = width;
     this.baseH = height;
-    this.baseImage.put(this.baseRgba, width, height);
+    if (this.gpuActive) {
+      this.gpu!.setBase(this.baseRgba, width, height);
+      this.baseImageStale = true;
+    } else {
+      this.baseImage.put(this.baseRgba, width, height);
+      this.baseImageStale = false;
+    }
     this.shadeDirty = this.baseDirty = true;
   }
 
   setHeightMap(height: Float32Array | null, width: number, height_: number): void {
-    if (height) this.heights.set(height, width, height_);
-    else this.heights.clear();
+    if (height) {
+      this.heights.set(height, width, height_);
+      this.detailFader.noteHeights(heightSignature(height, width * height_), performance.now());
+    } else {
+      this.heights.clear();
+      this.detailFader.reset();
+    }
+    if (this.gpuActive) this.gpu!.setHeight(height ? this.heights.data : null, width, height_);
     this.shade = null;
     this.shadeDirty = this.baseDirty = true;
   }
@@ -194,6 +228,12 @@ export class MapView implements WorldView {
     this.baseDirty = true;
   }
 
+  /** Strength of the procedural close-up detail on the GPU base (0 disables it; default 1). */
+  setSurfaceDetail(amount: number): void {
+    this.detailAmount = Math.max(0, Math.min(1, Number.isFinite(amount) ? amount : 0));
+    this.baseDirty = true;
+  }
+
   /** Fixes the subsolar longitude (radians) in 'sun' lighting; null = follow the view center. */
   setSunLongitude(lon: number | null): void {
     this.fixedSunLon = lon;
@@ -246,10 +286,19 @@ export class MapView implements WorldView {
   }
 
   resize(): void {
-    if (this.disposed) return;
+    this.syncSize();
+  }
+
+  /** Applies the container size when it changed; false while the container has no area. */
+  private syncSize(): boolean {
+    if (this.disposed) return false;
     const w = this.root.clientWidth, h = this.root.clientHeight;
-    if (w === 0 || h === 0) return;
+    if (w === 0 || h === 0) return false;
     const dpr = this.dpr();
+    if (w === this.appliedW && h === this.appliedH && dpr === this.appliedDpr) return true;
+    this.appliedW = w;
+    this.appliedH = h;
+    this.appliedDpr = dpr;
     for (const c of [this.baseCanvas, this.topCanvas]) {
       c.width = Math.round(w * dpr);
       c.height = Math.round(h * dpr);
@@ -257,9 +306,15 @@ export class MapView implements WorldView {
     this.particleLayer.resize(w, h, dpr);
     this.t = mapClamp({ ...this.t, width: w, height: h, scale: this.zoom * mapMinScale(w, h) });
     this.baseDirty = this.topDirty = true;
+    return true;
   }
 
+  private readonly onVisibility = (): void => {
+    this.syncSize();
+  };
+
   toDataURL(): string {
+    this.syncSize();
     this.renderStatic();
     const out = document.createElement('canvas');
     out.width = this.baseCanvas.width;
@@ -276,6 +331,9 @@ export class MapView implements WorldView {
     this.disposed = true;
     cancelAnimationFrame(this.raf);
     this.resizeObserver.disconnect();
+    document.removeEventListener('visibilitychange', this.onVisibility);
+    window.removeEventListener('resize', this.onVisibility);
+    this.gpu?.dispose();
     this.input.dispose();
     this.pointers.clear();
     this.particles = null;
@@ -312,7 +370,10 @@ export class MapView implements WorldView {
     this.raf = requestAnimationFrame(this.frame);
     const dt = this.lastFrameMs < 0 ? 0 : Math.min(0.1, Math.max(0, (ms - this.lastFrameMs) / 1000));
     this.lastFrameMs = ms;
-    if (this.root.clientWidth === 0 || this.root.clientHeight === 0) return;
+    if (!this.syncSize()) return;
+    // Redraw for the detail fade only while its value moves (constant 0 through the hold, i.e. during
+    // playback: no base redraws at display rate between streamed frames), up to the settled value.
+    if (this.gpuActive && this.baseRgba && this.detailValue(performance.now()) !== this.drawnDetail) this.baseDirty = true;
     this.renderStatic();
     if (this.particles) {
       // Slower geographic speed when zoomed in keeps on-screen speed comparable.
@@ -329,6 +390,15 @@ export class MapView implements WorldView {
     if (this.topDirty) this.drawTop();
   }
 
+  private detailValue(nowMs: number): number {
+    return this.detailAmount * this.detailFader.value(nowMs);
+  }
+
+  /** The GPU base layer is in use (WebGL2 available and the context alive). */
+  private get gpuActive(): boolean {
+    return this.gpu !== null && this.gpu.usable;
+  }
+
   private get shaded(): boolean {
     return this.lighting.mode !== 'flat' && this.heights.present && this.baseRgba !== null;
   }
@@ -336,7 +406,8 @@ export class MapView implements WorldView {
   /** Recomputes the relief-shaded copy of the base image ('relief'/'sun' with a height map). */
   private updateShading(): void {
     // Stays dirty while unshaded (flat lighting / no height map) so a later switch recomputes it.
-    if (!this.shaded) return;
+    // The GPU base shades in its shader (stays dirty too, in case the context is lost later).
+    if (!this.shaded || this.gpuActive) return;
     this.shadeDirty = false;
     const hf = this.heights;
     this.shade ??= hillshade(hf.data!, hf.w, hf.h, this.seaLevel);
@@ -366,7 +437,19 @@ export class MapView implements WorldView {
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
     const layers: HTMLCanvasElement[] = [];
-    if (this.baseRgba) layers.push(this.shaded ? this.shadedImage.canvas : this.baseImage.canvas);
+    let gpuBase: HTMLCanvasElement | null = null;
+    if (this.baseRgba && this.gpuActive) {
+      const detail = this.detailValue(performance.now());
+      gpuBase = this.gpu!.render({ t, dpr, seaLevel: this.seaLevel, shade: this.shaded, detail });
+      this.drawnDetail = detail;
+    }
+    if (gpuBase) {
+      // One draw at device resolution (the shader wraps longitude itself).
+      ctx.drawImage(gpuBase, 0, 0, t.width, t.height);
+    } else if (this.baseRgba) {
+      this.ensureCpuBase();
+      layers.push(this.shaded ? this.shadedImage.canvas : this.baseImage.canvas);
+    }
     if (this.cloudLayer.active) layers.push(this.cloudLayer.canvas);
     if (this.lighting.mode === 'sun') layers.push(this.nightImage.canvas);
     if (this.hasOverlay) layers.push(this.overlayImage.canvas);
@@ -378,6 +461,17 @@ export class MapView implements WorldView {
       for (const c of layers) ctx.drawImage(c, x0, y0, x1 - x0, y1 - y0);
     }
     if (this.graticuleStep > 0) drawGraticule(ctx, t, this.graticuleStep);
+  }
+
+  /** Brings the Canvas 2D base (and its hillshade) up to date after running on the GPU path. */
+  private ensureCpuBase(): void {
+    if (!this.baseRgba) return;
+    if (this.baseImageStale) {
+      this.baseImage.put(this.baseRgba, this.baseW, this.baseH);
+      this.baseImageStale = false;
+      this.shadeDirty = true;
+    }
+    if (this.shadeDirty) this.updateShading();
   }
 
   private drawTop(): void {

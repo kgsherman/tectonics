@@ -1,5 +1,5 @@
 /**
- * Paints what the sim/paint worker sends to the main thread: the layer image, the display height
+ * Paints what the paint worker sends to the main thread: the layer image, the display height
  * map and the overlay for a frame, or an export image. All returned buffers are freshly allocated
  * by the painter (PaintCache never retains them), so they can be transferred.
  */
@@ -28,11 +28,21 @@ export class FramePainter {
     };
   }
 
-  /** Base + height map (parts 'all') and the boundaries/coastlines overlay (the views draw the graticule). */
-  frame(src: PaintSources, d: DisplaySettings, quality: PaintQuality, parts: PaintParts, seed: number): PaintedFrame {
-    const full = quality === 'full';
-    const width = full ? d.fullWidth : d.previewWidth;
-    const height = full ? d.fullHeight : d.previewHeight;
+  /** Frame size for a quality. */
+  static size(d: DisplaySettings, quality: PaintQuality): { width: number; height: number } {
+    return quality === 'full' ? { width: d.fullWidth, height: d.fullHeight } : { width: d.previewWidth, height: d.previewHeight };
+  }
+
+  /**
+   * Base + height map (parts 'all') and the boundaries/coastlines overlay (the views draw the
+   * graticule). `want` skips the height map / overlay when the receiver already holds them
+   * (`overlayRepainted` is then false).
+   */
+  frame(
+    src: PaintSources, d: DisplaySettings, quality: PaintQuality, parts: PaintParts, seed: number,
+    want: { height: boolean; overlay: boolean } = { height: true, overlay: true },
+  ): PaintedFrame & { overlayRepainted: boolean } {
+    const { width, height } = FramePainter.size(d, quality);
     const opts = this.options(d, width, height, quality, seed);
     const t0 = this.now();
     let rgba: Uint8ClampedArray | null = null;
@@ -40,11 +50,11 @@ export class FramePainter {
     if (parts === 'all') {
       const res = paintLayer(d.layer, src, opts, this.cache);
       rgba = res.rgba;
-      heightMap = res.heightMap ?? paintHeightMap(src, opts, this.cache);
+      if (want.height) heightMap = res.heightMap ?? paintHeightMap(src, opts, this.cache);
     }
     const flags: OverlayFlags = { boundaries: d.overlays.boundaries, coastlines: d.overlays.coastlines, graticule: false };
-    const overlay = flags.boundaries || flags.coastlines ? paintOverlay(flags, src, opts, this.cache) : null;
-    return { width, height, rgba, heightMap, overlay, ms: this.now() - t0 };
+    const overlay = want.overlay && (flags.boundaries || flags.coastlines) ? paintOverlay(flags, src, opts, this.cache) : null;
+    return { width, height, rgba, heightMap, overlay, overlayRepainted: want.overlay, ms: this.now() - t0 };
   }
 
   /** Full-quality equirectangular export of the current layer; the overlay includes the graticule. */
