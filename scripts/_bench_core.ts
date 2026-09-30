@@ -1,0 +1,20 @@
+import { createSphereMesh, nearestCell } from '../src/core/sphereMesh';
+import { buildMeshGridMap } from '../src/core/grid';
+import { Rng } from '../src/core/rng';
+
+let t = performance.now();
+const m = createSphereMesh(100000);
+console.log('mesh 100k ms', (performance.now() - t).toFixed(0));
+const r = new Rng(1);
+const q = new Float64Array(600000);
+for (let i = 0; i < 200000; i++) q.set(r.unitVector(), 3 * i);
+t = performance.now();
+let s = 0;
+for (let i = 0; i < 200000; i++) s += nearestCell(m, q[3 * i], q[3 * i + 1], q[3 * i + 2]);
+console.log('nearest no-hint us', ((performance.now() - t) / 200).toFixed(3), s > 0);
+t = performance.now();
+buildMeshGridMap(m, 1024, 512);
+console.log('gridmap 1024x512 ms', (performance.now() - t).toFixed(0));
+t = performance.now();
+buildMeshGridMap(m, 2048, 1024);
+console.log('gridmap 2048x1024 ms', (performance.now() - t).toFixed(0));
