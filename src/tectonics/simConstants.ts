@@ -1,0 +1,177 @@
+/**
+ * Tunable constants of the tectonic simulation (SPEC §4). Units: km, Myr, m (elevation), km/Myr
+ * (speeds), rad/Myr (angular velocities). Distances are physical (km) so behaviour is independent of
+ * mesh resolution.
+ */
+
+/* ---------------- Kinematics (substeps A–D) ---------------- */
+
+/** Maximum displacement of any plate point per substep, in cell spacings. */
+export const SUBSTEP_MAX_DISPLACEMENT = 0.8;
+/** Hard cap on substeps per step (a warning is emitted once when hit). */
+export const MAX_SUBSTEPS = 8;
+/** Loser crust is consumed (subducted / collided) only where plates converge faster than this. */
+export const CONSUME_MIN_VCONV = 3;
+/** Gaps open new ridge crust only where some plate pair diverges faster than this. */
+export const RIDGE_MIN_DIVERGENCE = 5;
+/**
+ * Convergence/divergence is only trusted when the normal component exceeds this fraction of the
+ * relative speed as well (obliquity gate): suppresses lattice-noise "subduction" along transforms.
+ */
+export const MIN_NORMAL_FRACTION = 0.3;
+/**
+ * Boundary normal is undefined (→ no consumption / no ridge) when |n| is below this fraction of the
+ * value a straight boundary would give (e.g. a cell deep inside one plate).
+ */
+export const NORMAL_MIN_STRENGTH = 0.25;
+/** Elevation removed from continental crust cloned into slow-stretching gaps (rift basins), m. */
+export const RIFT_BASIN_DROP = 150;
+
+/* ---------------- Interaction fields (E) ---------------- */
+
+/**
+ * Crust-thickness proxy added to max(0, elev + 500) when a continental cell is consumed, m: a 35 km
+ * crustal column stacked onto the overriding plate is worth ≈ 35 km·(1 − ρc/ρm) ≈ 5 km of relief.
+ */
+export const COLLISION_THICKNESS_PROXY = 4500;
+/** Subduction uplift rate at the kernel peak, m/Myr per km/Myr of convergence. */
+export const SUBDUCTION_UPLIFT_RATE = 1.4;
+/** Uplift factor of island arcs (oceanic overriding plate): arcs must build ~5 km of relief. */
+export const ARC_OCEANIC_FACTOR = 2.5;
+/** Arc crust rising above this converts to continental crust, m. */
+export const ARC_CONVERSION_ELEV = 0;
+/** Continental-margin (cordillera) kernel: peak distance / rise width / fall width / cutoff, km. */
+export const CORDILLERA_PEAK_KM = 230;
+export const CORDILLERA_RISE_KM = 150;
+export const CORDILLERA_FALL_KM = 320;
+/** Island-arc kernel on oceanic overriding plates, km. */
+export const ARC_PEAK_KM = 160;
+export const ARC_RISE_KM = 90;
+export const ARC_FALL_KM = 150;
+/** Subduction influence ends here, km. */
+export const SUBDUCTION_MAX_KM = 1000;
+/** Collision kernel: frontal peak width, plateau end, cutoff (km) and frontal peak share. */
+export const COLLISION_PEAK_KM = 180;
+export const COLLISION_PLATEAU_KM = 700;
+export const COLLISION_MAX_KM = 1200;
+export const COLLISION_PEAK_SHARE = 0.55;
+/** Soft saturation height for tectonic uplift, m (rate × (1 − h/cap)). */
+export const UPLIFT_SOFT_CAP = 9000;
+/** Transient trench: depth at the front, e-folding half-width, cutoff, full-depth speed. */
+export const TRENCH_DEPTH = -7500;
+export const TRENCH_WIDTH_KM = 70;
+export const TRENCH_MAX_KM = 200;
+export const TRENCH_FULL_SPEED = 20;
+/** Smoothing passes of front speeds / collision budgets along the front. */
+export const FRONT_SMOOTH_PASSES = 2;
+/**
+ * Width (Gaussian σ, km) of the conservative smoothing of the tectonic uplift field inside each plate;
+ * one pass adds σ ≈ spacing/2, so passes = round((2σ/spacing)²), at least one.
+ */
+export const UPLIFT_SMOOTH_KM = 60;
+/** Oceanic crust converts to continental only in the arc core (subduction kernel ≥ this fraction). */
+export const ARC_CORE_FRACTION = 0.3;
+
+/** Hotspot saturating growth rate at the plume centre, 1/Myr (× strength × activity). */
+export const HOTSPOT_RATE = 0.35;
+/** Oceanic hotspot target height = HOTSPOT_OCEAN_TARGET × strength², m. */
+export const HOTSPOT_OCEAN_TARGET = 1500;
+/** Continental hotspot swell target = HOTSPOT_CONT_TARGET × strength, m. */
+export const HOTSPOT_CONT_TARGET = 1000;
+/** Hotspot influence radius in units of Hotspot.radius. */
+export const HOTSPOT_REACH = 2.5;
+
+/* ---------------- Surface processes (G) ---------------- */
+
+/**
+ * Isostatic freeboard of continental crust (m) by age: juvenile arc crust (age 0) floats low and rises
+ * to FREEBOARD_YOUNG by JUVENILE_AGE (Myr), then to FREEBOARD_CRATON by CRATON_AGE. Inactive young
+ * arcs therefore subside to submarine ridges instead of standing as permanent land bridges.
+ */
+export const FREEBOARD_JUVENILE = -300;
+export const FREEBOARD_YOUNG = 300;
+export const FREEBOARD_CRATON = 480;
+export const JUVENILE_AGE = 200;
+export const CRATON_AGE = 2000;
+/** Relaxation time of juvenile continental crust toward its freeboard, Myr. */
+export const TAU_JUVENILE = 50;
+/** Erosion e-folding times, Myr: whole continental excess, orogenic excess above +1 km. */
+export const TAU_CONTINENT = 250;
+export const TAU_OROGEN = 60;
+export const OROGEN_THRESHOLD = 1000;
+/** Submerged continental crust drifts toward a shelf depth, m, with this e-folding time, Myr. */
+export const SHELF_DEPTH = -200;
+export const TAU_SHELF = 200;
+/** Oceanic islands above sea level are planed off by waves (guyots), Myr. */
+export const TAU_ISLAND = 15;
+/** Subaerial hillslope/fluvial diffusivity, km²/Myr, and the factor for the submarine part. */
+export const DIFFUSIVITY = 70;
+export const SUBMARINE_DIFFUSIVITY_FACTOR = 0.15;
+/** e-folding time of the orogeny field, Myr. */
+export const OROGENY_DECAY = 50;
+/** Deepest allowed sea floor, m. */
+export const OCEAN_FLOOR_MIN = -11000;
+/** Highest allowed elevation (hard safety clamp after the soft cap), m. */
+export const ELEVATION_MAX = 10000;
+
+/* ---------------- Polarity (F) ---------------- */
+
+/** Width of the boundary band whose oceanic age sets a plate's buoyancy rank, km. */
+export const POLARITY_BAND_KM = 500;
+/** Score bonus of continent-dominated plates. */
+export const CONTINENTAL_RANK_BONUS = 1000;
+/** Mean-age difference (Myr) that must persist POLARITY_FLIP_TIME Myr before two plates swap rank. */
+export const POLARITY_FLIP_DIFF = 15;
+export const POLARITY_FLIP_TIME = 10;
+/** Oceanic age assumed for a plate with no oceanic crust near its boundaries, Myr. */
+export const POLARITY_DEFAULT_AGE = 120;
+/** Rank scores are re-evaluated every this many Myr (the hysteresis clocks advance by the elapsed time). */
+export const POLARITY_INTERVAL = 5;
+
+/* ---------------- Plate dynamics (H) ---------------- */
+
+/** Maximum surface speed |ω|·R, km/Myr. */
+export const MAX_SURFACE_SPEED = 150;
+/** Collision drag coefficient (km/Myr) and the shortening scale at which it bites, km. */
+export const COLLISION_DRAG = 4000;
+export const COLLISION_SHORTENING_REF = 1200;
+/** Pairs without collision contacts for this long forget their shortening, Myr. */
+export const COLLISION_MEMORY = 20;
+/** Merge when the relative speed at the suture stays below this (km/Myr) for MERGE_TIME Myr. */
+export const MERGE_SPEED = 5;
+export const MERGE_TIME = 10;
+/** Slab pull: refit interval, relaxation time (Myr), trench-ward target speed (km/Myr). */
+export const SLAB_PULL_INTERVAL = 5;
+export const SLAB_PULL_TAU = 20;
+export const SLAB_PULL_SPEED = 90;
+/** Fraction of a plate's perimeter that must subduct for the full slab-pull weight. */
+export const SLAB_PULL_FULL_FRACTION = 0.15;
+
+/* ---------------- Rifting (I) & housekeeping (J) ---------------- */
+
+/** Minimum visible area (fraction of the sphere) of a plate that may rift. */
+export const RIFT_MIN_AREA = 0.04;
+/** Relative separation speed of rift halves, km/Myr. */
+export const RIFT_SPEED_MIN = 20;
+export const RIFT_SPEED_MAX = 60;
+/** Noise warp of the rift partition (unit-sphere amplitude) and its frequency. */
+export const RIFT_WARP = 0.22;
+export const RIFT_WARP_FREQ = 2.2;
+/** Each rift half must receive at least this fraction of the parent's cells. */
+export const RIFT_MIN_SHARE = 0.2;
+/**
+ * Subduction initiation at old passive margins (closing half of the Wilson cycle): oceanic crust
+ * older than INITIATION_AGE next to continental crust of the same plate may detach and converge on
+ * the continent. Expected events per 100 Myr = riftRate × min(2, oldOceanFraction / INITIATION_REF).
+ */
+export const INITIATION_AGE = 140;
+export const INITIATION_REF = 0.15;
+/** Minimum old passive-margin length of a candidate plate, as a fraction of all cells. */
+export const INITIATION_MIN_MARGIN = 0.0003;
+/** The detached oceanic region must cover at least this fraction of the sphere. */
+export const INITIATION_MIN_AREA = 0.01;
+/** Initial convergence speed of the detached ocean toward its continent, km/Myr. */
+export const INITIATION_SPEED_MIN = 20;
+export const INITIATION_SPEED_MAX = 50;
+/** Plates with fewer visible cells than this are merged into a neighbour. */
+export const TINY_PLATE_CELLS = 20;

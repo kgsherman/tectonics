@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Worldgen views demo</title>
+<style>
+  :root { color-scheme: dark; --panel: rgba(14, 18, 26, 0.88); --line: #2a3242; --text: #d8dee9; --muted: #8a94a6; --accent: #6cb6ff; }
+  html, body { margin: 0; height: 100%; background: #05070b; color: var(--text); font: 13px/1.35 system-ui, sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  .view { position: absolute; inset: 0; }
+  #panel { position: fixed; top: 10px; left: 10px; width: 250px; max-height: calc(100% - 20px); overflow: auto; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; box-sizing: border-box; backdrop-filter: blur(4px); }
+  #panel h1 { font-size: 14px; margin: 0 0 8px; }
+  #panel fieldset { border: none; border-top: 1px solid var(--line); margin: 8px 0 0; padding: 8px 0 0; }
+  #panel legend { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; padding: 0; }
+  #panel label { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 4px 0; }
+  #panel label.check { justify-content: flex-start; }
+  #panel select, #panel input[type=range] { width: 130px; }
+  #panel .seg { display: flex; gap: 4px; margin: 4px 0; }
+  #panel .seg button { flex: 1; background: #1a2130; color: var(--text); border: 1px solid var(--line); border-radius: 5px; padding: 4px 0; cursor: pointer; }
+  #panel .seg button.on { background: #24416a; border-color: var(--accent); }
+  #status { position: fixed; right: 10px; bottom: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 10px; font: 12px/1.4 ui-monospace, monospace; white-space: pre; min-width: 190px; }
+  #busy { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 15px; color: var(--muted); pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="globe" class="view"></div>
+  <div id="map" class="view" style="display:none"></div>
+</div>
+<div id="busy">Generating synthetic planet…</div>
+<div id="panel">
+  <h1>Views demo</h1>
+  <div class="seg" id="viewSeg"><button data-v="globe" class="on">Globe (G)</button><button data-v="map">Map (M)</button></div>
+  <fieldset><legend>Layer</legend>
+    <label>Image <select id="layer"><option value="satellite">Satellite-like</option><option value="elevation">Elevation</option><option value="test">Test pattern</option></select></label>
+    <label class="check"><input type="checkbox" id="height" checked /> Height map</label>
+    <label class="check"><input type="checkbox" id="overlay" /> Overlay image (30° + coasts)</label>
+    <label class="check"><input type="checkbox" id="graticule" checked /> Shader graticule (15°)</label>
+    <label>Sea level <input type="range" id="sea" min="-600" max="600" step="10" value="0" /></label>
+  </fieldset>
+  <fieldset><legend>Lighting</legend>
+    <div class="seg" id="lightSeg"><button data-v="flat">Flat</button><button data-v="relief" class="on">Relief</button><button data-v="sun">Sun</button></div>
+    <label>Declination <input type="range" id="decl" min="-23.44" max="23.44" step="0.1" value="15" /></label>
+    <label>Relief scale <input type="range" id="relief" min="0" max="4" step="0.05" value="1" /></label>
+  </fieldset>
+  <fieldset><legend>Weather</legend>
+    <label>Particles <select id="particles"><option value="none">None</option><option value="wind" selected>Wind</option><option value="current">Currents</option></select></label>
+    <label>Count <select id="count"><option>2000</option><option>4000</option><option selected>8000</option><option>16000</option></select></label>
+    <label class="check"><input type="checkbox" id="clouds" checked /> Clouds</label>
+  </fieldset>
+  <fieldset><legend>Annotations</legend>
+    <label class="check"><input type="checkbox" id="markers" checked /> Test markers</label>
+    <label class="check"><input type="checkbox" id="arrows" checked /> Arrows</label>
+    <label class="check"><input type="checkbox" id="arrowField" /> Arrow field (ω×p)</label>
+  </fieldset>
+  <fieldset><legend>Interaction</legend>
+    <div class="seg" id="modeSeg"><button data-v="navigate" class="on">Navigate</button><button data-v="paint">Paint</button></div>
+    <label>Brush radius° <input type="range" id="brush" min="0.5" max="20" step="0.5" value="5" /></label>
+    <label class="check"><input type="checkbox" id="brushOn" checked /> Brush cursor</label>
+  </fieldset>
+</div>
+<div id="status">…</div>
+<script type="module" src="./views.ts"></script>
+</body>
+</html>

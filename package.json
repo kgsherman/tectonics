@@ -10,7 +10,10 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "headless": "tsx scripts/headless.ts",
-    "perf": "vitest run tests/perf --no-file-parallelism"
+    "perf": "vitest run --config vitest.perf.config.ts --no-file-parallelism",
+    "earth": "tsx scripts/earth.ts",
+    "earth:preview": "tsx scripts/earthPreview.ts",
+    "calibrate": "tsx scripts/calibrate.ts"
   },
   "dependencies": {
     "delaunator": "^5.1.0",
