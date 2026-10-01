@@ -2,6 +2,7 @@ import type {
   ArrowSpec, BrushCursor, CloudSpec, GeoPoint, LightingMode, MarkerSpec, VectorFieldSpec, WorldPointerEvent, WorldView,
 } from '../core/types';
 import { MapClouds } from './cloudsMap';
+import { CLOUD_DEBUG } from './cloudsDebug';
 import { context2d, ImageCanvas, makeLayerCanvas } from './mapCanvas';
 import { MapGlBase } from './mapGl';
 import { MapInput } from './mapInput';
@@ -55,6 +56,7 @@ export class MapView implements WorldView {
   private readonly cloudLayer = new MapClouds(() => {
     this.baseDirty = true;
   });
+  private readonly cloudsShownHandlers = new Set<(clouds: CloudSpec) => void>();
   private readonly baseImage = new ImageCanvas();
   private readonly shadedImage = new ImageCanvas();
   private readonly overlayImage = new ImageCanvas();
@@ -113,6 +115,9 @@ export class MapView implements WorldView {
   private disposed = false;
 
   constructor(container: HTMLElement) {
+    this.cloudLayer.onShown = (c) => {
+      for (const fn of [...this.cloudsShownHandlers]) fn(c);
+    };
     this.element = container;
     this.root = document.createElement('div');
     Object.assign(this.root.style, {
@@ -334,6 +339,11 @@ export class MapView implements WorldView {
     return this.pointers.on(handler);
   }
 
+  onCloudsShown(handler: (clouds: CloudSpec) => void): () => void {
+    this.cloudsShownHandlers.add(handler);
+    return () => this.cloudsShownHandlers.delete(handler);
+  }
+
   resize(): void {
     this.syncSize();
   }
@@ -383,7 +393,7 @@ export class MapView implements WorldView {
     document.removeEventListener('visibilitychange', this.onVisibility);
     window.removeEventListener('resize', this.onVisibility);
     this.gpu?.dispose();
-    this.cloudLayer.dispose(); // cancels pending window rasters, frees the window canvas
+    this.cloudLayer.dispose(); // cancels pending tiles, frees the tile cache
     this.input.dispose();
     this.pointers.clear();
     this.particles = null;
@@ -502,7 +512,7 @@ export class MapView implements WorldView {
       layers.push(this.shaded ? this.shadedImage.canvas : this.baseImage.canvas);
     }
     if (this.cloudLayer.active) {
-      // Zoomed in, the cloud worker rasterizes the visible window sharply once the view rests.
+      // HD clouds: the cloud worker rasterizes the visible tiles at screen resolution once the view rests.
       this.cloudLayer.setView(t, dpr);
       layers.push(this.cloudLayer.canvas);
     }
@@ -528,6 +538,7 @@ export class MapView implements WorldView {
       if (ov) ctx.drawImage(ov, 0, 0, t.width, t.height);
     }
     if (this.graticuleStep > 0) drawGraticule(ctx, t, this.graticuleStep);
+    if (CLOUD_DEBUG) this.cloudLayer.drawDebug(ctx, t);
   }
 
   /** Brings the Canvas 2D base (and its hillshade) up to date after running on the GPU path. */

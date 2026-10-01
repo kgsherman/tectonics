@@ -43,6 +43,7 @@ export class GlobeView implements WorldView {
   private readonly surface: GlobeSurface;
   private readonly sky: GlobeSky;
   private readonly clouds: GlobeClouds;
+  private readonly cloudsShownHandlers = new Set<(clouds: CloudSpec) => void>();
   private readonly arrows: GlobeArrows;
   private readonly markers: GlobeMarkers;
   private readonly particleLines: GlobeParticles;
@@ -104,6 +105,10 @@ export class GlobeView implements WorldView {
     this.surface = new GlobeSurface(this.shared, aniso, this.renderer.extensions.has('EXT_color_buffer_float'));
     this.sky = new GlobeSky(this.shared, this.dpr());
     this.clouds = new GlobeClouds(this.shared);
+    this.clouds.onShown = (c) => {
+      this.invalidate();
+      for (const fn of [...this.cloudsShownHandlers]) fn(c);
+    };
     this.arrows = new GlobeArrows();
     this.markers = new GlobeMarkers(this.root, this.dpr());
     this.particleLines = new GlobeParticles();
@@ -328,6 +333,11 @@ export class GlobeView implements WorldView {
 
   onPointer(handler: (e: WorldPointerEvent) => void): () => void {
     return this.pointers.on(handler);
+  }
+
+  onCloudsShown(handler: (clouds: CloudSpec) => void): () => void {
+    this.cloudsShownHandlers.add(handler);
+    return () => this.cloudsShownHandlers.delete(handler);
   }
 
   resize(): void {

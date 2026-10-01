@@ -113,7 +113,7 @@ describe('large polar supercontinent', () => {
 
 describe('mid-latitude continent', () => {
   // A 60°-wide continent from 25°N to 65°N: no ice anywhere, so none of the glacier changes apply.
-  // Reference values from the polish-3 model (identical within rounding).
+  // Reference values measured without any ice (see MID_REF).
   const mid = world((lat, lon) => (lat > 25 && lat < 65 && lon > -30 && lon < 30 ? 400 : -4000), 42);
   const c = computeClimate(mid, { ...DEFAULT_CLIMATE_PARAMS, gridW: W, gridH: H });
 
@@ -251,5 +251,9 @@ describe('glacier mechanics', () => {
   });
 });
 
-/** Polish-3 values of the mid-latitude continent (measured with the previous model). */
-const MID_REF = { interiorWarm: 18.944, interiorCold: -7.818, southWarm: 25.835, koppenE: 10.222, koppenD: 37.712 };
+/**
+ * Values of the mid-latitude continent, re-measured after the land monsoon trough and shallow heat
+ * lows (circulation.ts) changed the summer circulation: interior summers ~1.3 °C warmer (polish-3:
+ * 18.944 / −7.818 / 25.835 °C, E 10.222 %, D 37.712 %). The glacier mechanics still leave it untouched.
+ */
+const MID_REF = { interiorWarm: 20.206, interiorCold: -7.595, southWarm: 27.015, koppenE: 8.639, koppenD: 38.538 };

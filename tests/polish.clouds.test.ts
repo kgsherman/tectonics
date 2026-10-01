@@ -227,9 +227,12 @@ describe('cyclones', () => {
 
   it('keep their genesis across cloud-spec changes when memoized (no teleporting on month change)', () => {
     const a = syntheticSpec(180, 90);
-    // A different "month": shifted storm track, stronger westerlies and zonally varying cover.
+    // A different "month": storm track ~6° poleward, stronger westerlies and zonally varying cover.
     const b = syntheticSpec(180, 90, 1.1);
-    for (let i = 0; i < b.u!.length; i++) b.u![i] *= 1.6;
+    for (let r = 0; r < 90; r++) {
+      const src = r < 45 ? Math.min(44, r + 3) : Math.max(45, r - 3);
+      for (let c = 0; c < 180; c++) b.u![r * 180 + c] = 1.6 * a.u![src * 180 + c];
+    }
     for (let r = 0; r < 90; r++) for (let c = 0; c < 180; c++) b.cover[r * 180 + c] *= 0.6 + 0.4 * Math.sin((c / 180) * 6 * Math.PI);
     const ca = analyzeCloudClimate(a), cb = analyzeCloudClimate(b);
     const memo = createCycloneMemo();
@@ -303,7 +306,9 @@ describe('map raster', () => {
     const f1 = frac(0.1), f2 = frac(0.2), f4 = frac(0.4), f10 = frac(1);
     expect(f1).toBeLessThan(0.08);
     expect(f2).toBeLessThan(f4);
-    expect(f4).toBeGreaterThan(0.4);
+    // (Mean opacity is unchanged since polish 4, but the thin veil margin was halved in polish 5: less
+    // area of faint haze around the cloud masses, more contrast between clusters and gaps.)
+    expect(f4).toBeGreaterThan(0.33);
     expect(f4).toBeLessThan(0.75);
     expect(f10).toBeGreaterThan(0.85);
     const clear = rasterizeClouds(raster, { w: 36, h: 18, cover: new Float32Array(36 * 18) }, 1, out);

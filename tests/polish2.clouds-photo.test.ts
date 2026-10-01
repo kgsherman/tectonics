@@ -174,11 +174,15 @@ describe('regime shaping', () => {
     const sc = detailParams(1, 0, 0, 0, 0, { ...sh });
     const open = detailParams(0, 0, 0, 1, 0, { ...sh });
     const plain = detailParams(0, 0, 0, 0, 0, { ...sh });
-    expect(conv.bc).toBeGreaterThan(0.5); // cauliflower convection
+    expect(conv.bf).toBeGreaterThan(0.5); // cauliflower towers (fine billows)
     expect(cu.bf).toBeGreaterThan(0.5); // popcorn cumulus
-    expect(sc.bf).toBeGreaterThan(0.8); // closed cells
+    // Closed cells: the honeycomb comes from the cell volume; billowed fine octaves creased the deck
+    // into worm-like strands (polish 5), so the fine detail stays nearly plain.
+    expect(sc.bf).toBeGreaterThan(0);
+    expect(sc.bf).toBeLessThan(0.75 * cu.bf);
     expect(open.bf).toBeLessThan(-0.8); // open cells (ridges)
-    expect(conv.gain).toBeLessThan(plain.gain); // clumpy
+    // Convection: crisp, fine-scale texture (the convective clusters make the clumps, polish 5).
+    expect(conv.gain).toBeGreaterThan(plain.gain);
     expect(cu.gain).toBeGreaterThan(plain.gain); // speckled
     for (const p of [conv, cu, sc, open, plain]) {
       expect(p.gain).toBeGreaterThanOrEqual(0.4);

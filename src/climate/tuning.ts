@@ -380,6 +380,41 @@ export const pressureTuning = {
   thermalEqSmoothLon: 30,
   thermalEqClamp: 25,
   thermalEqSoftness: 2.5,
+  /**
+   * Land monsoon trough: summer continents carry their trough near the summer tropic (Earth: heat
+   * lows over the Sahara, Arabia, Pakistan, Australia and the Chaco near 20–25°), poleward of the
+   * oceans' ITCZ, because land heats with the sun at little lag while the ocean lags and its thermal
+   * equator stays near 5–10°. Over land the equatorial trough moves from the oceans' thermal equator
+   * toward landTroughShare × the solar declination of landTroughLagMonths earlier (0 = off; the
+   * belts then follow the all-cell thermal equator) and widens to landTroughWidth (deg), weighted per
+   * cell by the smoothed lowland land fraction (terrain below landTroughHeight m, smoothed over
+   * landTroughSmoothKm, saturating at landTroughFull): continental interiors carry it, while coasts
+   * in front of high ranges (the Pacific side of the Andes) and plateaus do not.
+   */
+  landTroughShare: 1,
+  landTroughLagMonths: 0.5,
+  landTroughWidth: 12,
+  landTroughHeight: 1500,
+  landTroughSmoothKm: 500,
+  landTroughFull: 0.7,
+  /**
+   * The land trough is a shallow circulation: its deep (rain-producing) ascent lies equatorward of
+   * it, this share of the way from the oceans' thermal equator to the trough, where the inflowing
+   * moist layer is deep enough for convection (Earth: monsoon rain belts near 10–18°). Its full
+   * pressure still steers the low-level flow (monsoon inflow, the South American low-level jet).
+   */
+  landRainShare: 0.15,
+  /**
+   * Heat lows (land warmer than the latitude's ocean reference) are shallow too: a 1–3 km inflow
+   * layer under divergent, subsiding air. Their pressure steers the low-level (moisture-carrying)
+   * flow, but only this share of their frictional convergence counts as large-scale ascent; rain
+   * in them comes from the moisture they converge (the humidity gate). 0 keeps desert heat lows dry.
+   * Heat lows over high terrain are elevated heat sources that convect deeply (summer rain on
+   * Tibet, the Altiplano, the Ethiopian highlands): the shallow share fades linearly to 0 at
+   * heatLowDeepHeight (m).
+   */
+  heatLowAscentShare: 0,
+  heatLowDeepHeight: 3000,
   /** Belt amplitudes scale with the hemispheric T gradient (K between the 0–30° and 50–80° bands). */
   gradientRef: 36,
   gradientScaleMin: 0,

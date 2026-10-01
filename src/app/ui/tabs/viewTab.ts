@@ -51,12 +51,21 @@ export function createViewTab(ctx: UiContext): HTMLElement {
   const count = slider({ spec: VIEW_SPECS.particleCount, value: v0.particleCount, onChange: (v) => patch({ particleCount: v }) });
   const clouds = switchRow({ label: 'Clouds', hint: 'Cloud cover from the climate, drifting with the wind', value: v0.clouds, onChange: (v) => patch({ clouds: v }) });
   const density = slider({ spec: VIEW_SPECS.cloudDensity, value: v0.cloudDensity, onChange: (v) => patch({ cloudDensity: v }) });
+  // High-definition clouds: made on demand for the month on screen (standard clouds follow changes).
+  const hdBtn = button({
+    label: 'Generate HD clouds', icon: 'sparkles', variant: 'secondary', wide: true,
+    title: 'Render the clouds on screen at full detail (finest texture; sharp clouds on a zoomed map)',
+    onClick: () => commands.generateHdClouds(),
+  });
+  const hdNote = hint('');
   const seasonLen = slider({ spec: SEASON_SECONDS_SPEC, value: store.getState().settings.seasonSeconds, onChange: (v) => store.dispatch({ type: 'setSeasonSeconds', value: v }) });
   const seasonsBtn = button({ label: 'Play seasons', icon: 'calendar', variant: 'secondary', wide: true, onClick: () => commands.toggleSeasons() });
 
   const weatherNote = hint('Particles and clouds need a climate (Climate tab). Clouds show on the satellite layer.');
   weatherNote.hidden = store.getState().runtime.climate.id !== 0;
-  store.watch((s) => ({ v: s.settings.view, secs: s.settings.seasonSeconds, seasons: s.runtime.seasonsPlaying, climate: s.runtime.climate.id !== 0 }), (x) => {
+  store.watch((s) => ({
+    v: s.settings.view, secs: s.settings.seasonSeconds, seasons: s.runtime.seasonsPlaying, climate: s.runtime.climate.id !== 0, hd: s.runtime.cloudsHd,
+  }), (x) => {
     kind.set(x.v.view);
     lighting.set(x.v.lighting);
     relief.set(x.v.reliefScale);
@@ -72,7 +81,16 @@ export function createViewTab(ctx: UiContext): HTMLElement {
     seasonsBtn.classList.toggle('is-active', x.seasons);
     seasonsBtn.lastElementChild!.textContent = x.seasons ? 'Stop seasons' : 'Play seasons';
     weatherNote.hidden = x.climate;
-  }, { equal: shallowEqual });
+    const cloudsOn = x.climate && x.v.clouds && x.v.layer === 'satellite';
+    hdBtn.disabled = !cloudsOn || x.hd !== 'off';
+    hdBtn.classList.toggle('is-active', cloudsOn && x.hd === 'shown');
+    hdBtn.lastElementChild!.textContent = !cloudsOn || x.hd === 'off' ? 'Generate HD clouds' : x.hd === 'generating' ? 'Generating HD clouds…' : 'HD clouds shown';
+    hdNote.lastElementChild!.textContent = !cloudsOn
+      ? 'HD clouds need the clouds on over the satellite layer.'
+      : x.hd === 'off'
+        ? 'Clouds follow the month and climate at standard detail. HD renders the current month at full detail, until the month, climate or density changes.'
+        : 'Back to standard detail when the month, climate or cloud density changes.';
+  }, { equal: shallowEqual, immediate: true });
 
   const exportMap = button({ label: 'Map PNG', icon: 'download', variant: 'secondary', title: 'Equirectangular image of the current layer (2048×1024)', onClick: () => commands.exportMap() });
   const shot = button({ label: 'Screenshot', icon: 'camera', variant: 'secondary', title: 'PNG of the current view', onClick: () => commands.exportScreenshot() });
@@ -82,7 +100,7 @@ export function createViewTab(ctx: UiContext): HTMLElement {
     h('div', { class: 'wg-panel-sub', text: 'How the planet is drawn.' }),
     section('Display', kind.el, lighting.el, relief.el, detail.el),
     section('Overlays', ...overlays.map((o) => o.el)),
-    section('Weather', particles.el, count.el, clouds.el, density.el, weatherNote),
+    section('Weather', particles.el, count.el, clouds.el, density.el, hdBtn, hdNote, weatherNote),
     section('Seasons', seasonLen.el, seasonsBtn),
     section('Export', h('div', { class: 'wg-row' }, exportMap, shot)),
     section('Keyboard', h('dl', { class: 'wg-keys' }, ...SHORTCUTS.flatMap(([k, label]) => [h('dt', null, h('kbd', { text: k })), h('dd', { text: label })]))),

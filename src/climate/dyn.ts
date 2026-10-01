@@ -109,7 +109,7 @@ export function computeDynamics(
   lap('dyn.pass1');
   progress(0.35);
 
-  let circ = computeCirculation(g, mon1.tAir, core.land, core.landFraction, params);
+  let circ = computeCirculation(g, mon1.tAir, core.land, core.landFraction, params, core.height);
   lap('dyn.circulation');
   const oceanCtx = makeOceanContext(g, core.landFraction, core.land, params.retrograde);
   let ocean = computeOcean(oceanCtx, circ.windU, circ.windV, null, params.fast, circ.baroclinic);
@@ -126,7 +126,7 @@ export function computeDynamics(
   progress(0.85);
 
   // ---- Final circulation consistent with the output temperatures.
-  circ = computeCirculation(g, mon2.tAir, core.land, core.landFraction, params);
+  circ = computeCirculation(g, mon2.tAir, core.land, core.landFraction, params, core.height);
   lap('dyn.circulation');
   ocean = computeOcean(oceanCtx, circ.windU, circ.windV, ocean, params.fast, circ.baroclinic);
   lap('dyn.ocean');

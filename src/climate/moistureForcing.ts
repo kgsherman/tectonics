@@ -264,9 +264,12 @@ export function precipMultiplier(asc: number, baro: number, upslope: number, sta
  * K, sea-level reduced) and synoptic storms (baroclinic index). A subsidence inversion caps the
  * land terms (not the storms).
  */
-export function gateThresholdShift(landFrac: number, warmAnomaly: number, asc: number, baro: number, t: HydroTuning): number {
-  const capConv = asc < 0 ? 1 + t.subsidenceCapping * asc : 1;
-  const capLand = asc < 0 ? 1 + t.subsidenceCappingLand * asc : 1;
+export function gateThresholdShift(landFrac: number, warmAnomaly: number, asc: number, baro: number, t: HydroTuning, stab = 0): number {
+  // A stable marine layer advected inland (cold upwind water) suppresses the land terms like a
+  // subsidence inversion does.
+  const marine = stab > 0 && t.stabilityGateScale > 0 ? Math.exp(-stab / t.stabilityGateScale) : 1;
+  const capConv = (asc < 0 ? 1 + t.subsidenceCapping * asc : 1) * marine;
+  const capLand = (asc < 0 ? 1 + t.subsidenceCappingLand * asc : 1) * marine;
   const warm = (landFrac * warmAnomaly) / t.landConvectionRefK;
   const storm = baro / t.baroclinicForMaxGateShift;
   const shift =
@@ -327,15 +330,16 @@ export function computeMonthForcing(
       // Precipitation multiplier M and the humidity-gate threshold.
       const asc = dyn.ascent[k] * invAsc;
       const baro = Math.max(0, dyn.baroclinic[k] * invBaro);
-      const upslope = (dyn.steerU[k] * st.hGradX[i] + dyn.steerV[k] * st.hGradY[i]) * invOroRef;
+      let upslope = (dyn.steerU[k] * st.hGradX[i] + dyn.steerV[k] * st.hGradY[i]) * invOroRef;
+      if (upslope > 0 && t.stabilityOroScale > 0) upslope *= Math.exp(-f.stab[i] / t.stabilityOroScale);
       const mult = precipMultiplier(asc, baro, upslope, f.stab[i], t);
       f.mult[i] = mult;
       // Ice-phase onset (Wegener–Bergeron–Findeisen): below 0 °C precipitation forms once the column
       // is saturated with respect to ice, e_si/e_sw of the liquid saturation used for W_sat.
       const icePhase = t.icePhaseGate > 0 && tCol < 0 ? 1 - t.icePhaseGate * (1 - iceToWaterSaturation(tCol)) : 1;
-      const r0 = t.gateThreshold * icePhase - gateThresholdShift(lf, T + lapse - tRef, asc, baro, t);
+      const r0 = t.gateThreshold * icePhase - gateThresholdShift(lf, T + lapse - tRef, asc, baro, t, f.stab[i]);
       f.gateR0[i] = r0;
-      f.cloudR0[i] = t.gateThreshold * icePhase - gateThresholdShift(lf, T + lapse - tRef, asc, 0, t);
+      f.cloudR0[i] = t.gateThreshold * icePhase - gateThresholdShift(lf, T + lapse - tRef, asc, 0, t, f.stab[i]);
       f.substeps[i] = substepsFor(mult, invTauP, t.gateSteepness, r0, dt, t.sinkStiffnessBound, t.maxSinkSubsteps);
 
       // Bulk ocean evaporation coefficients on the open-water fraction.

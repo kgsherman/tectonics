@@ -107,6 +107,14 @@ export interface HydroTuning {
   stabilitySmoothKm: number;
   /** Cap on the stability anomaly (K). */
   stabilityMax: number;
+  /**
+   * Orographic lift of a stable marine layer: the upslope term is × exp(−stab / this) (K; 0 = off).
+   * Air off cold upwelling water is capped by a low inversion and flows along coastal ranges (fog
+   * and drizzle, not rain: the Peruvian, Namib and Baja coasts).
+   */
+  stabilityOroScale: number;
+  /** The land terms of the gate-threshold shift are × exp(−stab / this) (K; 0 = off): see gateThresholdShift. */
+  stabilityGateScale: number;
 
   /* ---- Ocean evaporation (bulk formula) ---- */
   /** Air density ρ_a (kg/m³). */
@@ -240,7 +248,11 @@ export interface HydroTuning {
   cloudRhLow: number;
   cloudRhHigh: number;
   cloudRhWeight: number;
-  /** Precipitation contribution: cloudPrecipWeight · (1 − exp(−P / cloudPrecipRefMmDay)). */
+  /**
+   * Precipitation contribution: cloudPrecipWeight · (1 − exp(−P / cloudPrecipRefMmDay)). The reference
+   * was lowered from 4 to 3 mm/day when the land monsoon trough brought rainforest rainfall from
+   * ~3.3 to ~2.4 m/yr (near observed), keeping their cloud cover near the observed ~0.7.
+   */
   cloudPrecipWeight: number;
   cloudPrecipRefMmDay: number;
   /** Marine stratocumulus over cold, stable water: cloudStratusWeight · clamp(stab / cloudStratusRefK). */
@@ -298,6 +310,8 @@ export const HYDRO_TUNING: HydroTuning = {
   stabilityUpwindHours: 12,
   stabilitySmoothKm: 150,
   stabilityMax: 12,
+  stabilityOroScale: 2,
+  stabilityGateScale: 2,
 
   airDensity: 1.2,
   evapTransferCoeff: 7e-4,
@@ -352,7 +366,7 @@ export const HYDRO_TUNING: HydroTuning = {
   cloudRhHigh: 0.75,
   cloudRhWeight: 0.6,
   cloudPrecipWeight: 0.8,
-  cloudPrecipRefMmDay: 4,
+  cloudPrecipRefMmDay: 3,
   cloudStratusWeight: 0.55,
   cloudStratusRefK: 3,
   cloudStratusSubsidence: 0.5,

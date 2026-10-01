@@ -207,7 +207,7 @@ describe('Blue Marble clouds (CPU model shared with the shader)', () => {
     expect(CLOUDS_FRAGMENT).toContain('pow(exT / (exRef + BIAS_REF * max(bias, 0.0)), TAU_POW) * thickness');
     expect(CLOUDS_FRAGMENT).toContain('float thickness = aux.b * THICK_MAX;');
     expect(CLOUDS_FRAGMENT).toContain('alpha = ALPHA_MAX * (1.0 - 1.0 / (q * q));');
-    expect(CLOUDS_FRAGMENT).toMatch(/float exT = max\(ex - [\d.]+ \* amp \* ia \* nd, [\d.]+ \* ex\);/);
+    expect(CLOUDS_FRAGMENT).toMatch(/float exT = max\(ex - \([\d.]+ - [\d.]+ \* cv\) \* amp \* ia \* nd, [\d.]+ \* ex\);/);
     expect(CLOUDS_FRAGMENT).toContain('* (1.0 - cu) * sstep(0.3, 0.9, thickness)');
     expect(CLOUDS_FRAGMENT).toContain('float wisps = 0.1 + 0.9 * sstep(-0.6, 1.0, 0.3 * n1 + ndt);');
     // Shadows only under optically thick cloud.

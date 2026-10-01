@@ -11,11 +11,12 @@
  */
 import {
   ClampToEdgeWrapping, Data3DTexture, DataTexture, LinearFilter, LinearMipmapLinearFilter, Mesh, NoColorSpace,
-  NormalBlending, RepeatWrapping, RGBAFormat, ShaderMaterial, SphereGeometry, UnsignedByteType, Vector3,
+  NormalBlending, RepeatWrapping, RGBAFormat, ShaderMaterial, SphereGeometry, UnsignedByteType, Vector3, Vector4,
 } from 'three';
 import type { Camera, Texture } from 'three';
-import type { CloudSpec } from '../core/types';
+import type { CloudQuality, CloudSpec } from '../core/types';
 import type { CloudGridsResult } from './cloudsJobs';
+import { CLOUD_DEBUG } from './cloudsDebug';
 import { noiseDrift } from './cloudsField';
 import { CLOUD_FLOW, createCycloneMemo, CYCLONE_COUNT, CYCLONE_STRIDE, cycloneStates, type CloudClimate } from './cloudsModel';
 import type { CloudNoiseVolume } from './cloudsNoise';
@@ -36,6 +37,13 @@ const SHADOW_HEIGHT = 0.004;
 const SHADOW_STRENGTH = 0.42;
 /** Crossfade from the previous grids after an update (month / density / climate change), ms. */
 const TRANSITION_MS = 900;
+/**
+ * Standard-quality clouds (CloudQuality): regime grids at most this wide (2°; the worker job is ~6×
+ * cheaper than at 1°) and only the two coarse detail octaves (the finer two are skipped per pixel).
+ */
+export const STANDARD_GRID_W = 180;
+const OCTAVES_STANDARD: [number, number, number, number] = [1, 1, 0, 0];
+const OCTAVES_HIGH: [number, number, number, number] = [1, 1, 1, 1];
 
 /** RGBA8 equirect grid texture (regime grid), linear filtered, longitude repeats. */
 class RgbaGridSlot {
@@ -167,11 +175,18 @@ export class GlobeClouds {
   private disposed = false;
   /** Worker compute time of the last grid job (ms, diagnostics). */
   lastJobMs = 0;
+  /** Quality of the clouds on screen (null: none yet). */
+  shownQuality: CloudQuality | null = null;
+  /** Called with the spec given to set() once its clouds are on screen. */
+  onShown: ((clouds: CloudSpec) => void) | null = null;
+  /** Spec whose grids landed while the noise volumes were still loading (announced when they are). */
+  private shownPending: CloudSpec | null = null;
   private readonly shared: SharedUniforms;
 
   constructor(shared: SharedUniforms) {
     this.shared = shared;
     const material = new ShaderMaterial({
+      defines: CLOUD_DEBUG ? { CLOUD_DEBUG: 1 } : {},
       uniforms: {
         uShellRadius: { value: 1.008 },
         uGrid: { value: null as Texture | null },
@@ -187,6 +202,8 @@ export class GlobeClouds {
         uHasWind: { value: 0 },
         uTime: { value: 0 },
         uCycle: { value: CLOUD_CYCLE },
+        uOctaveMask: { value: new Vector4(...OCTAVES_HIGH) },
+        uGridW: { value: 0 },
         uFlow: { value: CLOUD_FLOW },
         uOpacity: { value: 1 },
         uShadow: { value: SHADOW_STRENGTH },
@@ -230,6 +247,8 @@ export class GlobeClouds {
       disposeSlots(this.prev);
       this.spec = null;
       this.climate = null;
+      this.shownQuality = null;
+      this.shownPending = null;
       this.transitionStart = -1;
       this.memo.fill(NaN);
       this.bindTextures();
@@ -245,12 +264,16 @@ export class GlobeClouds {
       spec.u = clouds.u!.slice(0, n);
       spec.v = clouds.v!.slice(0, n);
     }
+    const quality = clouds.quality ?? 'high';
     this.jobs++;
-    void cloudWorker().run({ kind: 'grids', spec }, this.channel).then((res) => {
+    const maxW = quality === 'standard' ? STANDARD_GRID_W : undefined;
+    void cloudWorker().run({ kind: 'grids', spec, maxW }, this.channel).then((res) => {
       this.jobs--;
       if (!res || this.disposed || seq < this.clearedAt) return;
       this.lastJobMs = res.ms;
-      this.apply(res, { w: spec.w, h: spec.h, cover: spec.cover }, hasWind);
+      this.apply(res, { w: spec.w, h: spec.h, cover: spec.cover }, hasWind, quality);
+      if (this.volumesState === 'ready') this.onShown?.(clouds);
+      else this.shownPending = clouds;
     });
     if (this.volumesState === 'none') {
       this.volumesState = 'loading';
@@ -267,6 +290,9 @@ export class GlobeClouds {
         this.volumesState = 'ready';
         this.bindTextures();
         this.updateVisibility();
+        const shown = this.shownPending;
+        this.shownPending = null;
+        if (shown) this.onShown?.(shown);
       });
     }
   }
@@ -316,6 +342,7 @@ export class GlobeClouds {
 
   dispose(): void {
     this.disposed = true;
+    this.onShown = null;
     cloudWorker().cancel(this.channel);
     disposeSlots(this.cur);
     disposeSlots(this.prev);
@@ -326,7 +353,7 @@ export class GlobeClouds {
     this.mesh.material.dispose();
   }
 
-  private apply(res: CloudGridsResult, cover: CloudSpec, hasWind: boolean): void {
+  private apply(res: CloudGridsResult, cover: CloudSpec, hasWind: boolean, quality: CloudQuality): void {
     const first = !this.cur.grid.texture;
     const now = performance.now();
     if (!first) {
@@ -350,6 +377,9 @@ export class GlobeClouds {
     this.climate = res.climate;
     this.spec = cover;
     this.mesh.material.uniforms.uHasWind.value = hasWind ? 1 : 0;
+    (this.mesh.material.uniforms.uOctaveMask.value as Vector4).set(...(quality === 'standard' ? OCTAVES_STANDARD : OCTAVES_HIGH));
+    this.shownQuality = quality;
+    this.mesh.material.uniforms.uGridW.value = res.w;
     this.mesh.material.uniforms.uMix.value = first ? 1 : this.mixAt(now);
     this.bindTextures();
     this.updateCyclones();

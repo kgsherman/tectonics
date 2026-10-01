@@ -13,13 +13,13 @@
  */
 import type { CloudSpec } from '../core/types';
 import {
-  ANVIL_TAU, anvilAlpha, BRIGHT_K, CELL_SCALE, cellFade, cellStage, cellularTexture, CIRRUS_ANISO, CIRRUS_SCALE, cirrusAlphaThr, cirrusFibre,
-  closedCells, cloudOpacity, combineNoise, coverageThreshold, cycloneEffect, detailOctaves, detailParams, detailSum, detailTexture, excessRef, newDetailShaping,
-  octaveFade, OPEN_CELL_SCALE, openCells, opticalDepth, SHAPE_STAGE_SIZE, shapeStage, TAU_DETAIL, tauExcess, THIN_BRIGHT, veilAlpha,
+  ANVIL_TAU, anvilAlpha, BRIGHT_K, CELL_SCALE, cellFade, cellStage, cellularTexture, cirrusAlphaThr, cirrusFades, cirrusFibre,
+  closedCells, clusterBias, organized, clusterCore, clusterRough, CLUSTER_SCALE, CLUSTER_WARP, cloudOpacity, combineNoise, coverageThreshold, cycloneEffect, detailOctaves, detailParams, detailSum, detailTexture, excessRef, newDetailShaping,
+  octaveFade, OPEN_CELL_SCALE, openCells, opticalDepth, SHAPE_STAGE_SIZE, shapeStage, tauDetail, tauExcess, THIN_BRIGHT, veilAlpha,
 } from './cloudsField';
-import { analyzeCloudClimate, buildCloudGrids, CYCLONE_COUNT, CYCLONE_STRIDE, cycloneStates, THICK_MAX } from './cloudsModel';
+import { analyzeCloudClimate, buildCloudGrids, CYCLONE_COUNT, CYCLONE_STRIDE, cycloneStates, THICK_MAX, type CloudGrids } from './cloudsModel';
 import {
-  CLOUD_CELL_EDGE_RANGE, CLOUD_DETAIL_PERIOD, cloudCellVolume, cloudDetailVolume, cloudNoiseVolume, type CloudNoiseVolume,
+  CLOUD_CELL_EDGE_RANGE, cloudCellVolume, cloudDetailVolume, cloudNoiseVolume, type CloudNoiseVolume,
 } from './cloudsNoise';
 
 /** Most detail octaves a raster resolves (all four of the globe's). */
@@ -70,6 +70,8 @@ export interface CloudNoiseRaster {
   cellF1: Uint8Array;
   /** The same for the (larger) open cells (edge only). */
   openEdge: Uint8Array;
+  /** Distance to the deep-convective cluster centre per pixel (cell units × 255 / 1.2; see clusterCore). */
+  cluster: Uint8Array;
   cellFade: number;
   openFade: number;
   /** Pixel footprint (radians, along a meridian). */
@@ -82,6 +84,20 @@ export interface CloudNoiseRaster {
  * detail fetches (as many octaves as the footprint resolves), cirrus fibres and cells run per pixel
  * (~0.3–0.6 s per million pixels: build it off the main thread).
  */
+/**
+ * Effective detail octaves (0–4: the footprint fades summed, as buildCloudNoiseRaster includes them)
+ * of a raster with pixel footprint `px` (radians); for the debug view (cloudsDebug.ts).
+ */
+export function rasterOctaveLevel(px: number): number {
+  let s = 0;
+  for (let k = 0; k < MAX_OCTAVES; k++) {
+    const f = octaveFade(px, k);
+    if (k >= 2 && f <= 0.02) break;
+    s += f;
+  }
+  return s;
+}
+
 export function buildCloudNoiseRaster(
   w: number, h: number, vol: CloudNoiseVolume = cloudNoiseVolume(), dvol: CloudNoiseVolume = cloudDetailVolume(),
   cvol: CloudNoiseVolume = cloudCellVolume(), win: CloudRasterWindow = WORLD_WINDOW,
@@ -102,10 +118,13 @@ export function buildCloudNoiseRaster(
   const closedOn = cf0 > 0.02, openOn = of0 > 0.02;
   const cellEdge = new Uint8Array(closedOn ? n : 0), cellId = new Uint8Array(closedOn ? n : 0), cellF1 = new Uint8Array(closedOn ? n : 0);
   const openEdge = new Uint8Array(openOn ? n : 0);
+  const cluster = new Uint8Array(n);
   const cell = new Float64Array(3);
   const g2 = new Float64Array(3);
   const oct: Int16Array[] = [];
   for (let k = 0; k < octaves; k++) oct.push(new Int16Array(n));
+  // Cirrus streaks: the fine octave only where this raster resolves it.
+  const fibreFine = cirrusFades(px)[1];
   const tmp = new Float32Array(4);
   const hw = Math.max(4, w >> 1), hh = Math.max(2, h >> 1);
   const S = SHAPE_STAGE_SIZE;
@@ -138,7 +157,7 @@ export function buildCloudNoiseRaster(
       nb[i] = st[3];
       detailOctaves(dvol, st, tmp, o, octaves, g2);
       for (let k = 0; k < octaves; k++) oct[k][i] = q(o[k]);
-      nc[i] = q(cirrusFibre(dvol, st, tmp));
+      nc[i] = q(cirrusFibre(dvol, st, tmp, fibreFine));
       if (closedOn) {
         cellStage(cvol, st, tmp, cell, CELL_SCALE, g2);
         cellEdge[i] = byte(cell[0] / CLOUD_CELL_EDGE_RANGE);
@@ -149,10 +168,12 @@ export function buildCloudNoiseRaster(
         cellStage(cvol, st, tmp, cell, CELL_SCALE * OPEN_CELL_SCALE, g2);
         openEdge[i] = byte(cell[0] / CLOUD_CELL_EDGE_RANGE);
       }
+      cellStage(cvol, st, tmp, cell, CLUSTER_SCALE, null, CLUSTER_WARP);
+      cluster[i] = byte(cell[2] / 1.2);
     }
   }
   return {
-    w, h, win, wraps, nb, hw, hh, cp, va, oct, nc, fade, cellEdge, cellId, cellF1, openEdge,
+    w, h, win, wraps, nb, hw, hh, cp, va, oct, nc, fade, cellEdge, cellId, cellF1, openEdge, cluster,
     cellFade: closedOn ? cf0 : 0, openFade: openOn ? of0 : 0, px,
   };
 }
@@ -285,14 +306,14 @@ const RELIEF_PX_REF = Math.PI / 768;
  * Paints the clouds of `spec` into `out` (w·h·4 RGBA, straight alpha): cloud as on the globe in relief
  * lighting (thin cloud grey and translucent, mottled thick cloud, bright cores and anvils, cloud-top
  * relief lit from the north-west, cirrus veils), with opacity × `opacity`. Returns area-weighted
- * statistics. `time` picks the cyclone snapshot (seconds on the globe's animation clock).
+ * statistics. `time` picks the cyclone snapshot (seconds on the globe's animation clock); `grids`:
+ * buildCloudGrids(spec) if already made (map tiles of one spec share them).
  */
 export function rasterizeClouds(
-  raster: CloudNoiseRaster, spec: CloudSpec, opacity: number, out: Uint8ClampedArray, time = 0,
+  raster: CloudNoiseRaster, spec: CloudSpec, opacity: number, out: Uint8ClampedArray, time = 0, grids: CloudGrids = buildCloudGrids(spec),
 ): CloudRasterStats {
-  const { w, h, win, wraps, nb, hw, hh, cp, va, oct, nc, fade, cellEdge, cellId, cellF1, openEdge, cellFade: cf0, openFade: of0 } = raster;
+  const { w, h, win, wraps, nb, hw, hh, cp, va, oct, nc, fade, cellEdge, cellId, cellF1, openEdge, cluster, cellFade: cf0, openFade: of0 } = raster;
   const gw = spec.w, gh = spec.h;
-  const grids = buildCloudGrids(spec);
   const grid = grids.regime, aux = grids.aux;
   const climate = grids.climate ?? analyzeCloudClimate(spec);
   const cyc = cycloneStates(time, spec, climate, new Float32Array(CYCLONE_COUNT * CYCLONE_STRIDE));
@@ -335,10 +356,9 @@ export function rasterizeClouds(
   for (let k = 0; k < 1024; k++) thrLut[k] = coverageThreshold(k / 1023);
   const o2 = new Float64Array(oct.length);
   const invQ = 1 / Q;
-  // Cirrus fibres fade to their mean veil below 2 px per lattice cell across them (as the shader's
-  // fadeC: the world raster resolves them only partly, a coarse raster not at all: no aliased speckle).
-  const fibrePx = 1 / (raster.px * CIRRUS_SCALE * CLOUD_DETAIL_PERIOD * CIRRUS_ANISO);
-  const tf = Math.min(1, Math.max(0, fibrePx - 1)), fibreFade = tf * tf * (3 - 2 * tf);
+  // Cirrus streaks fade to their mean veil below 2 px per lattice cell across the coarse octave (as the
+  // shader's fadeC: no aliased speckle in a coarse raster).
+  const fibreFade = cirrusFades(raster.px)[0];
   for (let r = 0; r < h; r++) {
     const lat = win.lat1 - ((r + 0.5) * (win.lat1 - win.lat0)) / h;
     const aLat = Math.abs(lat);
@@ -368,26 +388,29 @@ export function rasterizeClouds(
       const d0 = bx.i0[c] * 3, d1 = bx.i1[c] * 3, tbx = bx.t[c];
       const bias = rowB[d0] + tbx * (rowB[d1] - rowB[d0]);
       const zthr0 = rowG[c0 + 1] + tc * (rowG[c1 + 1] - rowG[c0 + 1]);
-      const zthr = zthr0 - bias;
+      const cv = rowG[c0 + 3] + tc * (rowG[c1 + 3] - rowG[c0 + 3]);
+      const e0 = hx.i0[c] * 2, e1 = hx.i1[c] * 2, the = hx.t[c];
+      const vary = rowH[e0 + 1] + the * (rowH[e1 + 1] - rowH[e0 + 1]);
+      // Deep-convective clusters lower the threshold in their cores, raise it in the gaps.
+      const clCore = cv > 0.02 ? clusterCore(cluster[i] * (1.2 / 255), vary) : 0;
+      const zthr = zthr0 - bias - (cv > 0.02 ? clusterBias(cv, clCore) : 0);
       const nbv = nb[i];
       hgt[i] = nbv + bias;
-      const e0 = hx.i0[c] * 2, e1 = hx.i1[c] * 2, the = hx.t[c];
       const cirrus = Math.min(1, rowG[c0 + 5] + tc * (rowG[c1 + 5] - rowG[c0 + 5]) + 0.5 * (rowB[d0 + 1] + tbx * (rowB[d1 + 1] - rowB[d0 + 1])));
       // Low cloud (skipped where no detail mix can lift the shape noise to the threshold).
       let exLow = nbv - zthr;
       if (nbv >= zthr - 2.8) {
         const sc = rowG[c0 + 2] + tc * (rowG[c1 + 2] - rowG[c0 + 2]);
-        const cv = rowG[c0 + 3] + tc * (rowG[c1 + 3] - rowG[c0 + 3]);
         const cu = rowG[c0 + 4] + tc * (rowG[c1 + 4] - rowG[c0 + 4]);
         const open = Math.min(1, rowG[c0 + 6] + tc * (rowG[c1 + 6] - rowG[c0 + 6]) + (rowB[d0 + 2] + tbx * (rowB[d1 + 2] - rowB[d0 + 2])));
-        const vary = rowH[e0 + 1] + the * (rowH[e1 + 1] - rowH[e0 + 1]);
-        detailParams(sc, cv, cu, open, vary, sh);
+        detailParams(sc, cv, cu, open, vary, sh, organized(bias));
         for (let k = 0; k < o2.length; k++) o2[k] = oct[k][i] * invQ;
         const ndv = detailSum(o2, o2.length, sh, fade);
         const ndt = detailTexture(o2, o2.length, sh.gain, fade);
         let ex = combineNoise(nbv, ndv, zthr, sc, cv, cu, sh.amp, bias, sh.floor) - zthr;
         // The detail's share beyond TAU_DETAIL (the optical depth follows the smoother excess).
-        const exD = ex - (combineNoise(nbv, TAU_DETAIL * ndv, zthr, sc, cv, cu, sh.amp, bias, sh.floor) - zthr);
+        const exD = ex - (combineNoise(nbv, tauDetail(cv) * ndv, zthr, sc, cv, cu, sh.amp, bias, sh.floor) - zthr);
+        if (clCore > 0) ex += clusterRough(cv, clCore, ndv);
         let cellsTau = 1;
         if (cf0 > 0 && sc > 0.02 && ex > -1.5) cellsTau = closedCells(cellEdge[i] * (CLOUD_CELL_EDGE_RANGE / 255), cellId[i] / 255, sc, cf0, cellF1[i] * (1.2 / 255));
         if (of0 > 0 && open > 0.02 && ex > -1.5) ex += openCells(openEdge[i] * (CLOUD_CELL_EDGE_RANGE / 255), open, of0, 0.3, ndv);
@@ -397,7 +420,7 @@ export function rasterizeClouds(
         tauA[i] = tau;
         const anvil = anvilAlpha(nbv, zthr, cv, o2[0] * fade[0], ndt);
         anvA[i] = anvil + veilAlpha(nbv, zthr, cu, o2[0] * fade[0], thick, ndt) * (1 - anvil);
-        const depth = tau > 0 ? Math.min(1, tau / 1.5) * (0.15 + 0.9 * cv + 0.4 * cu) * (1 - 0.6 * sc) : 0;
+        const depth = tau > 0 ? Math.min(1, tau / 1.5) * (0.35 + 0.7 * cv + 0.4 * cu) * (1 - 0.4 * sc) : 0;
         hgt[i] = nbv + bias + (RELIEF_DETAIL / RELIEF_SHAPE) * ndv * depth;
       }
       // Cirrus (not over optically thick low cloud, as on the globe).

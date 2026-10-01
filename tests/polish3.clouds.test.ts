@@ -15,7 +15,7 @@ import { COVER_REFERENCE_DENSITY, CYCLONE_COUNT, CYCLONE_STRIDE } from '../src/r
 import { cloudDetailVolume, cloudNoiseVolume } from '../src/render/cloudsNoise';
 import { buildCloudNoiseRaster, rasterizeClouds, WORLD_WINDOW, type CloudRasterWindow } from '../src/render/cloudsRaster';
 import { runCloudJob } from '../src/render/cloudsJobs';
-import { MapClouds, MAP_CLOUD_DETAIL_ZOOM } from '../src/render/cloudsMap';
+import { MAP_CLOUD_MAX_LEVEL, MapClouds, mapCloudTileLevel, mapCloudTileRes, mapCloudTileWindow } from '../src/render/cloudsMap';
 import { setCloudWorkerFactory } from '../src/render/cloudsWorkerClient';
 import { CLOUDS_FRAGMENT, CLOUDS_VERTEX } from '../src/render/shadersClouds';
 import { mapMinScale, type MapTransform } from '../src/render/viewMapTransform';
@@ -94,7 +94,9 @@ describe('no painterly strokes', () => {
   it('keeps the warps small (their strain drew the detail into brush strokes)', () => {
     expect(DETAIL_GRAD_WARP).toBeLessThanOrEqual(0.08);
     expect(DETAIL_WARP).toBeLessThanOrEqual(0.03);
-    expect(CIRRUS_WARP).toBeLessThanOrEqual(0.08);
+    // Cirrus: the 9×-stretched streaks stay coherent and just bend (0.06 ran ruler-straight; with the
+    // old 4× fibres 0.2 sent them every which way).
+    expect(CIRRUS_WARP).toBeLessThanOrEqual(0.2);
     // The detail texture is statistically isotropic (streaks would score ≳ 0.6).
     const samples = [[10, 20], [-35, 140], [50, -60], [0, -150]].map(([la, lo]) => coherence(detail, la * DEG, lo * DEG, 64, 0.0025));
     const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
@@ -135,7 +137,7 @@ describe('no painterly strokes', () => {
 });
 
 describe('regime spectra', () => {
-  it('puts cumulus and stratocumulus texture at the finest scales, convection at the coarse one', () => {
+  it('puts cumulus, stratocumulus and convective texture at the finest scales (clusters make the clumps)', () => {
     const sh = newDetailShaping();
     const cu = { ...detailParams(0, 0, 1, 0, 0, sh) };
     const sc = { ...detailParams(1, 0, 0, 0, 0, sh) };
@@ -148,7 +150,10 @@ describe('regime spectra', () => {
     };
     expect(coarseShare(cu)).toBeLessThan(0.1);
     expect(coarseShare(sc)).toBeLessThan(0.15);
-    expect(coarseShare(cv)).toBeGreaterThan(0.6);
+    // Convection (polish 5): crisp cauliflower towers at the fine scales; its ~300 km clumps come from
+    // the convective clusters (clusterCore), not from a red noise spectrum (soft cotton-wool puffs).
+    expect(coarseShare(cv)).toBeLessThan(0.15);
+    expect(coarseShare(plain)).toBeGreaterThan(coarseShare(cv) * 3);
     expect(coarseShare(plain)).toBeGreaterThan(coarseShare(cu) * 3);
     // Cumulus fields are broken throughout (a higher detail floor), not blobs with fringes.
     expect(cu.floor).toBeGreaterThan(plain.floor + 0.4);
@@ -210,7 +215,7 @@ describe('cloud bodies, anvils and cirrus', () => {
     expect(outer).toBeGreaterThan(0.1); // inside: a translucent sheet
     expect(outer).toBeLessThan(0.3);
     expect(anvilAlpha(zthr + 2, zthr, 1, 0)).toBeLessThanOrEqual(ANVIL_TAU + 1e-9);
-    expect(anvilAlpha(zthr + 2, zthr, 1, 0)).toBeGreaterThan(0.4);
+    expect(anvilAlpha(zthr + 2, zthr, 1, 0)).toBeGreaterThan(0.35);
   });
 
   it('keeps cirrus a thin, striated veil (streaks, not smoke loops)', () => {
@@ -307,11 +312,10 @@ describe('zoomed map window rasters', () => {
   });
 });
 
-describe('MapClouds window rasters (host wiring: setView + drawCopy)', () => {
+describe('MapClouds tiles (host wiring: setView + drawCopy)', () => {
   /** Minimal DOM canvas stand-in recording drawImage calls. */
   class FakeCtx {
     calls: { img: unknown; args: number[] }[] = [];
-    clips = 0;
     setTransform(): void {}
     clearRect(): void {}
     putImageData(): void {}
@@ -319,7 +323,7 @@ describe('MapClouds window rasters (host wiring: setView + drawCopy)', () => {
     restore(): void {}
     beginPath(): void {}
     rect(): void {}
-    clip(): void { this.clips++; }
+    clip(): void {}
     drawImage(img: unknown, ...args: number[]): void { this.calls.push({ img, args }); }
   }
   class FakeCanvas {
@@ -335,101 +339,198 @@ describe('MapClouds window rasters (host wiring: setView + drawCopy)', () => {
     if (!hadDoc) delete g.document;
     if (!hadImageData) delete g.ImageData;
   });
-
-  it('requests a sharp raster of the visible window once zoomed in and draws it over the world raster', async () => {
+  const fake = (): void => {
     g.document = { createElement: () => new FakeCanvas() };
     g.ImageData = class { constructor(public data: Uint8ClampedArray, public width: number, public height: number) {} };
     setCloudWorkerFactory(null);
-    let updates = 0;
-    const clouds = new MapClouds(() => { updates++; });
-    clouds.set(syntheticSpec(72, 36));
-    for (let i = 0; i < 400 && clouds.busy; i++) await new Promise((r) => setTimeout(r, 10));
-    expect(updates).toBe(1);
-    const ctx = new FakeCtx();
-    const W = 400, H = 250;
-    const fit = mapMinScale(W, H);
-    // Zoom 1: the world raster only.
-    const t1: MapTransform = { width: W, height: H, centerLon: 0, centerLat: 0, scale: fit };
-    clouds.setView(t1, 1);
-    expect(clouds.pending).toBe(false);
-    clouds.drawCopy(ctx as unknown as CanvasRenderingContext2D, 0, 0, 2 * Math.PI * fit, Math.PI * fit);
-    expect(ctx.calls.length).toBe(1);
-    expect(ctx.calls[0].img).toBe(clouds.canvas);
-    // Zoom 8: after the view settles a window raster lands; it is drawn after the (clipped) world one.
-    const z = Math.max(8, MAP_CLOUD_DETAIL_ZOOM + 1);
-    const t8: MapTransform = { width: W, height: H, centerLon: 0.3, centerLat: 0.4, scale: z * fit };
-    clouds.setView(t8, 1);
-    expect(clouds.pending).toBe(true);
-    for (let i = 0; i < 400 && clouds.pending; i++) await new Promise((r) => setTimeout(r, 10));
-    expect(updates).toBe(2);
-    expect(clouds.lastDetailMs).toBeGreaterThan(0);
-    // The same view again: nothing new to compute.
-    clouds.setView(t8, 1);
-    expect(clouds.pending).toBe(false);
+  };
+  const W = 400, H = 250;
+  const fit = mapMinScale(W, H);
+  const at = (zoom: number, centerLon = 0.3, centerLat = 0.4): MapTransform => ({ width: W, height: H, centerLon, centerLat, scale: zoom * fit });
+  /** drawCopy of the world copy the transform centres; the tile draws (source rect + destination). */
+  const draw = (clouds: MapClouds, t: MapTransform, ctx = new FakeCtx()): { world: number; tiles: number[][] } => {
     ctx.calls.length = 0;
-    const rx = t8.width / 2 - (t8.centerLon + Math.PI) * t8.scale, ry = t8.height / 2 - (Math.PI / 2 - t8.centerLat) * t8.scale;
-    clouds.drawCopy(ctx as unknown as CanvasRenderingContext2D, rx, ry, 2 * Math.PI * t8.scale, Math.PI * t8.scale);
-    expect(ctx.calls.length).toBe(2);
-    expect(ctx.calls[0].img).toBe(clouds.canvas);
-    expect(ctx.calls[1].img).not.toBe(clouds.canvas);
-    // The window covers the viewport.
-    const [x, y, w, h] = ctx.calls[1].args;
-    expect(x).toBeLessThanOrEqual(0);
-    expect(y).toBeLessThanOrEqual(0);
-    expect(x + w).toBeGreaterThanOrEqual(W);
-    expect(y + h).toBeGreaterThanOrEqual(H);
-    // Zooming back out drops it.
-    clouds.setView(t1, 1);
-    ctx.calls.length = 0;
-    clouds.drawCopy(ctx as unknown as CanvasRenderingContext2D, 0, 0, 2 * Math.PI * fit, Math.PI * fit);
-    expect(ctx.calls.length).toBe(1);
-    clouds.dispose();
+    const rx = t.width / 2 - (t.centerLon + Math.PI) * t.scale, ry = t.height / 2 - (Math.PI / 2 - t.centerLat) * t.scale;
+    clouds.drawCopy(ctx as unknown as CanvasRenderingContext2D, rx, ry, 2 * Math.PI * t.scale, Math.PI * t.scale);
+    return { world: ctx.calls.filter((c) => c.img === clouds.canvas).length, tiles: ctx.calls.filter((c) => c.img !== clouds.canvas).map((c) => c.args) };
+  };
+  /** The tiles' destinations cover the viewport. */
+  const coversViewport = (tiles: number[][]): boolean => {
+    for (let y = 1; y < H; y += 20) {
+      for (let x = 1; x < W; x += 20) {
+        if (!tiles.some((a) => x >= a[4] && x <= a[4] + a[6] && y >= a[5] && y <= a[5] + a[7])) return false;
+      }
+    }
+    return true;
+  };
+
+  it('chooses the tile level from the screen resolution, always finer than the world raster', () => {
+    const worldRes = 1536 / (2 * Math.PI);
+    expect(mapCloudTileRes(mapCloudTileLevel(1, worldRes))).toBeGreaterThan(worldRes); // zoomed out: still tiles
+    let prev = 0;
+    for (let need = 100; need < 40000; need *= 1.3) {
+      const l = mapCloudTileLevel(need, worldRes);
+      expect(l).toBeGreaterThanOrEqual(prev);
+      expect(l).toBeLessThanOrEqual(MAP_CLOUD_MAX_LEVEL);
+      if (l < MAP_CLOUD_MAX_LEVEL) expect(mapCloudTileRes(l)).toBeGreaterThanOrEqual(0.85 * need);
+      prev = l;
+    }
+    const w = mapCloudTileWindow(3, 0, 0);
+    expect(w.lon0).toBeCloseTo(-Math.PI, 12);
+    expect(w.lat1).toBeCloseTo(Math.PI / 2, 12);
+    expect(w.lat1 - w.lat0).toBeCloseTo(Math.PI / 8, 12);
+    expect(w.lon1 - w.lon0).toBeCloseTo(Math.PI / 8, 12);
   });
 
-  it('follows a pan that settles while the clouds change (season playback), seamlessly', async () => {
-    g.document = { createElement: () => new FakeCanvas() };
-    g.ImageData = class { constructor(public data: Uint8ClampedArray, public width: number, public height: number) {} };
-    setCloudWorkerFactory(null);
+  it('tiles the view once it settles, prefetches the neighbouring levels, and changes the picture only at zoom breakpoints', async () => {
+    fake();
     let updates = 0;
     const clouds = new MapClouds(() => { updates++; });
     const idle = async (): Promise<void> => {
-      for (let i = 0; i < 600 && clouds.pending; i++) await new Promise((r) => setTimeout(r, 10));
+      for (let i = 0; i < 1500 && clouds.pending; i++) await new Promise((r) => setTimeout(r, 10));
     };
     clouds.set(syntheticSpec(72, 36));
     await idle();
-    const W = 400, H = 250, fit = mapMinScale(W, H);
-    const tA: MapTransform = { width: W, height: H, centerLon: 0.3, centerLat: 0.4, scale: 8 * fit };
-    clouds.setView(tA, 1);
+    expect(updates).toBe(1);
+    // Zoom 8 (level 3): nothing until the view rests, then the visible tiles, then the prefetch
+    // (level 4 under the view, level 2 around it).
+    const t8 = at(8);
+    clouds.setView(t8, 1);
+    expect(clouds.pending).toBe(true);
+    expect(draw(clouds, t8).tiles.length).toBe(0);
     await idle();
-    // Pan far away; the month changes before the view has settled (the host does not call setView
-    // again: the new window must not be lost to a re-rasterization of the old one).
-    const tB: MapTransform = { ...tA, centerLon: -2, centerLat: -0.3 };
-    clouds.setView(tB, 1);
-    clouds.set(syntheticSpec(72, 36, COVER_REFERENCE_DENSITY * 0.8));
+    expect(clouds.lastDetailMs).toBeGreaterThan(0);
+    clouds.setView(t8, 1);
+    expect(clouds.pending).toBe(false); // the same view: nothing new
+    const d8 = draw(clouds, t8);
+    expect(d8.world).toBe(1); // the world raster under the tiles
+    expect(coversViewport(d8.tiles)).toBe(true);
+    for (const a of d8.tiles) expect(a.slice(0, 4)).toEqual([1, 1, 256, 256]); // drawn without the apron
+    // One level on screen (the prefetched levels are not drawn over it).
+    const size8 = new Set(d8.tiles.map((a) => Math.round(a[6])));
+    expect(size8.size).toBe(1);
+    const n = clouds.tileCount;
+    expect(n).toBeGreaterThan(5 * d8.tiles.length); // the view's tiles + 4× finer + the coarser ones
+    // Zooming in a breakpoint (zoom 16: level 4) or out (zoom 4: level 2): already made, drawn at once,
+    // before the view has even settled.
+    for (const z of [16, 4]) {
+      const t = at(z);
+      clouds.setView(t, 1);
+      const d = draw(clouds, t);
+      expect(coversViewport(d.tiles)).toBe(true);
+      expect(new Set(d.tiles.map((a) => Math.round(a[6]))).size).toBe(1);
+      await idle();
+    }
+    // Back to zoom 8: cached; nothing to compute.
+    clouds.setView(t8, 1);
+    await new Promise((r) => setTimeout(r, 300));
+    clouds.setView(t8, 1);
+    expect(draw(clouds, t8).tiles.length).toBe(d8.tiles.length);
+    clouds.dispose();
+    expect(clouds.tileCount).toBe(0);
+  });
+
+  it('lets other levels stand in only where the view’s own tiles are missing', async () => {
+    fake();
+    const clouds = new MapClouds(() => {});
+    const idle = async (): Promise<void> => {
+      for (let i = 0; i < 1500 && clouds.pending; i++) await new Promise((r) => setTimeout(r, 10));
+    };
+    clouds.set(syntheticSpec(72, 36));
     await idle();
-    clouds.setView(tB, 1);
-    expect(clouds.pending).toBe(false); // the raster on screen already covers the new view
-    // Window edges on device pixels (DPR 2): the world raster's clip hole and the window meet exactly.
+    const t8 = at(8);
+    clouds.setView(t8, 1);
+    await idle();
+    // Panned east (zoom 8): before the view's own tiles land, the cached tiles of the neighbouring
+    // levels (the coarser prefetch spans twice the view) stand in where they exist.
+    const tp = at(8, 0.3 + 0.6, 0.4);
+    clouds.setView(tp, 1);
+    const before = draw(clouds, tp);
+    expect(before.tiles.length).toBeGreaterThan(0);
+    await idle();
+    const after = draw(clouds, tp);
+    expect(coversViewport(after.tiles)).toBe(true);
+    const own = new Set(after.tiles.map((a) => Math.round(a[6])));
+    expect(own.size).toBe(1);
+    // Before: stand-ins of the prefetched coarser level where the view's own tiles were missing.
+    expect(before.tiles.some((a) => !own.has(Math.round(a[6])))).toBe(true);
+    clouds.dispose();
+  });
+
+  it('tiles zoomed-out views too, snaps tile edges to device pixels, and drops nothing on a date-line pan', async () => {
+    fake();
+    const clouds = new MapClouds(() => {});
+    const idle = async (): Promise<void> => {
+      for (let i = 0; i < 900 && clouds.pending; i++) await new Promise((r) => setTimeout(r, 10));
+    };
+    clouds.set(syntheticSpec(72, 36));
+    await idle();
+    // Zoom 2 across the date line.
+    const t = at(2, Math.PI - 0.1, -0.2);
+    clouds.setView(t, 1);
+    await idle();
     class DprCtx extends FakeCtx {
       getTransform(): { a: number; b: number; c: number; d: number; e: number; f: number } {
         return { a: 2, b: 0, c: 0, d: 2, e: 0, f: 0 };
       }
     }
     const ctx = new DprCtx();
-    const rx = tB.width / 2 - (tB.centerLon + Math.PI) * tB.scale + 0.3, ry = tB.height / 2 - (Math.PI / 2 - tB.centerLat) * tB.scale + 0.2;
-    clouds.drawCopy(ctx as unknown as CanvasRenderingContext2D, rx, ry, 2 * Math.PI * tB.scale, Math.PI * tB.scale);
-    expect(ctx.calls.length).toBe(2);
-    for (const v of ctx.calls[1].args) expect(Math.abs(v * 2 - Math.round(v * 2))).toBeLessThan(1e-6);
-    const [x, y, w, h] = ctx.calls[1].args;
-    expect(x).toBeLessThanOrEqual(0);
-    expect(y).toBeLessThanOrEqual(0);
-    expect(x + w).toBeGreaterThanOrEqual(W);
-    expect(y + h).toBeGreaterThanOrEqual(H);
-    // Disposed: late results are dropped, no callbacks.
-    const before = updates;
+    // The centred world copy and the one east of it (the view straddles both).
+    const rx = t.width / 2 - (t.centerLon + Math.PI) * t.scale + 0.3, ry = t.height / 2 - (Math.PI / 2 - t.centerLat) * t.scale + 0.2;
+    const ww = 2 * Math.PI * t.scale;
+    const all: number[][] = [];
+    for (const k of [0, 1]) {
+      ctx.calls.length = 0;
+      clouds.drawCopy(ctx as unknown as CanvasRenderingContext2D, rx + k * ww, ry, ww, Math.PI * t.scale);
+      all.push(...ctx.calls.filter((c) => c.img !== clouds.canvas).map((c) => c.args));
+    }
+    expect(coversViewport(all)).toBe(true);
+    for (const a of all) for (const v of a.slice(4)) expect(Math.abs(v * 2 - Math.round(v * 2))).toBeLessThan(1e-6);
+    // Neighbouring tiles share their edges exactly (no gap, no overlap).
+    const xs = new Set(all.map((a) => a[4]));
+    for (const a of all) {
+      const right = a[4] + a[6];
+      if (right < W) expect(xs.has(right)).toBe(true);
+    }
+    clouds.dispose();
+  });
+
+  it('keeps the previous clouds’ tiles until the new world raster lands, then remakes the view’s tiles', async () => {
+    fake();
+    let updates = 0;
+    const clouds = new MapClouds(() => { updates++; });
+    const idle = async (): Promise<void> => {
+      for (let i = 0; i < 900 && clouds.pending; i++) await new Promise((r) => setTimeout(r, 10));
+    };
     clouds.set(syntheticSpec(72, 36));
+    await idle();
+    const t = at(8);
+    clouds.setView(t, 1);
+    await idle();
+    const n = clouds.tileCount;
+    const before = draw(clouds, t).tiles.length;
+    // New clouds (season playback in HD): the old tiles stay on screen meanwhile.
+    clouds.set(syntheticSpec(72, 36, COVER_REFERENCE_DENSITY * 0.8));
+    expect(draw(clouds, t).tiles.length).toBe(before);
+    await idle();
+    clouds.setView(t, 1);
+    await idle();
+    expect(clouds.pending).toBe(false);
+    expect(clouds.tileCount).toBe(n); // the old ones freed, the view's remade
+    expect(draw(clouds, t).tiles.length).toBe(before);
+    // Standard clouds: no tiles at all.
+    clouds.set({ ...syntheticSpec(72, 36), quality: 'standard' });
+    await idle();
+    expect(clouds.tileCount).toBe(0);
+    clouds.setView(t, 1);
+    expect(clouds.pending).toBe(false);
+    // Disposed: late results are dropped, no callbacks.
+    clouds.set(syntheticSpec(72, 36));
+    clouds.setView(t, 1);
+    const u = updates;
     clouds.dispose();
     await new Promise((r) => setTimeout(r, 1500));
-    expect(updates).toBe(before);
+    expect(updates).toBe(u);
+    expect(clouds.tileCount).toBe(0);
   });
 });

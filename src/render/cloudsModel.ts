@@ -10,9 +10,10 @@
  *    deep convection, shallow cumulus) packed with the coverage in an RGBA8 grid
  *    (`buildCloudRegimeGrid`);
  *  - storm-track latitudes and the planet's rotation sense (`analyzeCloudClimate`);
- *  - extratropical cyclones living in the storm tracks (`cycloneStates`): each is born as an open
- *    frontal wave, winds up into a comma and an occluded spiral while drifting east and poleward,
- *    then decays and is reborn elsewhere (stateless: a pure function of time).
+ *  - extratropical cyclones living in the storm tracks (`cycloneStates`): a wave train per hemisphere
+ *    (evenly spaced, drifting east together: storms never merge); each is born as an open frontal
+ *    wave, winds up into a comma and an occluded spiral while drifting poleward, weakens over dry
+ *    climates, then decays and is reborn (stateless: a pure function of time).
  */
 import type { CloudSpec } from '../core/types';
 
@@ -373,6 +374,18 @@ export const CYCLONE_STRIDE = 8;
 export const CYCLONE_LIFE = 150;
 /** Cloud drift: radians of arc per second per (m/s) of wind (10 m/s ≈ 0.29°/s: a gentle time-lapse). */
 export const CLOUD_FLOW = 0.0005;
+/**
+ * Eastward (prograde) drift of the storms in longitude (radians per animation second): 12 m/s along a
+ * 50° storm track. All storms of a hemisphere share it (a wave train), so they keep their spacing and
+ * never run into one another.
+ */
+export const CYCLONE_DRIFT = (12 * CLOUD_FLOW) / Math.cos(50 * Math.PI / 180);
+/**
+ * Swirl (radians of rotation at the low's centre) of the comma template over a storm's life: an open
+ * wave at birth, wound up into an occluded spiral (the dry slot wrapping into the centre) when mature.
+ */
+export const CYCLONE_SWIRL_MIN = 0.4;
+export const CYCLONE_SWIRL_MAX = 4.0;
 
 function hash(a: number, b: number, c: number): number {
   let x = (Math.imul(a | 0, 0x27d4eb2d) ^ Math.imul(b | 0, 0x165667b1) ^ Math.imul(c | 0, 0x9e3779b1)) >>> 0;
@@ -417,7 +430,10 @@ export function createCycloneMemo(): Float64Array {
  * arc), intensity 0..1 (0 = inactive), swirl angle at the centre (radians, ≥ 0: applied in the
  * cyclone's template frame, which is always cyclonic), and the template mirror signs (x: rotation
  * sense, y: hemisphere) that map template axes (x = downstream, y = poleward) to east/north.
- * Genesis longitudes prefer cloudy longitudes of the storm track (a few seeded tries).
+ * The storms of a hemisphere form a wave train: slot k is born near the k-th of K evenly spaced
+ * longitudes of a frame drifting east at CYCLONE_DRIFT and travels with it, so storms keep their
+ * spacing (~60° of longitude) instead of running into one another. A storm is weaker where its
+ * climate is dry (it fades over desert continents and strengthens again over the ocean).
  * Stateless (a pure function of t, spec and climate) unless a `memo` (createCycloneMemo) is given:
  * then each storm keeps its genesis parameters for its whole life (continuous across spec changes).
  */
@@ -430,7 +446,8 @@ export function cycloneStates(
     const track = climate.stormLat[hemi];
     for (let k = 0; k < K; k++) {
       const o = (hemi * K + k) * CYCLONE_STRIDE;
-      const life = t / CYCLONE_LIFE + (k * 0.618034 + hemi * 0.37) % 1;
+      const phase = (k * 0.618034 + hemi * 0.37) % 1;
+      const life = t / CYCLONE_LIFE + phase;
       const cycle = Math.floor(life);
       const age = life - cycle;
       const h1 = hash(hemi * 97 + k, cycle, 1), h2 = hash(hemi * 97 + k, cycle, 2);
@@ -447,21 +464,12 @@ export function cycloneStates(
         rotation = climate.rotation;
         // Activity: stronger westerlies → stronger, bigger storms (winter hemisphere).
         act = smoothstep(0.5, 6, climate.stormWind[hemi]);
-        drift = Math.max(5, 1.6 * climate.stormWind[hemi]) * CLOUD_FLOW * rotation;
+        drift = CYCLONE_DRIFT * rotation;
         lat0 = track - 7 * DEG + 6 * DEG * h2;
-        // Genesis longitude within the slot's sector, preferring cloudy longitudes.
-        lon0 = -Math.PI + ((k + 0.15 + 0.7 * h1) / K) * 2 * Math.PI;
-        if (spec) {
-          let best = -1;
-          for (let tr = 0; tr < 4; tr++) {
-            const cand = -Math.PI + ((k + hash(hemi * 97 + k, cycle, 10 + tr)) / K) * 2 * Math.PI;
-            const x = coverAt(spec, hs * lat0, cand);
-            if (x > best + 0.05) {
-              best = x;
-              lon0 = cand;
-            }
-          }
-        }
+        // Genesis at the slot's place in the drifting wave train (a little jitter), at birth time.
+        const born = (cycle - phase) * CYCLONE_LIFE;
+        lon0 = -Math.PI + ((k + 0.5 + 0.3 * (h1 - 0.5)) / K) * 2 * Math.PI + drift * born + hemi * 0.4;
+        lon0 -= 2 * Math.PI * Math.floor((lon0 + Math.PI) / (2 * Math.PI));
         if (memo) {
           memo[mo] = cycle;
           memo[mo + 1] = lat0;
@@ -473,10 +481,12 @@ export function cycloneStates(
       }
       const dur = CYCLONE_LIFE;
       const lat = Math.min(72 * DEG, lat0 + 11 * DEG * age);
-      const lon = lon0 + (drift * age * dur) / Math.max(0.3, Math.cos(lat));
-      const inten = smoothstep(0, 0.22, age) * (1 - smoothstep(0.62, 1, age)) * (0.55 + 0.45 * act) * (0.75 + 0.25 * h3);
+      const lon = lon0 + drift * age * dur;
+      // Weaker over dry climates (deserts, dry continental interiors), full strength over the oceans.
+      const moist = spec ? 0.35 + 0.65 * smoothstep(0.25, 0.6, coverAt(spec, hs * lat, lon)) : 1;
+      const inten = smoothstep(0, 0.22, age) * (1 - smoothstep(0.62, 1, age)) * (0.55 + 0.45 * act) * (0.75 + 0.25 * h3) * moist;
       const radius = (0.19 + 0.07 * h4) * (0.75 + 0.35 * smoothstep(0, 0.6, age)) * (0.8 + 0.25 * act);
-      const swirl = 0.4 + 1.8 * smoothstep(0.1, 0.85, age);
+      const swirl = CYCLONE_SWIRL_MIN + (CYCLONE_SWIRL_MAX - CYCLONE_SWIRL_MIN) * smoothstep(0.1, 0.85, age);
       const sl = hs * lat, cl = Math.cos(sl);
       out[o] = cl * Math.cos(lon);
       out[o + 1] = cl * Math.sin(lon);

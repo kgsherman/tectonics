@@ -56,6 +56,8 @@ export class Viewport {
   private current: AppView | null = null;
   private currentKind: ViewKind | null = null;
   private unsubscribe: (() => void) | null = null;
+  private cloudsUnsub: (() => void) | null = null;
+  private readonly cloudsShownHandlers = new Set<(clouds: CloudSpec) => void>();
   private suspended = false;
 
   private base: ImageRef | null = null;
@@ -112,6 +114,9 @@ export class Viewport {
     this.current = view;
     this.currentKind = kind;
     this.unsubscribe = view.onPointer((ev) => this.opts.onPointer(ev));
+    this.cloudsUnsub = view.onCloudsShown?.((c) => {
+      for (const fn of [...this.cloudsShownHandlers]) fn(c);
+    }) ?? null;
     if (center && view.setView) view.setView(center);
     this.pushAll();
     this.opts.onViewChanged(view);
@@ -164,6 +169,15 @@ export class Viewport {
   setClouds(c: CloudSpec | null): void {
     this.clouds = c;
     if (this.live) this.current!.setClouds(c);
+  }
+
+  /**
+   * Called with the spec given to setClouds() once the current view shows its clouds (also after a
+   * globe ⇄ map switch, which re-sends them). Returns unsubscribe.
+   */
+  onCloudsShown(handler: (clouds: CloudSpec) => void): () => void {
+    this.cloudsShownHandlers.add(handler);
+    return () => this.cloudsShownHandlers.delete(handler);
   }
 
   setParticleCount(n: number): void {
@@ -272,6 +286,8 @@ export class Viewport {
   private disposeView(): void {
     this.unsubscribe?.();
     this.unsubscribe = null;
+    this.cloudsUnsub?.();
+    this.cloudsUnsub = null;
     if (this.current) {
       const slot = this.current.element;
       this.current.dispose();

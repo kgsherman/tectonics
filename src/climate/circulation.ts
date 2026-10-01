@@ -9,6 +9,7 @@
 import { OMEGA_EARTH } from '../core/constants';
 import type { ClimateParams } from '../core/types';
 import { EARTH_RADIUS_M, type LatLonGrid } from './dynGrid';
+import { declinationAt } from './insolation';
 import { boxBlurZonal, smoothField } from './numerics';
 import { pressureTuning, windTuning } from './tuning';
 
@@ -114,6 +115,57 @@ function thermalEquator(g: LatLonGrid, Ts: Float64Array, tiltDeg: number, out: F
   for (let c = 0; c < nx; c++) out[off + c] = Math.max(-clamp, Math.min(clamp, row[c]));
 }
 
+/** Hemispheric belt scales of one month (gradientScales, subpolarChannelFactors). */
+interface BeltScales {
+  sN: number;
+  sS: number;
+  sEq: number;
+  openN: number;
+  openS: number;
+}
+
+/**
+ * Zonal-belt pressure anomaly (hPa) at latitude `la` (deg) for an equatorial trough centred on `te`
+ * (deg) with Gaussian width `itczW`: ITCZ trough, subtropical highs (amplitude ampSt), subpolar lows
+ * (ampSp) and polar highs, shifted with the trough and scaled by the hemispheric gradients.
+ */
+function beltPressure(la: number, te: number, itczW: number, ampSt: number, ampSp: number, b: BeltScales): number {
+  const P = pressureTuning;
+  const d = la - te;
+  const phiE = la - te * Math.exp(-(d * d) / (P.shiftDecay * P.shiftDecay));
+  const a = Math.abs(phiE);
+  const north = phiE >= 0;
+  return (
+    -P.itczDepth * b.sEq * gauss(phiE, 0, itczW) +
+    (north ? b.sN : b.sS) *
+      (ampSt * gauss(a, P.subtropicalLat, P.subtropicalWidth) -
+        ampSp * (north ? b.openN : b.openS) * gauss(a, P.subpolarLat, P.subpolarWidth) +
+        P.polarAmp * gauss(a, 90, P.polarWidth))
+  );
+}
+
+/**
+ * Weight (0..1) of the land monsoon trough per cell (see pressureTuning.landTroughShare): the
+ * lowland part of the land fraction (terrain below landTroughHeight, fading over its last third),
+ * smoothed over landTroughSmoothKm and saturating at landTroughFull, so continental interiors carry
+ * the trough while coasts in front of high ranges (the Pacific side of the Andes) and plateaus do
+ * not.
+ */
+function landTroughWeights(g: LatLonGrid, landFrac: Float64Array, height: ArrayLike<number> | undefined): Float64Array {
+  const P = pressureTuning;
+  const w = new Float64Array(g.n);
+  const h1 = P.landTroughHeight;
+  const h0 = (2 * h1) / 3;
+  for (let i = 0; i < g.n; i++) {
+    const h = height ? Math.max(0, height[i]) : 0;
+    const x = h <= h0 ? 1 : h >= h1 ? 0 : (h1 - h) / (h1 - h0);
+    w[i] = landFrac[i] * x;
+  }
+  smoothField(g, w, P.landTroughSmoothKm, 3);
+  for (let i = 0; i < g.n; i++) w[i] = Math.min(1, w[i] / P.landTroughFull);
+  return w;
+}
+
 /**
  * Subpolar-trough deepening [north, south] over a zonally open storm-track ocean: where the latitude
  * circle of the subpolar belt is (almost) all ocean, the storm track is zonally uniform and not
@@ -167,9 +219,17 @@ function gradientScales(g: LatLonGrid, T: Float64Array, off: number): [number, n
 
 /**
  * Compute monthly pressure, winds, steering winds, ascent and baroclinicity from the monthly
- * sea-level-reduced air temperature `tSl` (12·n) on grid g.
+ * sea-level-reduced air temperature `tSl` (12·n) on grid g. `height` (land surface height above sea
+ * level, m, n) keeps the land monsoon trough off high terrain; without it the terrain is flat.
  */
-export function computeCirculation(g: LatLonGrid, tSl: Float64Array, land: Uint8Array, landFrac: Float64Array, params: ClimateParams): Circulation {
+export function computeCirculation(
+  g: LatLonGrid,
+  tSl: Float64Array,
+  land: Uint8Array,
+  landFrac: Float64Array,
+  params: ClimateParams,
+  height?: ArrayLike<number>,
+): Circulation {
   const P = pressureTuning;
   const W = windTuning;
   const { nx, ny, n } = g;
@@ -191,9 +251,21 @@ export function computeCirculation(g: LatLonGrid, tSl: Float64Array, land: Uint8
   const lfCoast = Float64Array.from(landFrac);
   smoothField(g, lfCoast, W.coastSmoothKm, 3);
   const f = coriolis(g, params.retrograde);
+  const troughW = P.landTroughShare > 0 ? landTroughWeights(g, landFrac, height) : null;
+  const tiltRad = Math.max(0, Math.min(90, params.axialTilt)) * DEG;
+  const teClamp = Math.min(Math.max(0, params.axialTilt), P.thermalEqClamp) * DEG;
   const Tref = new Float64Array(ny);
   const Ts = new Float64Array(n);
+  const To = troughW ? new Float64Array(n) : null;
   const th = new Float64Array(n);
+  // Shallow part of the pressure (heat lows, the land monsoon trough beyond its rain belt): it steers
+  // the low-level flow but is left out of the deep pressure whose frictional convergence is the
+  // large-scale ascent.
+  const shallow = troughW || P.heatLowAscentShare < 1 ? new Float64Array(n) : null;
+  const heatLow = P.heatLowAscentShare < 1 ? new Float64Array(n) : null;
+  const pDeep = shallow ? new Float64Array(12 * n) : null;
+  const deepU = shallow ? new Float64Array(12 * n) : null;
+  const deepV = shallow ? new Float64Array(12 * n) : null;
 
   for (let m = 0; m < 12; m++) {
     const off = m * n;
@@ -210,38 +282,75 @@ export function computeCirculation(g: LatLonGrid, tSl: Float64Array, land: Uint8
     for (let j = 0; j < ny; j++) {
       for (let c = 0; c < nx; c++) {
         const i = j * nx + c;
-        const d = -P.thermalK * (tSl[off + i] - Tref[j]);
-        th[i] = Math.max(-P.thermalMax, Math.min(P.thermalMax, d));
+        th[i] = Math.max(-P.thermalMax, Math.min(P.thermalMax, -P.thermalK * (tSl[off + i] - Tref[j])));
+        if (heatLow && th[i] < 0) {
+          // Elevated heat sources (plateaus) convect deeply: only lowland heat lows are shallow.
+          const h = height ? Math.max(0, height[i]) : 0;
+          const lowland = h >= P.heatLowDeepHeight ? 0 : 1 - h / P.heatLowDeepHeight;
+          heatLow[i] = (1 - P.heatLowAscentShare) * landFrac[i] * lowland * th[i];
+        } else if (heatLow) heatLow[i] = 0;
       }
     }
     smoothField(g, th, P.thermalSmoothKm, 3);
-    // Thermal equator & belt scaling.
+    if (heatLow) smoothField(g, heatLow, P.thermalSmoothKm, 3);
+    // Thermal equator & belt scaling. With the land monsoon trough on, the belts follow the oceans'
+    // thermal equator (land cells enter the search with their row's ocean reference temperature)
+    // and continents carry their own trough.
     for (let i = 0; i < n; i++) Ts[i] = tSl[off + i];
     smoothField(g, Ts, 500, 2);
-    thermalEquator(g, Ts, params.axialTilt, thermalEq, m * nx);
+    if (To) {
+      for (let j = 0; j < ny; j++) {
+        for (let c = 0; c < nx; c++) {
+          const i = j * nx + c;
+          To[i] = Tref[j] + (1 - landFrac[i]) * (tSl[off + i] - Tref[j]);
+        }
+      }
+      smoothField(g, To, 500, 2);
+      thermalEquator(g, To, params.axialTilt, thermalEq, m * nx);
+    } else thermalEquator(g, Ts, params.axialTilt, thermalEq, m * nx);
+    // Land monsoon trough latitude: a share of the lagged solar declination (land heats with the sun
+    // at little lag, while the ocean's thermal equator lags and stays near 5–10°).
+    const troughLat = troughW
+      ? Math.max(-teClamp, Math.min(teClamp, P.landTroughShare * declinationAt((m + 0.5 - P.landTroughLagMonths) / 12, tiltRad))) / DEG
+      : 0;
     const [sN, sS] = gradientScales(g, tSl, off);
-    const sEq = 0.5 * (sN + sS);
+    const belts: BeltScales = { sN, sS, sEq: 0.5 * (sN + sS), openN, openS };
+    if (shallow) shallow.fill(0);
     for (let j = 0; j < ny; j++) {
       const la = g.lat[j] / DEG;
       for (let c = 0; c < nx; c++) {
         const i = j * nx + c;
-        const te = thermalEq[m * nx + c] / DEG;
-        const d = la - te;
-        const phiE = la - te * Math.exp(-(d * d) / (P.shiftDecay * P.shiftDecay));
-        const a = Math.abs(phiE);
-        const sH = phiE >= 0 ? sN : sS;
         // Subtropical anticyclones are oceanic cells; over continents the thermal term takes over
         // (winter continental highs, summer heat lows).
         const ampSt = P.subtropicalAmp * (1 - (1 - P.subtropicalLandFactor) * lfBelt[i]);
-        const ampSp = (P.subpolarAmpLand + (P.subpolarAmpOcean - P.subpolarAmpLand) * (1 - lfBelt[i])) * (phiE >= 0 ? openN : openS);
-        const belt =
-          -P.itczDepth * sEq * gauss(phiE, 0, P.itczWidth) +
-          sH * (ampSt * gauss(a, P.subtropicalLat, P.subtropicalWidth) - ampSp * gauss(a, P.subpolarLat, P.subpolarWidth) + P.polarAmp * gauss(a, 90, P.polarWidth));
+        const ampSp = P.subpolarAmpLand + (P.subpolarAmpOcean - P.subpolarAmpLand) * (1 - lfBelt[i]);
+        const te = thermalEq[m * nx + c] / DEG;
+        let belt = beltPressure(la, te, P.itczWidth, ampSt, ampSp, belts);
+        const lw = troughW ? troughW[i] : 0;
+        if (lw > 0) {
+          // Over land the trough moves toward troughLat and widens. It is a shallow (heat-low)
+          // circulation: its deep (rain-producing) ascent lies equatorward of it, landRainShare of the
+          // way from the oceans' thermal equator, where the inflowing moist layer is deep enough for
+          // convection.
+          const width = P.itczWidth + lw * (P.landTroughWidth - P.itczWidth);
+          const landBelt = beltPressure(la, te + lw * (troughLat - te), width, ampSt, ampSp, belts);
+          shallow![i] += landBelt - beltPressure(la, te + lw * P.landRainShare * (troughLat - te), width, ampSt, ampSp, belts);
+          belt = landBelt;
+        }
+        if (heatLow) shallow![i] += heatLow[i];
         pressure[off + i] = P.base + belt + th[i];
+        if (pDeep) pDeep[off + i] = pressure[off + i] - shallow![i];
       }
     }
     smoothField(g, pressure, P.finalSmoothKm, 3, off);
     windsFromPressure(g, pressure, off, f, lfCoast, windU, windV);
+    if (pDeep) {
+      smoothField(g, pDeep, P.finalSmoothKm, 3, off);
+      windsFromPressure(g, pDeep, off, f, lfCoast, deepU!, deepV!);
+      polarFilter(g, deepU!, off);
+      polarFilter(g, deepV!, off);
+      capSpeed(deepU!, deepV!, off, n, W.maxSpeed);
+    }
     polarFilter(g, windU, off);
     polarFilter(g, windV, off);
     capSpeed(windU, windV, off, n, W.maxSpeed);
@@ -252,7 +361,9 @@ export function computeCirculation(g: LatLonGrid, tSl: Float64Array, land: Uint8
     polarFilter(g, steerV, off);
     polarFilter(g, heatU, off);
     polarFilter(g, heatV, off);
-    convergence(g, windU, windV, off, ascent);
+    // Large-scale ascent: frictional convergence of the deep part of the circulation.
+    if (pDeep) convergence(g, deepU!, deepV!, off, ascent);
+    else convergence(g, windU, windV, off, ascent);
     smoothField(g, ascent, W.ascentSmoothKm, 3, off);
     for (let i = 0; i < n; i++) ascent[off + i] /= W.ascentRef;
     baroclinicity(g, Ts, steerU, steerV, off, params.retrograde, baroclinic);

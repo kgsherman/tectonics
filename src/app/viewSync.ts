@@ -2,7 +2,7 @@
  * Pushes state-derived presentation into the viewport and right panel: lighting, relief, sea level,
  * graticule, particles and clouds (from the main thread's climate copy) and the legend.
  */
-import type { ClimateResult, SphereMesh, WorldSnapshot } from '../core/types';
+import type { ClimateResult, CloudQuality, CloudSpec, SphereMesh, WorldSnapshot } from '../core/types';
 import { getLegend } from '../render/paint';
 import { layerNeedsClimate } from '../worker/layerInfo';
 import type { PaintOptionsExt } from '../worker/framePainter';
@@ -25,13 +25,37 @@ export class ViewSync {
   /** What the view last received: rebuilding clouds or particles costs main-thread time, skip repeats. */
   private cloudKey = '';
   private fieldKey = '';
+  /**
+   * Climate / month / density the high-definition clouds were requested for ('' = none: standard
+   * clouds, which follow every change automatically).
+   */
+  private hdKey = '';
+  /** The cloud spec last given to the viewport. */
+  private sentClouds: CloudSpec | null = null;
 
   constructor(
     private readonly store: Store<AppState, Action>,
     private readonly viewport: Viewport,
     private readonly right: RightPanel,
     private readonly data: WorldData,
-  ) {}
+  ) {
+    viewport.onCloudsShown((c) => {
+      if (c === this.sentClouds && c.quality === 'high' && this.hdKey) this.store.dispatch({ type: 'setCloudsHd', status: 'shown' });
+    });
+  }
+
+  /**
+   * High-definition clouds for what is on screen now (the full cloud model: too expensive to redo on
+   * every month / climate / density change, so made on demand). False when no clouds are shown.
+   */
+  requestHdClouds(): boolean {
+    const key = this.cloudBaseKey();
+    if (!key) return false;
+    if (this.hdKey === key) return true;
+    this.hdKey = key;
+    this.weather();
+    return true;
+  }
 
   /** Sea level, lighting (month/tilt dependent), relief exaggeration, graticule. */
   viewProps(): void {
@@ -61,12 +85,26 @@ export class ViewSync {
       this.fieldKey = fieldKey;
       this.viewport.setVectorField(!c || !field ? null : field === 'wind' ? windFieldSpec(c, m) : currentFieldSpec(c, m));
     }
-    const clouds = !!c && v.clouds && v.layer === 'satellite';
-    const cloudKey = clouds && c ? `${c.id}|${m}|${v.cloudDensity}` : '';
+    const baseKey = this.cloudBaseKey();
+    // HD clouds belong to one climate, month and density: any change drops back to standard clouds,
+    // and the request is forgotten (returning to that month does not remake HD clouds unasked).
+    if (this.hdKey && this.hdKey !== baseKey) this.hdKey = '';
+    const quality: CloudQuality = this.hdKey ? 'high' : 'standard';
+    const cloudKey = baseKey ? `${baseKey}|${quality}` : '';
     if (cloudKey !== this.cloudKey) {
       this.cloudKey = cloudKey;
-      this.viewport.setClouds(clouds && c ? cloudSpec(c, m, v.cloudDensity) : null);
+      this.sentClouds = baseKey && c ? { ...cloudSpec(c, m, v.cloudDensity), quality } : null;
+      this.viewport.setClouds(this.sentClouds);
+      this.store.dispatch({ type: 'setCloudsHd', status: this.hdKey ? 'generating' : 'off' });
     }
+  }
+
+  /** Climate / month / density of the clouds to show ('' when none: no climate, clouds off, not the satellite layer). */
+  private cloudBaseKey(): string {
+    const s = this.store.getState();
+    const c = this.data.climate();
+    const v = s.settings.view;
+    return c && v.clouds && v.layer === 'satellite' ? `${c.id}|${s.runtime.month}|${v.cloudDensity}` : '';
   }
 
   legend(): void {

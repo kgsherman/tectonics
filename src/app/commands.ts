@@ -14,6 +14,8 @@ export interface Commands {
   playFromKeyframe(): void;
   computeClimate(): void;
   toggleSeasons(): void;
+  /** High-definition clouds for the climate, month and cloud density on screen (made on demand). */
+  generateHdClouds(): void;
   exportMap(): void;
   exportScreenshot(): void;
 }

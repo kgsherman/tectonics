@@ -481,6 +481,13 @@ export interface MarkerSpec {
 }
 
 /** Cloud cover for the globe's cloud shell (weather visualization). */
+/**
+ * Cloud rendering quality. 'standard': cheap enough to follow every change automatically (coarser
+ * regime grids, fewer detail octaves on the globe, a smaller map raster, no zoomed-map window
+ * rasters). 'high': the full model (high-definition clouds, made on demand).
+ */
+export type CloudQuality = 'standard' | 'high';
+
 export interface CloudSpec {
   w: number;
   h: number;
@@ -489,6 +496,8 @@ export interface CloudSpec {
   /** Optional w*h wind (m/s) so cloud texture drifts with the flow. */
   u?: Float32Array;
   v?: Float32Array;
+  /** Rendering quality (default 'high'). */
+  quality?: CloudQuality;
 }
 
 export type LightingMode =
@@ -515,6 +524,11 @@ export interface WorldView {
   setVectorField(field: VectorFieldSpec | null): void;
   /** Cloud layer (globe; the map may draw a translucent version); null disables. */
   setClouds(clouds: CloudSpec | null): void;
+  /**
+   * Subscribe to cloud completion: called with the very spec object given to setClouds() once its
+   * clouds are on screen (cloud work is asynchronous). Returns unsubscribe.
+   */
+  onCloudsShown?(handler: (clouds: CloudSpec) => void): () => void;
   setArrows(arrows: ArrowSpec[]): void;
   setMarkers(markers: MarkerSpec[]): void;
   setBrushCursor(cursor: BrushCursor | null): void;

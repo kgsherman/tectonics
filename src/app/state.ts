@@ -127,7 +127,15 @@ export interface RuntimeState {
    * the plate editor: the World tab tells the user when "Generate" would apply changed settings.
    */
   worldParams: string;
+  /**
+   * High-definition clouds (made on demand; standard clouds follow every change automatically):
+   * 'off' (standard on screen), 'generating' (requested for the current climate / month / density),
+   * 'shown'. Back to 'off' when any of those changes.
+   */
+  cloudsHd: CloudsHdStatus;
 }
+
+export type CloudsHdStatus = 'off' | 'generating' | 'shown';
 
 export interface AppState {
   settings: Settings;
@@ -173,6 +181,7 @@ export function initialRuntime(): RuntimeState {
     landFraction: null, perf: { stepsPerSec: 0, framesPerSec: 0, lastStepMs: 0, lastPaintMs: 0 }, month: -1, seasonsPlaying: false,
     climate: { ...EMPTY_CLIMATE }, keyframes: [], keyframeInterval: 0, viewingKeyframe: null, tasks: [], editorActive: false,
     worldParams: '',
+    cloudsHd: 'off',
   };
 }
 
@@ -217,7 +226,8 @@ export type Action =
   | { type: 'taskStart'; id: string; label: string; progress?: number | null }
   | { type: 'taskProgress'; id: string; progress: number | null; label?: string }
   | { type: 'taskEnd'; id: string }
-  | { type: 'setEditorActive'; active: boolean };
+  | { type: 'setEditorActive'; active: boolean }
+  | { type: 'setCloudsHd'; status: CloudsHdStatus };
 
 /* ------------------------------------------------------------------ */
 /* Reducer                                                              */
@@ -389,6 +399,8 @@ export function reduce(s: AppState, a: Action): AppState {
       return rt.tasks.some((t) => t.id === a.id) ? withRuntime(s, { tasks: rt.tasks.filter((t) => t.id !== a.id) }) : s;
     case 'setEditorActive':
       return withRuntime(s, { editorActive: a.active });
+    case 'setCloudsHd':
+      return rt.cloudsHd === a.status ? s : withRuntime(s, { cloudsHd: a.status });
     default: {
       const never: never = a;
       throw new Error(`reduce: unknown action ${JSON.stringify(never)}`);
