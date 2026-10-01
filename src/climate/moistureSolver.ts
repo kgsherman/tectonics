@@ -42,10 +42,12 @@ export function allocMoistureState(n: number): MoistureState {
 export interface SolverScratch {
   adv: Float64Array;
   pCheck: Float64Array;
+  /** Water held back by high terrain this step (kg/m² over the source cell). */
+  blocked: Float64Array;
 }
 
 export function allocSolverScratch(n: number): SolverScratch {
-  return { adv: new Float64Array(n), pCheck: new Float64Array(n) };
+  return { adv: new Float64Array(n), pCheck: new Float64Array(n), blocked: new Float64Array(n) };
 }
 
 /** Initialize W from column RH (land / ocean) for a cold start; P, E from a first sink evaluation. */
@@ -62,7 +64,10 @@ export function coldStartState(g: HydroGrid, f: MonthForcing, landFrac: Float64A
 /**
  * Iterate month `f` to convergence (or `maxSteps`), starting from the current state.
  * `diffusion` must already be set up for f.eddyK and dt; `stencil` holds the departure points
- * (with the compression factor folded into its weights).
+ * (with the compression factor folded into its weights). `lift` (4 per cell, optional) is the share
+ * of each source's water that can follow the air onto higher terrain; the rest cannot climb the
+ * barrier and stays in the source column (the blocked moist layer flows around), so transport still
+ * conserves Σ area·W.
  */
 export function solveMonth(
   g: HydroGrid,
@@ -74,10 +79,11 @@ export function solveMonth(
   maxSteps: number,
   state: MoistureState,
   scratch: SolverScratch,
+  lift: Float32Array | null = null,
 ): MonthSolveStats {
   const { n, w, h } = g;
   const { W, P, E } = state;
-  const { adv, pCheck } = scratch;
+  const { adv, pCheck, blocked } = scratch;
   const { idx, wt } = stencil;
   const rowArea = g.rowArea;
   const floor = t.convergenceFloorMmDay / 86400;
@@ -118,17 +124,44 @@ export function solveMonth(
     //    transport alone neither creates nor destroys water.
     diffusion.apply(W);
     let advMass = 0;
+    if (lift) blocked.fill(0);
     for (let r = 0; r < h; r++) {
       let rowAdv = 0;
+      const ra = rowArea[r];
       for (let c = 0; c < w; c++) {
         const i = r * w + c;
         const k = 4 * i;
-        let v = wt[k] * W[idx[k]] + wt[k + 1] * W[idx[k + 1]] + wt[k + 2] * W[idx[k + 2]] + wt[k + 3] * W[idx[k + 3]];
+        let v: number;
+        if (lift && (lift[k] < 1 || lift[k + 1] < 1 || lift[k + 2] < 1 || lift[k + 3] < 1)) {
+          v = 0;
+          for (let q = 0; q < 4; q++) {
+            const j = idx[k + q];
+            const x = wt[k + q] * W[j];
+            const f = lift[k + q];
+            v += f * x;
+            // Held back below the barrier top: stays with the source (per unit area of j).
+            if (f < 1 && x > 0) blocked[j] += ((1 - f) * x * ra) / rowArea[(j / w) | 0];
+          }
+        } else v = wt[k] * W[idx[k]] + wt[k + 1] * W[idx[k + 1]] + wt[k + 2] * W[idx[k + 2]] + wt[k + 3] * W[idx[k + 3]];
         if (v < 0) v = 0;
         adv[i] = v;
         rowAdv += v;
       }
-      advMass += rowAdv * rowArea[r];
+      advMass += rowAdv * ra;
+    }
+    if (lift) {
+      for (let r = 0; r < h; r++) {
+        let rowB = 0;
+        for (let c = 0; c < w; c++) {
+          const i = r * w + c;
+          const b = blocked[i];
+          if (b > 0) {
+            adv[i] += b;
+            rowB += b;
+          }
+        }
+        advMass += rowB * rowArea[r];
+      }
     }
     const fix = advMass > 0 ? mass / advMass : 1;
     fixerDrift += Math.abs(1 - fix);

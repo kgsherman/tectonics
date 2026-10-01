@@ -14,11 +14,13 @@
 import type { PaintCache } from './paintCache';
 import * as _satelliteBiome from './satelliteBiome';
 import type { ClimateSampler } from './satelliteSampler';
+import * as _satelliteSampler from './satelliteSampler';
 
 const {
-  A_COVER, A_DESERT, A_GRASS, A_HOT, A_SHEET, A_SNOWSUP, A_SOIL, A_TREE, A_TREES, A_TSNOW, A_TWARM, A_WET, LAND_K,
-  O_ICE, O_SST, OCEAN_K,
+  A_COVER, A_DESERT, A_EVER, A_GRASS, A_HIDED, A_HOT, A_PANN, A_SHEET, A_SNOWSUP, A_SOIL, A_TREE, A_TREES, A_TSNOW, A_TWARM,
+  A_WET, A_WINDE, A_WINDN, LAND_K, O_ICE, O_SST, OCEAN_K,
 } = _satelliteBiome;
+const { bspline16, bsplineWeights } = _satelliteSampler;
 
 /** Record layout (Uint16 per pixel). */
 export const PX_SOIL = 0; // 3
@@ -35,10 +37,20 @@ export const PX_WET = 16;
 export const PX_SHEET = 17;
 export const PX_ICE = 18;
 export const PX_SST = 19;
-export const PX_K = 20;
-/** Encoding scales: fractions / linear colours, temperatures ((T − PX_T0) × ENC_T). */
+export const PX_PANN = 20;
+export const PX_EVER = 21;
+export const PX_HIDED = 22;
+export const PX_WINDE = 23;
+export const PX_WINDN = 24;
+export const PX_K = 25;
+/** Encoding scales: fractions / linear colours, temperatures ((T − PX_T0) × ENC_T), precipitation (m/yr), winds. */
 const ENC_U = 65535;
 const ENC_T = 400;
+const ENC_P = 65535 / 8;
+const ENC_W = 65535 / 2;
+/** Decoding of PX_PANN (m/yr) and of the wind components (x·PX_W − 1). */
+export const PX_P = 1 / ENC_P;
+export const PX_W = 1 / ENC_W;
 /** Decoding: fractions / linear colours, temperatures. */
 export const PX_U = 1 / ENC_U;
 export const PX_T = 1 / ENC_T;
@@ -57,13 +69,17 @@ const MAX_PIXELS = 1024 * 512;
 const LAND_DST = Int32Array.from([
   PX_SOIL, PX_SOIL + 1, PX_SOIL + 2, PX_GRASS, PX_GRASS + 1, PX_GRASS + 2, PX_TREE, PX_TREE + 1, PX_TREE + 2,
   PX_COVER, PX_TREES, PX_TWARM, PX_TSNOW, PX_SNOWSUP, PX_DESERT, PX_HOT, PX_WET, PX_SHEET,
+  PX_PANN, PX_EVER, PX_HIDED, PX_WINDE, PX_WINDN,
 ]);
 const LAND_SRC = Int32Array.from([
   A_SOIL, A_SOIL + 1, A_SOIL + 2, A_GRASS, A_GRASS + 1, A_GRASS + 2, A_TREE, A_TREE + 1, A_TREE + 2,
   A_COVER, A_TREES, A_TWARM, A_TSNOW, A_SNOWSUP, A_DESERT, A_HOT, A_WET, A_SHEET,
+  A_PANN, A_EVER, A_HIDED, A_WINDE, A_WINDN,
 ]);
-const LAND_OFF = Float64Array.from(LAND_DST, (d) => (d === PX_TWARM || d === PX_TSNOW ? PX_T0 : 0));
-const LAND_SCALE = Float64Array.from(LAND_DST, (d) => (d === PX_TWARM || d === PX_TSNOW ? ENC_T : ENC_U));
+const LAND_OFF = Float64Array.from(LAND_DST, (d) => (d === PX_TWARM || d === PX_TSNOW ? PX_T0 : d === PX_WINDE || d === PX_WINDN ? -1 : 0));
+const LAND_SCALE = Float64Array.from(LAND_DST, (d) => (
+  d === PX_TWARM || d === PX_TSNOW ? ENC_T : d === PX_PANN ? ENC_P : d === PX_WINDE || d === PX_WINDN ? ENC_W : ENC_U
+));
 const NL = LAND_DST.length;
 
 /** Per-pixel attribute records (PX_K Uint16 per pixel) and which parts of each are filled. */
@@ -87,16 +103,31 @@ export function pixelAttributes(smp: ClimateSampler, gridKey: string, seed: numb
 }
 
 /**
- * Fill the land part of record `o` (= p·PX_K) from the padded land grid: bilinear corners q00,
- * q00 + LAND_K, q00 + lStride, q00 + lStride + LAND_K with weights w00, w01, w10, w11.
+ * Land attribute channels interpolated with the C² cubic B-spline (the fractions and temperatures
+ * that mosaics and belts threshold); the others (colours, winds, blend weights) bilinearly. The full
+ * quality path (satellite.ts) uses the same split, so preview and full agree.
  */
-export function fillLand(
-  rec: Uint16Array, o: number, LG: Float32Array, q00: number, lStride: number, w00: number, w01: number, w10: number, w11: number,
-): void {
-  const q01 = q00 + LAND_K, q10 = q00 + lStride, q11 = q10 + LAND_K;
+export const LAND_BSPLINE = Int32Array.from([A_COVER, A_TREES, A_TWARM, A_TSNOW, A_SNOWSUP, A_DESERT, A_SHEET]);
+const IS_BS = Uint8Array.from(LAND_SRC, (a) => (LAND_BSPLINE.includes(a) ? 1 : 0));
+const BW = new Float64Array(8);
+
+/**
+ * Fill the land part of record `o` (= p·PX_K) from the padded land grid at the sampler position:
+ * bilinear corner index i00 (padded cells) with fractional offsets fr (row), fc (column).
+ */
+export function fillLand(rec: Uint16Array, o: number, LG: Float32Array, i00: number, stride: number, fr: number, fc: number): void {
+  const lStride = stride * LAND_K;
+  const q00 = i00 * LAND_K, q01 = q00 + LAND_K, q10 = q00 + lStride, q11 = q10 + LAND_K;
+  const w00 = (1 - fr) * (1 - fc), w01 = (1 - fr) * fc, w10 = fr * (1 - fc), w11 = fr * fc;
+  bsplineWeights(fr, BW, 0);
+  bsplineWeights(fc, BW, 4);
+  const qb = (i00 - stride - 1) * LAND_K;
   for (let k = 0; k < NL; k++) {
     const a = LAND_SRC[k];
-    const x = (w00 * LG[q00 + a] + w01 * LG[q01 + a] + w10 * LG[q10 + a] + w11 * LG[q11 + a] - LAND_OFF[k]) * LAND_SCALE[k];
+    const v = IS_BS[k] === 1
+      ? bspline16(LG, qb, lStride, LAND_K, a, BW)
+      : w00 * LG[q00 + a] + w01 * LG[q01 + a] + w10 * LG[q10 + a] + w11 * LG[q11 + a];
+    const x = (v - LAND_OFF[k]) * LAND_SCALE[k];
     rec[o + LAND_DST[k]] = x <= 0 ? 0 : x >= 65535 ? 65535 : (x + 0.5) | 0;
   }
 }

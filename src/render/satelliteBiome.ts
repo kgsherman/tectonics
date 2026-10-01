@@ -3,7 +3,10 @@
  * (humid soil, tree cap, evergreen / sclerophyll share) modulated by continuous climate fields
  * (aridity ratio, warm/cold-month temperature, monthly phenology). Attributes, never class ids,
  * are what gets interpolated. Output grids are dilated from land over coastal ocean cells,
- * blurred ~1 cell and padded for the warped bilinear sampler.
+ * blurred ~1 cell and padded for the warped sampler (bilinear colours, cubic B-spline for the
+ * thresholded fractions and temperatures). Herbaceous greenness and drought deciduousness follow a
+ * monthly snow + soil-moisture bucket (snowmelt keeps continental interiors green into early
+ * summer; dry seasons brown the grass as the store empties).
  *
  * Temperatures are stored SEA-LEVEL-REDUCED (T + Γ·h_ref) so each pixel re-applies the lapse rate
  * to its own amplified height (alpine belts, treeline, snow line).
@@ -158,16 +161,52 @@ function cellStats(T: Float64Array, P: Float64Array, south: boolean): CellStats 
   return { tWarm, tCold, mat, pAnn, aridity: pAnn / pthSoft };
 }
 
+/** Soil water capacity of the moisture bucket (mm) and snowmelt rate (mm per °C-month above 0 °C). */
+const SOIL_MM = 150;
+const MELT_MM = 40;
+
+/**
+ * Monthly moisture availability 0..1 (actual / potential evapotranspiration of a snow + soil bucket,
+ * two spin-up years): spring snowmelt and stored soil water keep continental interiors green into
+ * early summer, and dry seasons brown the grass as the store empties (Mediterranean summers,
+ * late-summer steppe) rather than month by month with the rain alone.
+ */
+function moistureAvailability(T: Float64Array, P: Float64Array, out: Float64Array): void {
+  let swe = 0, soil = 0.5 * SOIL_MM;
+  for (let it = 0; it < 24; it++) {
+    const k = it % 12, t = T[k];
+    let water = P[k];
+    if (t < 0) {
+      swe += water;
+      water = 0;
+    } else if (swe > 0) {
+      const melt = Math.min(swe, MELT_MM * t + 5);
+      swe -= melt;
+      water += melt;
+    }
+    const e = t > 0 ? pet(t) : 0;
+    // Evapotranspiration draws on the rain first, then on the store (in proportion to its fill).
+    let aet = Math.min(e, water);
+    soil += water - aet;
+    if (soil > SOIL_MM) soil = SOIL_MM;
+    const fromSoil = Math.min(soil, (e - aet) * (soil / SOIL_MM));
+    soil -= fromSoil;
+    aet += fromSoil;
+    if (it >= 12) out[k] = e > 0 ? aet / e : 1;
+  }
+}
+
+// Per-cell scratch: moisture availability by month.
+const AVAIL = new Float64Array(12);
+
 /** Month greenness of the herbaceous layer: warm enough and moist enough (0..1). */
-function greenness(T: Float64Array, P: Float64Array, k: number): number {
-  const pEff = 0.65 * P[k] + 0.35 * P[(k + 11) % 12];
-  return smoothstep(1, 10, T[k]) * smoothstep(0.2, 0.75, pEff / pet(T[k]));
+function greenness(T: Float64Array, avail: Float64Array, k: number): number {
+  return smoothstep(1, 10, T[k]) * smoothstep(0.3, 0.8, avail[k]);
 }
 
 /** Deciduous leaf-on fraction: thermal (temperate) and drought (tropical) deciduousness. */
-function leafOn(T: Float64Array, P: Float64Array, k: number): number {
-  const moist = (0.6 * P[k] + 0.4 * P[(k + 11) % 12]) / pet(T[k]);
-  return Math.min(smoothstep(2, 9, T[k]), smoothstep(0.12, 0.45, moist));
+function leafOn(T: Float64Array, avail: Float64Array, k: number): number {
+  return Math.min(smoothstep(2, 9, T[k]), smoothstep(0.2, 0.55, avail[k]));
 }
 
 // Scratch colours for cellAttributes (no per-cell allocation).
@@ -201,14 +240,15 @@ function cellAttributes(
   out[o + A_SOIL + 2] = em.soilLin[2] * (1 - 0.3 * steppe) + 0.3 * steppe * 0.14;
 
   let g: number, lo: number, tMonth: number;
+  moistureAvailability(T, P, AVAIL);
   if (m >= 0) {
-    g = greenness(T, P, m);
-    lo = leafOn(T, P, m);
+    g = greenness(T, AVAIL, m);
+    lo = leafOn(T, AVAIL, m);
     tMonth = T[m];
   } else {
     let gs = 0, gm = 0, ls = 0, lm = 0;
     for (let k = 0; k < 12; k++) {
-      const gk = greenness(T, P, k), lk = leafOn(T, P, k);
+      const gk = greenness(T, AVAIL, k), lk = leafOn(T, AVAIL, k);
       gs += gk;
       ls += lk;
       if (gk > gm) gm = gk;

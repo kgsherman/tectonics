@@ -48,6 +48,7 @@ export class GlobeSurface {
       uOverlay: { value: null as Texture | null },
       uHasOverlay: { value: 0 },
       uOverlaySize: { value: new Vector2(1, 1) },
+      uDpr: { value: 1 },
       uHeight: { value: null as Texture | null },
       uHasHeight: { value: 0 },
       uHeightTexel: { value: new Vector2(1, 1) },
@@ -150,6 +151,11 @@ export class GlobeSurface {
   setExaggeration(exaggeration: number): void {
     this.u.uDispScale.value = Math.max(0, exaggeration) / PLANET_RADIUS_M;
     this.u.uShadeScale.value = Math.max(SHADE_EXAGGERATION, exaggeration) / PLANET_RADIUS_M;
+  }
+
+  /** Device pixels per CSS pixel (overlay lines keep a constant CSS width). */
+  setPixelRatio(dpr: number): void {
+    this.u.uDpr.value = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
   }
 
   /** Screen up-left direction in world space (relief light azimuth). */

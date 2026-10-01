@@ -10,12 +10,15 @@
  *    whose step grows with the pixel footprint (distant relief is shaded from the matching mip);
  *  - magnified (texel ≥ ~2 px): sub-texel reconstruction (GLSL_TERRAIN_RECON): smooth anti-aliased
  *    coastline from the Catmull-Rom height, land/sea colors reconstructed per class (no bleeding),
- *    C1 relief normals, plus procedural detail (albedo ±~6 %, normals, fractal coast breakup) that
- *    fades in octave by octave with zoom and is scaled by slope/elevation (GLSL_TERRAIN_DETAIL).
+ *    C1 relief normals, plus procedural detail (slope-aware albedo and micro-relief, a colour warp
+ *    that sharpens painted patch borders, fractal coast breakup) that fades in octave by octave with
+ *    zoom (GLSL_TERRAIN_DETAIL).
+ * Overlay lines (boundaries, coastlines) keep a constant thin screen width once magnified, the
+ * coastline drawn on the displayed coast (GLSL_OVERLAY_LINES).
  * Relief normals are object-space from the height gradient with the 1/cosφ metric (no tangents).
  */
 import {
-  GLSL_BASIS, GLSL_CONSTANTS, GLSL_OVERLAY_SHARP, GLSL_RELIEF_RESPONSE, GLSL_SRGB, GLSL_TERRAIN_DETAIL, GLSL_TERRAIN_RECON,
+  GLSL_BASIS, GLSL_CONSTANTS, GLSL_OVERLAY_LINES, GLSL_RELIEF_RESPONSE, GLSL_SRGB, GLSL_TERRAIN_DETAIL, GLSL_TERRAIN_RECON,
 } from './shadersCommon';
 
 export const SURFACE_VERTEX = /* glsl */ `
@@ -53,13 +56,14 @@ ${GLSL_BASIS}
 ${GLSL_TERRAIN_RECON}
 ${GLSL_TERRAIN_DETAIL}
 ${GLSL_RELIEF_RESPONSE}
-${GLSL_OVERLAY_SHARP}
+${GLSL_OVERLAY_LINES}
 uniform sampler2D uBase;
 uniform float uHasBase;
 uniform vec2 uBaseSize;
 uniform sampler2D uOverlay;
 uniform float uHasOverlay;
 uniform vec2 uOverlaySize;
+uniform float uDpr;
 uniform sampler2D uHeight;
 uniform float uHasHeight;
 uniform vec2 uHeightTexel;
@@ -152,6 +156,10 @@ void main() {
   float rough = 0.0;
   // Relief tilt without the procedural detail (drives the light-independent relief cue).
   float baseTilt = 0.0;
+  // Screen distance to the displayed coast for the overlay's coastline (1e6 = unknown) and the weight
+  // of that analytic coast (the reconstruction's share).
+  float coastPx = 1e6, snap = 0.0, coastM = 1.0;
+  vec2 coastG = vec2(0.0);
 
   if (k < 1.0) {
     vec3 c = uHasBase > 0.5 ? textureGrad(uBase, st, dsx, dsy).rgb : col;
@@ -176,9 +184,9 @@ void main() {
   }
 
   if (k > 0.0) {
-    vec3 warp = vec3(0.0);
+    vec3 warp = vec3(0.0), cwarp = vec3(0.0);
     float ridgeW = smoothstep(400.0, 2500.0, hLin - uSeaLevel);
-    vec4 det = uDetail > 0.0 ? terrainDetail(n0, texRad, pxRad, ridgeW, warp) : vec4(0.0);
+    vec4 det = uDetail > 0.0 ? terrainDetail(n0, texRad, pxRad, ridgeW, warp, cwarp) : vec4(0.0);
     // Fractal coast breakup by domain warping the lookup (≤ ~0.4 texel, tangent to the sphere).
     warp = uDetail * (warp - dot(warp, n0) * n0);
     vec2 stw = st + vec2(dot(warp, east) / (TWO_PI * cosLat), -dot(warp, north) / PI);
@@ -191,7 +199,15 @@ void main() {
     // Coast = zero contour of the squashed height, anti-aliased over one pixel (analytic gradient).
     float aa = max(length(ts.gm) * (pxRad / texRadH), 1e-4);
     float l = smoothstep(-0.5, 0.5, ts.m / aa);
-    vec3 c = uHasBase > 0.5 ? mix(ts.seaCol, ts.landCol, l) : col;
+    coastPx = coastDistPx(ts.m, ts.gmd, dsx * uHeightSize, dsy * uHeightSize);
+    coastM = ts.m;
+    coastG = ts.gmd;
+    snap = k;
+    // Procedural colour warp of the land (tangent displacement → base texels); lit modes only (flat
+    // mode keeps exact legend colours).
+    cwarp = (lit ? uDetail : 0.0) * (cwarp - dot(cwarp, n0) * n0);
+    vec2 coff = vec2(dot(cwarp, east) / (TWO_PI * cosLat), -dot(cwarp, north) / PI) * uHeightSize;
+    vec3 c = uHasBase > 0.5 ? mix(ts.seaCol, perturbLand(ts, coff), l) : col;
     vec3 t = vec3(0.0);
     if (lit) {
       vec2 gt = terrainGradient(ts, texRadH / pxRad);
@@ -200,7 +216,7 @@ void main() {
       t = uShadeScale * l * (gE * east + gN * north);
       baseTilt = mix(baseTilt, length(t), k);
       vec3 dg = det.yzw - dot(det.yzw, n0) * n0;
-      t += (uDetail * l * (0.04 + 0.3 * r)) * dg;
+      t += (uDetail * l * detailSlopeGain(r)) * dg;
     }
     col = mix(col, c, k);
     land = mix(land, l, k);
@@ -218,7 +234,7 @@ void main() {
   if (lit) {
     // Albedo detail and the light-independent relief cue (lit modes only: flat mode keeps exact
     // legend colors).
-    col *= 1.0 + uDetail * (0.14 + 0.06 * rough) * detailAlbedo;
+    col *= 1.0 + uDetail * detailAlbedoGain(rough) * detailAlbedo;
     col *= reliefCue(baseTilt, land * (max(hLin, uSeaLevel) - max(hCoarse, uSeaLevel)));
   }
   if (uLightMode == 1) {
@@ -258,10 +274,15 @@ void main() {
 
   if (uHasOverlay > 0.5) {
     vec4 o = textureGrad(uOverlay, st, dsx, dsy);
-    // Magnified (an overlay texel ≥ 1.5–3 px): crisp lines instead of a zoom-wide blur.
+    // Magnified (an overlay texel ≥ 1–1.4 px): the lines are redrawn at a constant thin screen width
+    // (the coastline on the displayed coast) instead of growing with the zoom.
     float ovTex = pxRad * uOverlaySize.y / PI;
-    float ko = smoothstep(0.67, 0.33, ovTex);
-    if (ko > 0.0) o = mix(o, overlaySharp(uOverlay, uOverlaySize, st, ovTex), ko);
+    float ko = smoothstep(1.0, 0.7, ovTex);
+    if (ko > 0.0) {
+      OverlayRidge ridge = overlayRidge(uOverlay, uOverlaySize, st, dsx * uOverlaySize, dsy * uOverlaySize);
+      float onCoast = snap > 0.0 ? ridgeOnCoast(ridge, uHeight, uHeightSize, uOverlaySize, st, uSeaLevel, coastM, coastG) : 0.0;
+      o = mix(o, overlayCompose(ridge, coastPx, onCoast, snap, uDpr), ko);
+    }
     if (o.a > 0.003) col = mix(col, srgbToLinear(o.rgb / o.a) * overlayLight, o.a);
   }
 

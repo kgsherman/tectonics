@@ -100,7 +100,8 @@ export function computeDynamics(
   spinYears(M, S1, NO_COUPLING, cold.pass1Years, cold.pass1Aitken, stats, 'pass1');
   integrateYear(M, S1, NO_COUPLING, mon1);
   // Land snow and ice always come from the cold pass 1 (deterministic in the input: glacier margins
-  // are hysteretic, and a warm start from a previous result would carry its margins along).
+  // are hysteretic, and a warm start from a previous result would carry its margins along); the
+  // glacier topology is settled on pass-1 balances only and held afterwards (energyIce.ts).
   if (S !== S1) S.M.set(S1.M);
   lap('dyn.pass1');
   progress(0.35);
@@ -128,13 +129,17 @@ export function computeDynamics(
   lap('dyn.ocean');
   for (const [k, v] of Object.entries(ocean.stats)) stats[`ocean.${k}`] = v;
 
+  // Glacier cover from the held glacier topology (energyIce.ts), not from the output year's mass
+  // minimum, which would let a strongly ablating margin flicker with the run's last-year weather.
+  const glacierMass = new Float64Array(g.n);
+  for (let i = 0; i < g.n; i++) glacierMass[i] = M.iceMask[i] ? ebmTuning.glacierMassMax : 0;
   const fields = assembleOutput(
     g,
     core.land,
     {
       tAir: mon2.tAir, sst: mon2.sst, ice: mon2.ice, pressure: circ.pressure, windU: circ.windU, windV: circ.windV,
       steerU: circ.steerU, steerV: circ.steerV, ascent: circ.ascent, baroclinic: circ.baroclinic,
-      currentU: ocean.currentU, currentV: ocean.currentV, upwelling: ocean.upwelling, landMass: mon2.mMin, iceRaise: M.iceRaise,
+      currentU: ocean.currentU, currentV: ocean.currentV, upwelling: ocean.upwelling, landMass: glacierMass, iceRaise: M.iceRaise,
     },
     surf,
     params.globalTempOffset,

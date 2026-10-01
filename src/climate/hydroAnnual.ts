@@ -20,7 +20,7 @@ import { allocForcingScratch, allocMonthForcing, computeMonthForcing, computeSta
 import { makeHydroGrid } from './moistureGrid';
 import type { HydroGrid } from './moistureGrid';
 import { allocMoistureState, allocSolverScratch, coldStartState, solveMonth } from './moistureSolver';
-import { allocStencil, buildDepartureStencil } from './moistureStencil';
+import { allocStencil, buildDepartureStencil, type Stencil } from './moistureStencil';
 
 const now = (): number => globalThis.performance?.now?.() ?? Date.now();
 
@@ -53,6 +53,21 @@ export interface MonthlyInit {
 
 type StartMode = 'cold' | 'carry' | 'warm' | 'resolve';
 
+/**
+ * Level-referenced advection (HydroTuning.levelScaleHeight): air arriving at cell i from a lower
+ * source cell j carries only its vapour above i's surface, min(1, above_i / above_j) of it.
+ */
+function liftFactors(s: Stencil, above: Float64Array, out: Float32Array, n: number): void {
+  const { idx } = s;
+  for (let i = 0, k = 0; i < n; i++, k += 4) {
+    const a = above[i];
+    for (let q = 0; q < 4; q++) {
+      const b = above[idx[k + q]];
+      out[k + q] = a < b ? a / b : 1;
+    }
+  }
+}
+
 /** Pseudo-time step (s): ∝ grid spacing so the per-step displacement in cells stays similar. */
 function pseudoTimeStep(g: HydroGrid, t: HydroTuning): number {
   const degrees = 360 / g.w;
@@ -81,6 +96,8 @@ export function solveAnnualCycle(
   const forcing = allocMonthForcing(n);
   const fScratch = allocForcingScratch(g);
   const stencil = allocStencil(n);
+  // Per stencil entry: share of the source column's water that can follow the air onto its arrival cell.
+  const lift = st.liftAbove ? new Float32Array(4 * n) : null;
   const diffusion = new ImplicitDiffusion(g);
   const state = allocMoistureState(n);
   const sScratch = allocSolverScratch(n);
@@ -139,7 +156,8 @@ export function solveAnnualCycle(
       forcing.etMemory[i] = beta * mu * lf * memory[i];
     }
     buildDepartureStencil(g, dyn.steerU, dyn.steerV, off, dt, t.departureIterations, stencil, forcing.compression);
-    diffusion.setup(forcing.eddyK, dt, t.diffusionBlockHeight > 0 ? st.hSmooth : null, t.diffusionBlockHeight);
+    if (lift) liftFactors(stencil, st.liftAbove!, lift, n);
+    diffusion.setup(forcing.eddyK, dt, st.hSmooth, t.diffusionBlockHeight, t.levelScaleHeight, t.levelBoundaryLayer);
     tForcing += now() - t0;
 
     t0 = now();
@@ -166,7 +184,7 @@ export function solveAnnualCycle(
     }
     if (stepsPerMonth !== null) maxSteps = stepsPerMonth;
     if (dyn.params.fast) maxSteps = Math.min(maxSteps, t.maxStepsFast);
-    const res = solveMonth(g, forcing, stencil, diffusion, dt, t, maxSteps, state, sScratch);
+    const res = solveMonth(g, forcing, stencil, diffusion, dt, t, maxSteps, state, sScratch, lift);
     tSolve += now() - t0;
     out.steps += res.steps;
     fixerSum += res.fixerDrift * res.steps;

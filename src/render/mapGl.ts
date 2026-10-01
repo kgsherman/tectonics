@@ -7,8 +7,8 @@
  * reconstruction (smooth anti-aliased coastline from the height map, per-class colour reconstruction
  * with smooth lake/Köppen/snow/sea-ice edges, C1 relief normals, zoom-dependent procedural detail —
  * shared GLSL in shadersCommon.ts) and the same relief shade response and relief cue as the globe.
- * The overlay pass magnifies the overlay image with crisp anti-aliased lines (GLSL_OVERLAY_SHARP)
- * instead of a zoom-wide bilinear blur. Longitude wraps in the shaders, so no world copies are
+ * The overlay pass redraws the overlay's lines at a constant thin screen width once magnified, the
+ * coastline on the base's displayed coast (GLSL_OVERLAY_LINES), instead of a zoom-wide bilinear blur. Longitude wraps in the shaders, so no world copies are
  * needed. Output is sRGB (premultiplied, alpha 0 beyond the poles); the caller composites each pass
  * into its 2D canvas.
  *
@@ -20,7 +20,7 @@
  */
 import { buildFloatMips, type FloatMip } from './globeTextures';
 import {
-  GLSL_BASIS, GLSL_CONSTANTS, GLSL_OVERLAY_SHARP, GLSL_RELIEF_RESPONSE, GLSL_SRGB_ENCODE, GLSL_TERRAIN_DETAIL,
+  GLSL_BASIS, GLSL_CONSTANTS, GLSL_OVERLAY_LINES, GLSL_RELIEF_RESPONSE, GLSL_SRGB_ENCODE, GLSL_TERRAIN_DETAIL,
   GLSL_TERRAIN_RECON,
 } from './shadersCommon';
 import { SizeCache } from './viewBuffers';
@@ -134,9 +134,9 @@ void main() {
     }
   }
   if (k > 0.0) {
-    vec3 warp = vec3(0.0);
+    vec3 warp = vec3(0.0), cwarp = vec3(0.0);
     float ridgeW = smoothstep(400.0, 2500.0, hLin - uSeaLevel);
-    vec4 det = uDetail > 0.0 ? terrainDetail(n0, texRad, pxRad, ridgeW, warp) : vec4(0.0);
+    vec4 det = uDetail > 0.0 ? terrainDetail(n0, texRad, pxRad, ridgeW, warp, cwarp) : vec4(0.0);
     warp = uDetail * (warp - dot(warp, n0) * n0);
     vec2 stw = st + vec2(dot(warp, east) / (TWO_PI * cosLat), -dot(warp, north) / PI);
     TerrainSample ts = reconstructTerrain(uHeight, uHeightSize, uBase, uBaseSize, uSameSize > 0.5, true, stw, uSeaLevel, pxRad / texRadH);
@@ -145,7 +145,10 @@ void main() {
     float r = clamp(max(smoothstep(0.004, 0.05, slopeReal), smoothstep(250.0, 3000.0, above)), 0.0, 1.0);
     float aa = max(length(ts.gm) * (pxRad / texRadH), 1e-4);
     float l = smoothstep(-0.5, 0.5, ts.m / aa);
-    vec3 c = mix(ts.seaCol, ts.landCol, l);
+    // Procedural colour warp of the land (lit only: flat mode keeps exact legend colours).
+    cwarp = (lit ? uDetail : 0.0) * (cwarp - dot(cwarp, n0) * n0);
+    vec2 coff = vec2(dot(cwarp, east) / (TWO_PI * cosLat), -dot(cwarp, north) / PI) * uHeightSize;
+    vec3 c = mix(ts.seaCol, perturbLand(ts, coff), l);
     vec3 t = vec3(0.0);
     if (lit) {
       vec2 gt = terrainGradient(ts, texRadH / pxRad);
@@ -154,7 +157,7 @@ void main() {
       t = uShadeScale * l * (gE * east + gN * north);
       baseTilt = mix(baseTilt, length(t), k);
       vec3 dg = det.yzw - dot(det.yzw, n0) * n0;
-      t += (uDetail * l * (0.04 + 0.3 * r)) * dg;
+      t += (uDetail * l * detailSlopeGain(r)) * dg;
     }
     col = mix(col, c, k);
     tilt = mix(tilt, t, k);
@@ -167,24 +170,38 @@ void main() {
     // Light from the north-west, 35° above the horizon (as the CPU hillshade).
     vec3 L = n0 * SIN_ALT + normalize(north - east) * COS_ALT;
     col *= reliefShade(dot(n, L) / SIN_ALT);
-    col *= 1.0 + uDetail * (0.14 + 0.06 * rough) * detailAlbedo;
+    col *= 1.0 + uDetail * detailAlbedoGain(rough) * detailAlbedo;
     col *= reliefCue(baseTilt, landF * (max(hLin, uSeaLevel) - max(hCoarse, uSeaLevel)));
   }
   outColor = vec4(linearToSrgb(col), 1.0);
 }
 `;
 
-/** Map overlay fragment shader: premultiplied overlay, crisp when magnified (exported for tests). */
+/**
+ * Map overlay fragment shader (exported for tests): premultiplied overlay; once magnified, lines at a
+ * constant thin screen width with the coastline on the displayed coast (the base pass's coast field
+ * and procedural warp, recomputed only near overlay lines).
+ */
 export const MAP_OVERLAY_FRAGMENT = /* glsl */ `#version 300 es
 precision highp float;
 precision highp int;
 precision highp sampler2D;
 ${GLSL_CONSTANTS}
+${GLSL_BASIS}
 ${GLSL_TERRAIN_RECON}
-${GLSL_OVERLAY_SHARP}
+${GLSL_TERRAIN_DETAIL}
+${GLSL_OVERLAY_LINES}
 ${GLSL_MAP_COORDS}
 uniform sampler2D uOverlay;
 uniform vec2 uOverlaySize;
+uniform sampler2D uHeight;
+uniform vec2 uHeightSize;
+uniform vec2 uBaseSize;
+uniform float uHasHeight;
+uniform float uSameSize;
+uniform float uSeaLevel;
+uniform float uDetail;
+uniform float uDpr;
 out vec4 outColor;
 
 void main() {
@@ -195,10 +212,32 @@ void main() {
     return;
   }
   vec4 o = textureGrad(uOverlay, st, dsx, dsy);
-  // Overlay texels per screen pixel; sharpen once a texel spans ≥ 1.5–3 px.
-  float ovTex = uOverlaySize.y / (PI * uXform.z);
-  float ko = smoothstep(0.67, 0.33, ovTex);
-  if (ko > 0.0) o = mix(o, overlaySharp(uOverlay, uOverlaySize, st, ovTex), ko);
+  float pxRad = 1.0 / uXform.z;
+  // Overlay texels per screen pixel; lines are redrawn once a texel spans ≥ 1–1.4 px.
+  float ovTex = uOverlaySize.y * pxRad / PI;
+  float ko = smoothstep(1.0, 0.7, ovTex);
+  if (ko > 0.0) {
+    OverlayRidge ridge = overlayRidge(uOverlay, uOverlaySize, st, dsx * uOverlaySize, dsy * uOverlaySize);
+    float coastPx = 1e6, onCoast = 0.0, snap = 0.0;
+    // The displayed coast, exactly as the base pass reconstructs it (same k, warp and coast field).
+    float texRad = PI / uBaseSize.y;
+    float k = uHasHeight > 0.5 && uSameSize > 0.5 ? smoothstep(1.0, 0.5, pxRad / texRad) : 0.0;
+    if (k > 0.0 && ridge.peak > 0.0) {
+      float cl = cos(lat);
+      vec3 n0 = vec3(cl * cos(lon), sin(lat), -cl * sin(lon));
+      vec3 east, north;
+      geoBasis(lat, lon, east, north);
+      float cosLat = max(cl, 0.5 * PI / uHeightSize.y);
+      vec3 warp = uDetail > 0.0 ? terrainWarp(n0, texRad, pxRad) : vec3(0.0);
+      warp = uDetail * (warp - dot(warp, n0) * n0);
+      vec2 stw = st + vec2(dot(warp, east) / (TWO_PI * cosLat), -dot(warp, north) / PI);
+      vec3 cf = coastField(uHeight, uHeightSize, stw, uSeaLevel);
+      coastPx = coastDistPx(cf.x, cf.yz, dsx * uHeightSize, dsy * uHeightSize);
+      snap = k;
+      onCoast = ridgeOnCoast(ridge, uHeight, uHeightSize, uOverlaySize, st, uSeaLevel, cf.x, cf.yz);
+    }
+    o = mix(o, overlayCompose(ridge, coastPx, onCoast, snap, uDpr), ko);
+  }
   outColor = o;
 }
 `;
@@ -213,11 +252,22 @@ export interface MapGlRenderOptions {
   detail: number;
 }
 
+export interface MapGlOverlayOptions {
+  t: MapTransform;
+  dpr: number;
+  /** Sea level and detail strength of the base draw (the coastline follows its displayed coast). */
+  seaLevel: number;
+  detail: number;
+}
+
 const BASE_UNIFORMS = [
   'uBase', 'uHeight', 'uBaseSize', 'uHeightSize', 'uHasHeight', 'uSameSize', 'uView', 'uXform', 'uSeaLevel', 'uShade',
   'uShadeScale', 'uDetail',
 ] as const;
-const OVERLAY_UNIFORMS = ['uOverlay', 'uOverlaySize', 'uView', 'uXform'] as const;
+const OVERLAY_UNIFORMS = [
+  'uOverlay', 'uOverlaySize', 'uView', 'uXform', 'uHeight', 'uHeightSize', 'uBaseSize', 'uHasHeight', 'uSameSize', 'uSeaLevel',
+  'uDetail', 'uDpr',
+] as const;
 type Locations<K extends string> = Record<K, WebGLUniformLocation | null>;
 
 interface Programs {
@@ -550,16 +600,28 @@ export class MapGlBase {
 
   /**
    * Renders the overlay of the viewport (premultiplied sRGB, transparent elsewhere) into the same
-   * canvas; returns it (drawImage it before the next pass), or null when unusable / no overlay.
+   * canvas; returns it (drawImage it before the next pass), or null when unusable / no overlay. Pass
+   * the sea level and detail of the base draw: the coastline is drawn on the base's displayed coast.
    */
-  renderOverlay(o: { t: MapTransform; dpr: number }): HTMLCanvasElement | null {
+  renderOverlay(o: MapGlOverlayOptions): HTMLCanvasElement | null {
     if (!this.usable || !this.overlay) return null;
-    const gl = this.gl, p = this.p!, u = p.uo, ov = this.overlay;
+    const gl = this.gl, p = this.p!, u = p.uo, ov = this.overlay, height = this.height, base = this.base;
     const { W, H } = this.begin(o, p.overlay);
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, ov.tex);
     gl.uniform1i(u.uOverlay, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    // Without a height map texture unit 1 still needs a valid sampler: reuse the overlay (never read).
+    gl.bindTexture(gl.TEXTURE_2D, height ? height.tex : ov.tex);
+    gl.uniform1i(u.uHeight, 1);
     gl.uniform2f(u.uOverlaySize, ov.w, ov.h);
+    gl.uniform2f(u.uHeightSize, height ? height.w : ov.w, height ? height.h : ov.h);
+    gl.uniform2f(u.uBaseSize, base ? base.w : ov.w, base ? base.h : ov.h);
+    gl.uniform1f(u.uHasHeight, height ? 1 : 0);
+    gl.uniform1f(u.uSameSize, height && base && height.w === base.w && height.h === base.h ? 1 : 0);
+    gl.uniform1f(u.uSeaLevel, o.seaLevel);
+    gl.uniform1f(u.uDetail, Math.max(0, Math.min(1, o.detail)));
+    gl.uniform1f(u.uDpr, o.dpr);
     this.setXform(u.uView, u.uXform, o.t, W, H);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.bindVertexArray(null);

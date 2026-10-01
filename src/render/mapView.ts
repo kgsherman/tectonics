@@ -383,6 +383,7 @@ export class MapView implements WorldView {
     document.removeEventListener('visibilitychange', this.onVisibility);
     window.removeEventListener('resize', this.onVisibility);
     this.gpu?.dispose();
+    this.cloudLayer.dispose(); // cancels pending window rasters, frees the window canvas
     this.input.dispose();
     this.pointers.clear();
     this.particles = null;
@@ -500,7 +501,11 @@ export class MapView implements WorldView {
       this.ensureCpuBase();
       layers.push(this.shaded ? this.shadedImage.canvas : this.baseImage.canvas);
     }
-    if (this.cloudLayer.active) layers.push(this.cloudLayer.canvas);
+    if (this.cloudLayer.active) {
+      // Zoomed in, the cloud worker rasterizes the visible window sharply once the view rests.
+      this.cloudLayer.setView(t, dpr);
+      layers.push(this.cloudLayer.canvas);
+    }
     if (this.lighting.mode === 'sun') layers.push(this.nightImage.canvas);
     // Overlay on top: a GPU pass (crisp when magnified) when the GPU base ran, else Canvas 2D.
     const gpuOverlay = this.hasOverlay && gpuBase !== null && this.gpu!.hasOverlay;
@@ -513,10 +518,13 @@ export class MapView implements WorldView {
       // Snap to device pixels so adjacent copies meet without a hairline seam.
       const x0 = Math.round(r.x * dpr) / dpr, x1 = Math.round((r.x + r.w) * dpr) / dpr;
       const y0 = Math.round(r.y * dpr) / dpr, y1 = Math.round((r.y + r.h) * dpr) / dpr;
-      for (const c of layers) ctx.drawImage(c, x0, y0, x1 - x0, y1 - y0);
+      for (const c of layers) {
+        if (c === this.cloudLayer.canvas) this.cloudLayer.drawCopy(ctx, x0, y0, x1 - x0, y1 - y0);
+        else ctx.drawImage(c, x0, y0, x1 - x0, y1 - y0);
+      }
     }
     if (gpuOverlay) {
-      const ov = this.gpu!.renderOverlay({ t, dpr });
+      const ov = this.gpu!.renderOverlay({ t, dpr, seaLevel: this.seaLevel, detail: Math.max(0, this.drawnDetail) });
       if (ov) ctx.drawImage(ov, 0, 0, t.width, t.height);
     }
     if (this.graticuleStep > 0) drawGraticule(ctx, t, this.graticuleStep);

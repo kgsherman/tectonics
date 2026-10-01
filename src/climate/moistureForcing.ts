@@ -29,6 +29,12 @@ export interface StaticForcing {
   landFrac: Float64Array;
   /** 12*h month-mean day length (hours). */
   dayLength: Float64Array;
+  /**
+   * Share e^{−max(0, h⁺ − levelLiftHeight)/levelScaleHeight} of an advected column's vapour that can
+   * follow the air over each cell's (smoothed) surface, or null when the level-referenced transport
+   * is off.
+   */
+  liftAbove: Float64Array | null;
 }
 
 export interface MonthForcing {
@@ -74,6 +80,9 @@ export interface ForcingScratch {
   zonalSst: Float64Array;
   zonalAir: Float64Array;
   zonalWeight: Float64Array;
+  /** Sea-level-reduced air temperature of the month and its smoothed column version. */
+  tSl: Float64Array;
+  tSlSmooth: Float64Array;
   stabStencil: Stencil;
 }
 
@@ -109,6 +118,11 @@ export function computeStaticForcing(g: HydroGrid, dyn: DynamicsResult, t: Hydro
   for (let m = 0; m < 12; m++) {
     for (let r = 0; r < g.h; r++) dayLength[m * g.h + r] = monthDayLength(g.lat[r], m, tilt);
   }
+  let liftAbove: Float64Array | null = null;
+  if (t.levelScaleHeight > 0) {
+    liftAbove = new Float64Array(n);
+    for (let i = 0; i < n; i++) liftAbove[i] = Math.exp(-Math.max(0, hPlus[i] - t.levelLiftHeight) / t.levelScaleHeight);
+  }
   return {
     hSmooth: hPlus,
     hGradX,
@@ -117,6 +131,7 @@ export function computeStaticForcing(g: HydroGrid, dyn: DynamicsResult, t: Hydro
     baroclinicScale: bRms > 1e-30 ? bRms * t.baroclinicRmsScale : Infinity,
     landFrac,
     dayLength,
+    liftAbove,
   };
 }
 
@@ -149,6 +164,8 @@ export function allocForcingScratch(g: HydroGrid): ForcingScratch {
     zonalSst: new Float64Array(g.h),
     zonalAir: new Float64Array(g.h),
     zonalWeight: new Float64Array(g.h),
+    tSl: new Float64Array(g.n),
+    tSlSmooth: new Float64Array(g.n),
     stabStencil: allocStencil(g.n),
   };
 }
@@ -286,6 +303,10 @@ export function computeMonthForcing(
   const kRange = t.eddyDiffusivityMax - t.eddyDiffusivityMin;
   const invTauP = 1 / (t.precipTimescaleDays * 86400);
   const keepAnomaly = 1 - t.columnAnomalyDamping;
+  // Column temperature anomaly: smoothed over the free-tropospheric scale (columnSmoothKm).
+  const tSl = scratch.tSl;
+  for (let i = 0; i < n; i++) tSl[i] = dyn.temp[off + i] + LAPSE_RATE * dyn.surfaceHeight[i];
+  const tSlCol = t.columnSmoothKm > 0 ? blurSphere(g, tSl, t.columnSmoothKm, scratch.tSlSmooth) : tSl;
   for (let r = 0; r < h; r++) {
     const dayLen = st.dayLength[m * h + r];
     const tRef = scratch.zonalAir[r];
@@ -298,7 +319,7 @@ export function computeMonthForcing(
       // Column saturation: only part of the local sea-level anomaly (relative to the latitude's
       // reference) reaches the free troposphere; the lapse term keeps plateaus dry.
       const lapse = LAPSE_RATE * dyn.surfaceHeight[i];
-      const tCol = tRef + keepAnomaly * (T + lapse - tRef) - lapse;
+      const tCol = tRef + keepAnomaly * (tSlCol[i] - tRef) - lapse;
       const ws = saturationColumnWater(tCol, t.waterScaleHeight);
       f.wsat[i] = ws;
       f.invWsat[i] = 1 / ws;

@@ -21,7 +21,7 @@ const { CRUST_CONTINENTAL } = _types;
 const { rasterGeometry } = _paintGeometry;
 const { blurMetric, scratchFloat32, scratchInt32, scratchUint8 } = _terrainBase;
 const {
-  CH_COAST, CH_COAST2, CH_HILL, CH_HILL2, CH_LITH, CH_RIDGE, CH_RIDGE2, DETAIL_SCALE, EQ_K, buildDetailTexture,
+  CH_COAST, CH_COAST2, CH_HILL, CH_HILL2, CH_LITH, CH_RIDGE, CH_RIDGE2, CH_VEG, CH_VREL, DETAIL_SCALE, EQ_K, VEG_Q, buildDetailTexture,
   detailResolution, sampleDetail,
 } = _terrainDetail;
 
@@ -108,26 +108,30 @@ export interface HeightField {
   /** Mountain (ridged) detail at the pixel, m: > 0 on crests, < 0 in valleys. */
   rough: Int16Array;
   /**
-   * A second plate-frame texture noise, independent of `patch`: CH_HILL of the detail texture at a
-   * fixed rotation of the material-frame direction, (x, y, z) → (y, z, x), as 2.5·hill ×127 (the
-   * climate sampler's `fine` encoding; its `tex` is 0.99-correlated, ≈ 0.91× this). Land colour
-   * mosaics use it rather than the sampler's world-frame noises, which stay put while the plates
-   * move (the forest / snow patches would crawl over the land during playback). 0 on sea pixels
-   * that no coastline noise can reach.
+   * Plate-frame colour noises, four signed bytes packed per pixel (PN_FINE … PN_REL: byte k is
+   * (v << (24 − 8k)) >> 24), 0 on sea pixels that no coastline noise can reach:
+   *  - fine (PN_FINE, ≈[-1,1] × 127): CH_HILL of the detail texture at a fixed rotation of the
+   *    material-frame direction, (x, y, z) → (y, z, x), as 2.5·hill — a second fine texture noise,
+   *    independent of `patch`. Land colour mosaics use plate-frame noises rather than world-frame
+   *    ones, which stay put while the plates move (forest / snow patches would crawl);
+   *  - grain (PN_GRAIN, ≈[-1,1] × 127): the whiter coastline channel at the rotated direction —
+   *    pixel-scale texture (canopy gaps, gravel) that still travels with the plates;
+   *  - veg (PN_VEG, ≈ unit variance × PVEG_SCALE): the CH_VEG patch noise — a redder, band-limited
+   *    cousin of `fine` for mosaic thresholds (smooth patch edges a few pixels wide);
+   *  - rel (PN_REL, ≈ unit variance × PVEG_SCALE): smooth relief proxy — the hill detail of `patch`
+   *    re-weighted to a redder spectrum (+ hills, − hollows, no pixel-scale roughness) for
+   *    terrain-following mosaic thresholds.
+   * (One stream instead of four: the colouring pass reads them together.)
    */
-  pfine: Int8Array;
+  pnoise: Int32Array;
   /**
    * Plate-frame drainage-line field (0..255, 0 on most ground, → 255 along narrow sinuous lines): the
-   * ridged channel of the detail texture at the same rotated direction as `pfine`, (ridge − mean)/up.
-   * Colouring uses it as the valley / drainage network below the mesh scale (forest along valleys in
-   * the forest–tundra, valley glaciers, shrub lines in snowy tundra). 0 on sea pixels.
+   * ridged channel of the detail texture at the same rotated direction as the fine noise,
+   * (ridge − mean)/up. Colouring uses it as the valley / drainage network below the mesh scale
+   * (forest along valleys in the forest–tundra, valley glaciers, shrub lines in snowy tundra). 0 on
+   * sea pixels.
    */
   pdrain: Uint8Array;
-  /**
-   * Plate-frame fine grain (≈[-1,1] × 127): the whiter coastline channel at the rotated direction —
-   * pixel-scale texture (canopy gaps, gravel) that still travels with the plates. 0 on sea pixels.
-   */
-  pgrain: Int8Array;
   /**
    * Signed distance to the drawn coastline (+ land), in mesh spacings × COAST_SD_SCALE, clamped to
    * ±127 (−128 = unknown: far from the coast, not evaluated). Its zero contour IS the coastline
@@ -146,6 +150,9 @@ export interface HeightField {
  */
 export const HF_NOISE_SCALE = 1 / 8192;
 
+/** HeightField.pnoise veg / rel byte units per unit of the (unit-variance) noise. */
+export const PVEG_SCALE = VEG_Q;
+
 /** Scale of HeightField.coastSd (units per mesh spacing). */
 export const COAST_SD_SCALE = 32;
 
@@ -153,10 +160,12 @@ export const COAST_SD_SCALE = 32;
 interface MeshTerrain {
   /** Laplacian-smoothed elevation (m). */
   elev: Float32Array;
-  /** Interleaved [ridge amplitude, hill amplitude, fine-ridge amplitude] per cell (m). */
-  amp: Float32Array;
-  /** Signed coast distance (mesh spacings, + land), see coastDistance(). */
-  coast: Float32Array;
+  /**
+   * Interleaved per vertex [signed coast distance (mesh spacings, + land, see coastDistance()),
+   * ridge amplitude, hill amplitude, fine-ridge amplitude (m)]: what the per-pixel composition
+   * reads for each triangle corner, in one cache line.
+   */
+  vtx: Float32Array;
 }
 
 
@@ -194,7 +203,7 @@ function buildMeshTerrain(mesh: SphereMesh, s: WorldSnapshot, sea: number, elen:
       rel += (v - e) * (v - e);
       const xj = v - sea;
       if ((xj > 0) !== landI) {
-        const ti = xi / ((xi < 0 ? -xi : xi) + COAST_T_M), tj = xj / ((xj < 0 ? -xj : xj) + COAST_T_M);
+        const ti = xi / (Math.abs(xi) + COAST_T_M), tj = xj / (Math.abs(xj) + COAST_T_M);
         const cand = (ti / (ti - tj)) * elen[k];
         if (cand < best) best = cand;
       }
@@ -210,13 +219,15 @@ function buildMeshTerrain(mesh: SphereMesh, s: WorldSnapshot, sea: number, elen:
     // Land / continental relief: recent orogeny, high elevation and steep mesh-scale relief.
     let m = oro / (1100 + oro);
     let te = (e - 400) * (1 / 3400);
-    te = te < 0 ? 0 : te > 1 ? 1 : te * te * (3 - 2 * te);
+    te = 0.5 * (Math.abs(te) - Math.abs(te - 1) + 1);
+    te = te * te * (3 - 2 * te);
     if (0.85 * te > m) m = 0.85 * te;
     const mRel = (0.7 * relief) / (900 + relief);
     if (mRel > m) m = mRel;
     const landR = 3000 * m + 160;
     let th = (e - 200) * (1 / 1800);
-    th = th < 0 ? 0 : th > 1 ? 1 : th * th * (3 - 2 * th);
+    th = 0.5 * (Math.abs(th) - Math.abs(th - 1) + 1);
+    th = th * th * (3 - 2 * th);
     const landH = 35 + 0.07 * landR + 90 * th;
     // Ocean floor: rough young ridge flanks, abyssal hills smoothed by sediment with age.
     const oceanR = 650 / (1 + age * 0.1) + (120 * relief) / (700 + relief) + 60;
@@ -225,7 +236,8 @@ function buildMeshTerrain(mesh: SphereMesh, s: WorldSnapshot, sea: number, elen:
     let t = 1;
     if (crustA[i] !== CRUST_CONTINENTAL) {
       t = (e + 2500) * (1 / 2200);
-      t = t < 0 ? 0 : t > 1 ? 1 : t * t * (3 - 2 * t);
+      t = 0.5 * (Math.abs(t) - Math.abs(t - 1) + 1);
+      t = t * t * (3 - 2 * t);
     }
     // Ruggedness of orogenic belts (recent uplift, steep mesh-scale relief; high plateaus much
     // less): amplitude of the fine ridge / valley relief.
@@ -255,7 +267,15 @@ function buildMeshTerrain(mesh: SphereMesh, s: WorldSnapshot, sea: number, elen:
     amp[i3 + 2] = a1 > a0 ? 0.5 * (raw[i3 + 2] + sf * inv) : raw[i3 + 2];
   }
   coastDistance(mesh, src, sea, elen, coast, queue, qn);
-  return { elev, amp, coast };
+  const vtx = new Float32Array(4 * n);
+  for (let i = 0; i < n; i++) {
+    const i3 = 3 * i, i4 = 4 * i;
+    vtx[i4] = coast[i];
+    vtx[i4 + 1] = amp[i3];
+    vtx[i4 + 2] = amp[i3 + 1];
+    vtx[i4 + 3] = amp[i3 + 2];
+  }
+  return { elev, vtx };
 }
 
 export function detailTexture(seed: number, w: number, cache: PaintCache): DetailTexture {
@@ -346,14 +366,13 @@ function buildHeightField(mesh: SphereMesh, s: WorldSnapshot | null, opts: Paint
   const patch = new Int16Array(npx);
   const lith = new Int16Array(npx);
   const rough = new Int16Array(npx);
-  const pfine = new Int8Array(npx);
+  const pnoise = new Int32Array(npx);
   const pdrain = new Uint8Array(npx);
-  const pgrain = new Int8Array(npx);
   const coastSd = new Int8Array(npx);
   if (!s) {
     height.fill(NEUTRAL_OCEAN_DEPTH);
     coastSd.fill(-128);
-    return { w, h, height, patch, lith, rough, pfine, pdrain, pgrain, coastSd, coastPx: new Int32Array(0) };
+    return { w, h, height, patch, lith, rough, pnoise, pdrain, coastSd, coastPx: new Int32Array(0) };
   }
   if (s.n !== mesh.n) throw new Error(`paint: snapshot.n (${s.n}) ≠ mesh.n (${mesh.n})`);
   const map = cache.getGridMap(mesh, w, h);
@@ -363,8 +382,8 @@ function buildHeightField(mesh: SphereMesh, s: WorldSnapshot | null, opts: Paint
   const base = smoothBase(map, mt.elev, BASE_SIGMA_SPACINGS * mesh.spacing, scratchFloat32(0, npx));
   const sea = opts.seaLevel;
   const skipBelow = qualityOf(opts) === 'preview' ? sea + PREVIEW_DEEP_SKIP_M : -Infinity;
-  const out: HeightField = { w, h, height, patch, lith, rough, pfine, pdrain, pgrain, coastSd, coastPx: new Int32Array(0) };
-  composeDetail(map, s, mt, mt.coast, tex, base, detailAmount(opts), sea, skipBelow, mesh.spacing, cache, out);
+  const out: HeightField = { w, h, height, patch, lith, rough, pnoise, pdrain, coastSd, coastPx: new Int32Array(0) };
+  composeDetail(map, s, mt, tex, base, detailAmount(opts), sea, skipBelow, mesh.spacing, cache, out);
   return out;
 }
 
@@ -443,17 +462,17 @@ function plateSlots(s: WorldSnapshot): Uint8Array {
 }
 
 function composeDetail(
-  map: MeshGridMap, s: WorldSnapshot, mt: MeshTerrain, coastS: Float32Array, tex: DetailTexture, base: Float32Array,
+  map: MeshGridMap, s: WorldSnapshot, mt: MeshTerrain, tex: DetailTexture, base: Float32Array,
   amount: number, sea: number, skipBelow: number, spacing: number, cache: PaintCache, out: HeightField,
 ): void {
-  const { height, patch, lith, rough, pfine, pdrain, pgrain, coastSd } = out;
+  const { height, patch, lith, rough, pnoise, pdrain, coastSd } = out;
   const { w, h, tri, bary } = map;
   const geo = rasterGeometry(w, h, cache);
   const { cosLat, sinLat, cosLon, sinLon } = geo;
   const M = plateMatrices(s);
   const slot = plateSlots(s);
-  const amp = mt.amp;
-  const smp = new Float64Array(8);
+  const vtx = mt.vtx;
+  const smp = new Float64Array(9);
   const acc = new Float64Array(4);
   const ks = new Int32Array(3);
   const ws = new Float64Array(3);
@@ -488,25 +507,25 @@ function composeDetail(
       const wa = bary[k3], wb = bary[k3 + 1], wc = bary[k3 + 2];
       // Signed coast distance (+ bias), in spacings: the coastline is its zero contour after the
       // (bounded) noise displacement is added.
-      const si = wa * coastS[va] + wb * coastS[vb] + wc * coastS[vc] + COAST_BIAS;
+      const ja = va << 2, jb = vb << 2, jc = vc << 2;
+      const si = wa * vtx[ja] + wb * vtx[jb] + wc * vtx[jc] + COAST_BIAS;
       if (b < skipBelow && si + coastBound < 0) {
         // Preview: deep sea that no detail can turn into land keeps the smooth sea floor.
         height[p] = b;
         coastSd[p] = -128;
         continue;
       }
-      const ja = 3 * va, jb = 3 * vb, jc = 3 * vc;
-      const ar = wa * amp[ja] + wb * amp[jb] + wc * amp[jc];
-      const ah = wa * amp[ja + 1] + wb * amp[jb + 1] + wc * amp[jc + 1];
-      const af = wa * amp[ja + 2] + wb * amp[jb + 2] + wc * amp[jc + 2];
+      const ar = wa * vtx[ja + 1] + wb * vtx[jb + 1] + wc * vtx[jc + 1];
+      const ah = wa * vtx[ja + 2] + wb * vtx[jb + 2] + wc * vtx[jc + 2];
+      const af = wa * vtx[ja + 3] + wb * vtx[jb + 3] + wc * vtx[jc + 3];
       const pa = slot[va], pb = slot[vb], pc = slot[vc];
       const x = cl * cosLon[c], y = cl * sinLon[c], z = sl;
       let ridge: number, hill: number, coast: number, li: number;
-      // Colour-only noises (HeightField.pfine / pdrain / pgrain: the rotated-direction channels of
+      // Colour-only noises (HeightField.pnoise / pdrain: the rotated-direction channels of
       // the same texels), fetched for land pixels only: single-plate pixels keep their texel
       // footprint (rq ≥ 0, weights g00..g11) and load them once the pixel is known to be land;
       // boundary pixels blend them right away where land is possible.
-      let hill2 = 0, ridge2 = 0, coast2 = 0, rq = -1, rs = 0, g00 = 0, g01 = 0, g10 = 0, g11 = 0;
+      let hill2 = 0, ridge2 = 0, coast2 = 0, veg2 = 0, vrel = 0, rq = -1, rs = 0, g00 = 0, g01 = 0, g10 = 0, g11 = 0;
       const maybeLand = si > -farSi;
       if (pa === pb && pa === pc) {
         // Single plate (the common case): sampleDetail() inlined by hand (V8 does not inline it and
@@ -539,8 +558,8 @@ function composeDetail(
           u = mx * inv;
           v = my * inv;
         }
-        const su = (u + EQ_K * u * (1 - (u < 0 ? -u : u)) + 1) * thn + 0.5;
-        const sv = (v + EQ_K * v * (1 - (v < 0 ? -v : v)) + 1) * thn + 0.5;
+        const su = (u + EQ_K * u * (1 - Math.abs(u)) + 1) * thn + 0.5;
+        const sv = (v + EQ_K * v * (1 - Math.abs(v)) + 1) * thn + 0.5;
         let i0 = su | 0, j0 = sv | 0;
         if (i0 > tn) i0 = tn;
         if (j0 > tn) j0 = tn;
@@ -573,13 +592,13 @@ function composeDetail(
         else if (m === 2 && pc === ks[1]) ws[1] += wc;
         else { ks[m] = pc; ws[m] = wc; m++; }
         acc.fill(0);
-        let w2 = 0, h2s = 0, r2s = 0, c2s = 0;
+        let w2 = 0, h2s = 0, r2s = 0, c2s = 0, v2s = 0, vrs = 0;
         for (let q = 0; q < m; q++) {
           const o = 9 * ks[q], wq = ws[q];
           const mx = M[o] * x + M[o + 3] * y + M[o + 6] * z;
           const my = M[o + 1] * x + M[o + 4] * y + M[o + 7] * z;
           const mz = M[o + 2] * x + M[o + 5] * y + M[o + 8] * z;
-          sampleDetail(tex, mx, my, mz, smp, 0, maybeLand ? 7 : 4);
+          sampleDetail(tex, mx, my, mz, smp, 0, maybeLand ? 8 : 4);
           acc[CH_RIDGE] += wq * (smp[CH_RIDGE] - ridgeMean);
           acc[CH_HILL] += wq * smp[CH_HILL];
           acc[CH_COAST] += wq * smp[CH_COAST];
@@ -588,6 +607,8 @@ function composeDetail(
             h2s += wq * smp[CH_HILL2];
             r2s += wq * (smp[CH_RIDGE2] - ridgeMean);
             c2s += wq * smp[CH_COAST2];
+            v2s += wq * smp[CH_VEG];
+            vrs += wq * smp[CH_VREL];
           }
           w2 += wq * wq;
         }
@@ -600,6 +621,8 @@ function composeDetail(
         hill2 = h2s * inv;
         ridge2 = r2s * inv + ridgeMean;
         coast2 = c2s * inv;
+        veg2 = v2s * inv * VEG_Q;
+        vrel = vrs * inv * VEG_Q;
       }
       // Mountain relief: the ridged detail scaled by the mountainousness, with extra gain on its
       // high-amplitude (orogenic) part so ranges carry kilometre-scale ridges and valleys.
@@ -610,7 +633,7 @@ function composeDetail(
       }
       // Fine ridges (crest lines along the zero contours of the fine coastline channel) give
       // orogenic belts kilometre-scale ridge / valley relief at the pixel scale.
-      const mountain = amount * (ar * (ridge - ridgeMean) * (1 + (MTN_GAIN - 1) * mg) + af * (fineMean - (coast < 0 ? -coast : coast)));
+      const mountain = amount * (ar * (ridge - ridgeMean) * (1 + (MTN_GAIN - 1) * mg) + af * (fineMean - Math.abs(coast)));
       const dd = mountain + amount * ah * hill;
       // Int16 stores (truncating): |mountain| ≪ 32767 m; |hill|, |li| < 4 (texture range, see
       // DETAIL_SCALE) whatever the plate blend, so no clamping is needed at HF_NOISE_SCALE.
@@ -624,12 +647,14 @@ function composeDetail(
         // Coast character: rugged (rias, skerries) on rugged lithology and along mountain belts,
         // smoother on sedimentary plains.
         let rug = (li + 0.15) * (1 / 0.45);
-        rug = rug < 0 ? 0 : rug > 1 ? 1 : rug * rug * (3 - 2 * rug);
+        rug = 0.5 * (Math.abs(rug) - Math.abs(rug - 1) + 1);
+        rug = rug * rug * (3 - 2 * rug);
         let rm = (ar - 500) * (1 / 1500);
-        rm = rm < 0 ? 0 : rm > 1 ? 1 : rm * rm * (3 - 2 * rm);
+        rm = 0.5 * (Math.abs(rm) - Math.abs(rm - 1) + 1);
+        rm = rm * rm * (3 - 2 * rm);
         if (rm > rug) rug = rm;
         let dn = (aSmooth + aRange * rug) * (COAST_W_COAST * coast + COAST_W_HILL * hill - COAST_W_FJORD * rm * (ridge - ridgeMean));
-        dn = dn / (1 + (dn < 0 ? -dn : dn) * (1 / COAST_NMAX));
+        dn = dn / (1 + Math.abs(dn) * (1 / COAST_NMAX));
         sp = si + dn;
         // (Int8 store truncates toward zero: ≤ 1/COAST_SD_SCALE spacing of error.)
         const q = sp * COAST_SD_SCALE;
@@ -642,30 +667,37 @@ function composeDetail(
           ridge2 = g00 * td[rq + 4] + g01 * td[rq + 12] + g10 * td[rs + 4] + g11 * td[rs + 12];
           hill2 = g00 * td[rq + 5] + g01 * td[rq + 13] + g10 * td[rs + 5] + g11 * td[rs + 13];
           coast2 = g00 * td[rq + 6] + g01 * td[rq + 14] + g10 * td[rs + 6] + g11 * td[rs + 14];
+          // CH_VEG: two packed bytes (patch noise high, relief proxy low), in VEG_Q units.
+          const v00 = td[rq + 7], v01 = td[rq + 15], v10 = td[rs + 7], v11 = td[rs + 15];
+          veg2 = (g00 * (v00 >> 8) + g01 * (v01 >> 8) + g10 * (v10 >> 8) + g11 * (v11 >> 8)) * (1 / DETAIL_SCALE);
+          vrel = (g00 * ((v00 << 24) >> 24) + g01 * ((v01 << 24) >> 24) + g10 * ((v10 << 24) >> 24) + g11 * ((v11 << 24) >> 24)) * (1 / DETAIL_SCALE);
         }
-        const t2 = (2.5 * 127) * hill2;
-        pfine[p] = t2 > 127 ? 127 : t2 < -127 ? -127 : t2;
         const t3 = (ridge2 - ridgeMean) * drainK;
         pdrain[p] = t3 > 255 ? 255 : t3 < 0 ? 0 : t3;
-        const t4 = (1.6 * 127) * coast2;
-        pgrain[p] = t4 > 127 ? 127 : t4 < -127 ? -127 : t4;
+        // Packed signed bytes (truncated toward zero, as Int8 stores would).
+        let t2 = (2.5 * 127) * hill2, t4 = (1.6 * 127) * coast2;
+        t2 = t2 > 127 ? 127 : t2 < -127 ? -127 : t2;
+        t4 = t4 > 127 ? 127 : t4 < -127 ? -127 : t4;
+        const t5 = veg2 > 127 ? 127 : veg2 < -127 ? -127 : veg2, t6 = vrel > 127 ? 127 : vrel < -127 ? -127 : vrel;
+        pnoise[p] = ((t2 | 0) & 0xff) | (((t4 | 0) & 0xff) << 8) | (((t5 | 0) & 0xff) << 16) | ((t6 | 0) << 24);
       }
       if (far) {
         // Far from any coastline (the noise cannot reach it, nor its 3×3 neighbourhood): the
         // pass-2 treatment with a full floor, done right away.
-        let u: number, d: number, f: number;
+        // Compression toward the floor written without a data-dependent branch:
+        // u + d·u / (u − min(d, 0)) on land (u > 0), u + d·u / (u − max(d, 0)) at sea (u < 0) —
+        // u + d when d points away from the floor, u² / (u − d) when toward it.
         if (si > 0) {
-          f = COAST_RAMP_M;
-          u = hb - f;
+          let u = hb - COAST_RAMP_M;
           if (u < COAST_EPS_M) u = COAST_EPS_M;
-          d = (dd * u) / (u + RELIEF_BASE_M);
+          const d = (dd * u) / (u + RELIEF_BASE_M);
+          height[p] = sea + COAST_RAMP_M + u + (d * u) / (u - 0.5 * (d - Math.abs(d)));
         } else {
-          f = -COAST_RAMP_M;
-          u = hb - f;
+          let u = hb + COAST_RAMP_M;
           if (u > -COAST_EPS_M) u = -COAST_EPS_M;
-          d = (SEA_DETAIL * dd * u) / (u - RELIEF_BASE_M);
+          const d = (SEA_DETAIL * dd * u) / (u - RELIEF_BASE_M);
+          height[p] = sea - COAST_RAMP_M + u + (d * u) / (u - 0.5 * (d + Math.abs(d)));
         }
-        height[p] = sea + f + ((u > 0) === (d < 0) ? (u * u) / (u - d) : u + d);
         continue;
       }
       // Coastal band, pass 1: the side of the coastline and the base relative to the display sea
@@ -697,11 +729,14 @@ function composeDetail(
       const land = side[p];
       const cw = c > 0 ? c - 1 : w - 1, ce = c + 1 < w ? c + 1 : 0;
       let ramp = 1, dist = 2;
-      if (side[row + cw] !== land || side[row + ce] !== land || side[rowN + c] !== land || side[rowS + c] !== land) {
+      // Neighbour sides summed (sides are 0 / 1): one comparison per ring instead of a chain of
+      // data-dependent branches.
+      const all4 = 4 * land;
+      if (side[row + cw] + side[row + ce] + side[rowN + c] + side[rowS + c] !== all4) {
         ramp = RAMP_ORTHO;
         dist = 1;
         coastList[nCoast++] = p;
-      } else if (side[rowN + cw] !== land || side[rowN + ce] !== land || side[rowS + cw] !== land || side[rowS + ce] !== land) {
+      } else if (side[rowN + cw] + side[rowN + ce] + side[rowS + cw] + side[rowS + ce] !== all4) {
         ramp = RAMP_DIAG;
         dist = 1.4142135623730951;
       }
@@ -709,24 +744,23 @@ function composeDetail(
       // drawn coastline, so heights keep growing ~linearly with the distance from it.
       let fl = COAST_RAMP_M * ramp;
       const hb = height[p];
-      if (ramp < 1 || (hb < 0 ? -hb : hb) < SLOPE_FLOOR_CHECK_M) {
+      if (ramp < 1 || Math.abs(hb) < SLOPE_FLOOR_CHECK_M) {
         const gx = base[row + ce] - base[row + cw], gy = base[rowN + c] - base[rowS + c];
         const slopeFloor = 0.5 * Math.sqrt(gx * gx + gy * gy) * (dist - 0.5);
         if (slopeFloor > fl) fl = slopeFloor;
       }
-      let u: number, f: number;
+      let e: number;
       if (land) {
-        f = fl;
-        u = hb - f;
+        let u = hb - fl;
         if (u < COAST_EPS_M) u = COAST_EPS_M;
         d *= u / (u + RELIEF_BASE_M);
+        e = fl + u + (d * u) / (u - 0.5 * (d - Math.abs(d)));
       } else {
-        f = -fl;
-        u = hb - f;
+        let u = hb + fl;
         if (u > -COAST_EPS_M) u = -COAST_EPS_M;
         d *= (SEA_DETAIL * u) / (u - RELIEF_BASE_M);
+        e = -fl + u + (d * u) / (u - 0.5 * (d + Math.abs(d)));
       }
-      let e = f + ((u > 0) === (d < 0) ? (u * u) / (u - d) : u + d);
       if (ramp < 1) {
         // Next to the coastline the profile is symmetric: no cliffs of natural height or depth
         // right at the shore (shallow near-shore water, low shores), heights ~ distance.

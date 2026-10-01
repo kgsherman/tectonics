@@ -81,19 +81,42 @@ export const ebmTuning = {
   /**
    * Perennial mass (firn and ice) turns snow into glacier: glacier weight G = smoothstep(glacierMassLow,
    * glacierMassHigh, M), which takes the ice-sheet albedo, is never patchy on high terrain and
-   * behaves as an ice sheet at the output (EF/ET, perennial snow). Mass is capped at glacierMassMax,
-   * which also bounds how long an unsustainable ice cap survives (≲ 1–2 model years).
+   * behaves as an ice sheet at the output (EF/ET, perennial snow). Mass is capped at glacierMassMax
+   * (also the mass of a cell that joins a sheet; energyIce.ts decides which cells are glacier).
    */
   glacierMassLow: 150,
   glacierMassHigh: 600,
   glacierMassMax: 1500,
   /**
    * Cold start: land whose steady annual-mean surface temperature is below glacierInitT (°C) starts
-   * glaciated (M = glacierMassMax); the mass balance then keeps or removes the ice (the ice-covered
+   * glaciated (M = glacierMassMax) where it can carry an ice sheet (glacierInitCoastKm,
+   * glacierInitReachKm); the mass balance then keeps, spreads or removes the ice (the ice-covered
    * branch of the hysteresis: an ice sheet keeps its own summers cold). Other land starts bare and
-   * glaciates only where its seasonal snow survives the summer.
+   * glaciates only where its seasonal snow survives the summer or a sheet's surplus can feed it.
    */
   glacierInitT: -12,
+  /**
+   * The ice-covered branch needs room for an ice-sheet dome: only land at least this far (km) from
+   * the ocean starts glaciated. Islands and coastal strips start bare (the interglacial branch) and
+   * carry ice only where their own seasonal snow survives the summer or a neighbouring sheet's
+   * accumulation surplus can feed them (energyIce.ts).
+   */
+  glacierInitCoastKm: 300,
+  /** …and the initial sheet reaches this far (km) from its interior (the dome's half-width). */
+  glacierInitReachKm: 450,
+  /**
+   * Glacier topology (which cells are ice) changes only at the first glacierTopologyYears year
+   * boundaries of a run — all of them inside the always-identical cold pass 1 — each time to the
+   * margin that balances every sheet's mass budget (energyIce.ts); afterwards it is held, so the
+   * glacier margins do not depend on how many coupled years a run gets (fast, full, warm starts).
+   */
+  glacierTopologyYears: 3,
+  /**
+   * A sheet advances only onto bare land whose melt left over once its seasonal snow is gone stays
+   * below this (kg/m²/yr w.e.): ice flow extends the margin into cool ground next to it, but cannot
+   * carry the accumulation of a distant interior across warm lowlands.
+   */
+  glacierAdvanceMaxDeficit: 400,
   /**
    * Ice-sheet surface (energyIce.ts): height above sea level iceProfileScale·sqrt(d + iceProfileEdgeKm)
    * (m, d = km from the glacier margin; plastic ice with τ₀ ≈ 70 kPa after isostatic bed
@@ -144,7 +167,7 @@ export const ebmTuning = {
    * Meridional ocean diffusion across zonally open channels: × (1 − (1 − factor)·open^power), open =
    * longest ocean run of the adjacent rows as a fraction of the latitude circle.
    */
-  channelDiffusionFactor: 0.5,
+  channelDiffusionFactor: 0.75,
   /** Zonal ocean diffusion relative to the meridional one. */
   oceanZonalDiffusionFactor: 1,
   /** Interhemispheric overturning heat transport (PW) for a single-hemisphere circumpolar channel (energyOverturning.ts). */
@@ -165,7 +188,7 @@ export const ebmTuning = {
   /** Diffusivity factor over land (weaker low-level eddy mixing into continental interiors). */
   landDiffusionFactor: 1,
   /** Diffusivity factor over high polar plateaus (ice sheets: strong surface inversions), poleward of iceSheetLat above iceSheetHeight (m). */
-  iceSheetDiffusionFactor: 0.2,
+  iceSheetDiffusionFactor: 0.17,
   iceSheetLat: 60,
   iceSheetHeight: 1500,
   /**

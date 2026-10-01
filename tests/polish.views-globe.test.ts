@@ -117,14 +117,15 @@ describe('surface shader contracts', () => {
     expect(GLSL_TERRAIN_RECON).toContain('texelFetch(baseTex');
     // Land iff h > sea at texel level (painter's rule) drives the per-class color split.
     expect(GLSL_TERRAIN_RECON).toContain('v > sea ? 1.0 : 0.0');
-    expect(GLSL_TERRAIN_DETAIL).toContain('smoothstep(2.5, 6.0, 1.0 / (freq * pxRad))');
+    expect(GLSL_TERRAIN_DETAIL).toContain('smoothstep(2.0, 5.0, 1.0 / (freq * pxRad))');
   });
 
   it('clamps the sharpened (Catmull-Rom) class colours to the central 2×2 texels (no dark rings)', () => {
     // A 2-texel lake on land undershoots by 12.5 % of the step per axis (≈25 % in 2D): in linear light
     // that is black for dark water. The CR colour must stay within its class's central texels.
-    expect(GLSL_TERRAIN_RECON).toContain('antiRing(lcr / wlr, lmin, lmax)');
-    expect(GLSL_TERRAIN_RECON).toContain('antiRing(scr / wsr, smin, smax)');
+    // (CR colour sums with the coastal anti-aliased texels down-weighted, polish 3: wlrc / wsrc.)
+    expect(GLSL_TERRAIN_RECON).toContain('antiRing(lcr / wlrc, lmin, lmax)');
+    expect(GLSL_TERRAIN_RECON).toContain('antiRing(scr / wsrc, smin, smax)');
     expect(GLSL_TERRAIN_RECON.match(/\(i == 1 \|\| i == 2\) && \(j == 1 \|\| j == 2\)/g)?.length).toBe(2);
   });
 

@@ -124,6 +124,10 @@ export interface RouteInput {
 const LAKE_MIN_DEPTH = 120;
 /** Outlet incision of open lakes as a fraction of the basin depth (lowers their level). */
 const BREACH = 0.45;
+/** Incision of deep basins: BREACH_DEEP reached from BREACH between M0 and M0 + M1 m of depth. */
+const BREACH_DEEP = 0.85;
+const BREACH_DEEP_M0 = 250;
+const BREACH_DEEP_M1 = 900;
 /**
  * Dryland transmission loss per 40 km of channel: fraction TL_K·aridity/(q + TL_Q0)^0.88 (q in
  * km³/yr) above aridity TL_ARID0 — about 0.5 km³/yr lost per 40 km whatever the size: wadis of
@@ -318,8 +322,12 @@ export function routeDrainage(inp: RouteInput): Drainage {
     const arid = aridSum / cells.length;
     const sorted = cells.slice().sort((a, b) => elev[a] - elev[b]);
     const endorheic = inflow < evapFull * 0.65;
-    // Open lakes: level at the (partly incised) outlet; area = cells below it.
-    let level = spill[id] - BREACH * depth;
+    // Open lakes: level at the (partly incised) outlet; area = cells below it. Deep pits between
+    // mountain ridges (rugged plateaus) are incised far more by their outlets: only their floors
+    // hold water, instead of a lake in every hollow of the procedural relief.
+    let deep = (depth - BREACH_DEEP_M0) * (1 / BREACH_DEEP_M1);
+    deep = deep < 0 ? 0 : deep > 1 ? 1 : deep * deep * (3 - 2 * deep);
+    let level = spill[id] - (BREACH + (BREACH_DEEP - BREACH) * deep) * depth;
     let waterCells = 0;
     for (const i of cells) if (elev[i] < level) waterCells++;
     // Drylands: standing water shrinks to a terminal lake on a playa floor as the basin gets more

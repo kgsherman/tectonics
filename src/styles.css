@@ -487,6 +487,11 @@ button.wg-chip:focus-visible, .wg-picker-btn:focus-visible, .wg-layer-item:focus
 .wg-app.is-editing { grid-template-columns: var(--wg-edit-w) minmax(0, 1fr) 0; }
 .wg-app.is-editing .wg-right, .wg-app.is-editing .wg-drawer-float.is-right { display: none; }
 .wg-app.is-editing ~ .wg-toasts { right: 14px; }
+/* The editor fills the panel height: its tools scroll inside, the footer ("Simulate this world") stays in view. */
+.wg-app.is-editing .wg-left { display: flex; flex-direction: column; overflow: hidden; }
+.wg-app.is-editing .wg-left > .wg-tabpanel:not([hidden]) { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; padding: 0; }
+.wg-app.is-editing .wg-editor-host { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.wg-app.is-editing .wg-editor-host > .pe-root { flex: 1 1 auto; height: auto; }
 @media (max-width: 1280px) { :root { --wg-edit-w: 340px; } }
 @media (max-width: 760px) { .wg-app.is-editing { grid-template-columns: 0 minmax(0, 1fr) 0; } .wg-app.is-editing .wg-left { width: min(360px, 92vw); } }
 

@@ -8,15 +8,18 @@
  *     shield, dry slot, cold sector) are evaluated in a swirled frame; they bias the coverage, add
  *     cirrus over the head / warm conveyor and open cells in the cold sector, and swirl the noise;
  *  2. noise: a large-scale domain warp and a synoptic shape fetch from the smooth volume (stretched
- *     east–west), then 2–4 detail octaves (ratio 2.6) from the detail volume, each warped by the
- *     previous one's gradient and shaped per regime between plain fbm, billows (soft |n|: cumulus,
- *     convective cores, closed cells) and ridges (open cells), with a regime-dependent octave gain;
+ *     east–west), then 2–4 detail octaves (ratio 2.6) from the detail volume, each warped a little
+ *     by the previous one's gradient and shaped per regime between plain fbm, billows (soft |n|:
+ *     cumulus, convective cores, closed cells) and ridges (open cells), with a regime-dependent
+ *     spectrum (coarse-octave weight and gain: clumpy convection, fields of small cumulus, finely
+ *     cellular decks). The detail follows only DETAIL_SWIRL of the storms' swirl, the cirrus none;
  *  3. the normalized noise z (≈ N(0,1)) plus the cyclone bias is compared with the coverage
  *     threshold z_thr = Φ⁻¹(1 − f): the cloudy area fraction follows the climate's coverage f, and the
- *     excess above the threshold sets a continuous, log-normally textured optical depth (thin grey
- *     edges, mottled mid-thick cloud, bright cores);
- *  4. cirrus: an independent thin veil (patches from the shape fetch's B channel, fibres from a
- *     strongly zonally stretched detail fetch).
+ *     excess above the threshold sets a continuous, log-normally textured optical depth (a crisp
+ *     edge, an opaque body right behind it, mottled at the finest resolved scales, bright cores);
+ *  4. upper cloud: anvils (smooth bright sheets around deep-convective cores, under their tops) and
+ *     cirrus (an independent thin veil: patches from the shape fetch's B channel, streaks from a
+ *     zonally stretched detail fetch).
  */
 import {
   CLOUD_CELL_EDGE_RANGE, CLOUD_CELL_PERIOD, CLOUD_DETAIL_GRAD_K, CLOUD_DETAIL_PERIOD, CLOUD_NOISE_STD, cloudDetailVolume, sampleCloudNoise,
@@ -33,32 +36,49 @@ export const WARP_AMP = 0.05;
 export const SHAPE_SCALE = 1.6;
 /** Detail amplitude relative to the synoptic shape (scaled per regime and near cloud edges). */
 export const DETAIL_AMP = 0.78;
-/** Warp of the first detail fetch by the shape fetch's GBA channels (tile units per σ). */
-export const DETAIL_WARP = 0.05;
-/** Optical depth per σ of noise excess above the coverage threshold. */
-export const TAU_PER_SIGMA = 0.85;
+/**
+ * Warp of the first detail fetch by the shape fetch's GBA channels (tile units per σ). Kept small:
+ * its strain (~7 σ per unit of domain × warp) stretches the detail into smeared strokes.
+ */
+export const DETAIL_WARP = 0.02;
+/** Optical depth per σ² of noise excess above the coverage threshold (super-linear core growth, see opticalDepth). */
+export const TAU_PER_SIGMA = 0.8;
 /** Log-normal optical-depth variability per σ of detail noise (mottled mid-thick cloud). */
-export const TAU_TEXTURE = 0.55;
+export const TAU_TEXTURE = 1.0;
 /** Opacity of the thickest cloud (a little ground always shows through). */
 export const ALPHA_MAX = 0.95;
 /** Optical depth reached right past the cloud edge (crisp outlines instead of fuzzy blobs). */
-export const EDGE_TAU = 0.3;
+export const EDGE_TAU = 0.7;
+/**
+ * Contrast of the storms' coverage bias (× the comma template): clear dry slots and a broken cold
+ * sector against the bright frontal band and head, so the comma reads even in overcast storm tracks.
+ */
+export const CYCLONE_BIAS_GAIN = 1.35;
 /** Fraction of the cyclone swirl applied to the noise domain (the rest only bends the template). */
 export const NOISE_SWIRL = 0.4;
+/**
+ * Fraction of that swirl the mesoscale detail follows (the synoptic shape takes all of it): the
+ * comma's bands wind up, while the cumulus and cells inside keep their own shapes instead of being
+ * drawn out into brush strokes around the low. Cirrus fibres take none (swirled fibres fanned out
+ * into straight "light beams" around storms).
+ */
+export const DETAIL_SWIRL = 0.3;
 /** Noise-domain compression along the polar axis for the synoptic shape (zonally elongated weather). */
-export const ANISO = 1.8;
+export const ANISO = 1.6;
 /**
  * Detail octaves (detail volume, CLOUD_DETAIL_PERIOD lattice cells per tile): tiles per unit of the
  * noise domain, ratio 2.6 (lattice cells ≈ 0.020, 0.0077, 0.0030, 0.0011 rad ≈ 130, 49, 19, 7 km).
- * Each fades in with zoom between 1.25 and 2.25 px per cell: at the default globe zoom the first two
- * are resolved (the third on a high-DPI screen), all four in close-ups.
+ * Each fades in with zoom between 0.75 and 1.4 px per cell: at the default globe zoom the first two
+ * are resolved and the third mostly (pixel-scale speckle of cumulus fields), all four in close-ups.
  */
 export const DETAIL_SCALES = [3.1, 3.1 * 2.6, 3.1 * 2.6 ** 2, 3.1 * 2.6 ** 3];
 /**
- * Octave band-limiting: an octave fades in between OCTAVE_FADE_PX[0] and [1] pixels per lattice cell
- * (below ~1.25 px it would alias, and would still cost a full-rate fetch per flow phase).
+ * Octave band-limiting: an octave fades in between OCTAVE_FADE_PX[0] and [1] pixels per lattice cell.
+ * The B-spline noise keeps little energy below ~2.5 cells per wavelength and the fetch LOD filters
+ * the rest, so an octave is safe from ~0.75 px per cell (below it would alias, and would still cost
+ * a full-rate fetch per flow phase).
  */
-export const OCTAVE_FADE_PX = [1.25, 2.25];
+export const OCTAVE_FADE_PX = [0.75, 1.4];
 
 /** Footprint fade (0..1) of detail octave k for a pixel footprint of `px` radians. Mirrored in GLSL. */
 export function octaveFade(px: number, k: number): number {
@@ -73,8 +93,12 @@ export const DETAIL_NORM = 1 / Math.sqrt(1 + DETAIL_GAIN ** 2 + DETAIL_GAIN ** 4
 /** Detail amplitude inside cloud (fraction of DETAIL_AMP) and its extra near the threshold. */
 export const DETAIL_FLOOR = 0.45;
 export const DETAIL_EDGE_BOOST = 1.0;
-/** Warp of each finer detail octave by the previous one's gradient (lattice cells per σ/cell). */
-export const DETAIL_GRAD_WARP = 0.2;
+/**
+ * Warp of each finer detail octave by the previous one's gradient (lattice cells per σ/cell). Small:
+ * at 0.2 its strain (~0.2 × the coarser octave's curvature, ≈ 50 %) drew every octave into swirled,
+ * painterly strokes; a little still breaks the lattice alignment between octaves.
+ */
+export const DETAIL_GRAD_WARP = 0.06;
 /** Zonal stretch of the detail (1: isotropic; streaks only in cirrus). */
 export const DETAIL_ANISO = 1.0;
 /**
@@ -84,12 +108,28 @@ export const DETAIL_ANISO = 1.0;
 export const BILLOW_EPS = 0.3;
 export const BILLOW_MEAN = 0.8869;
 export const BILLOW_INV_SD = 1 / 0.5508;
-/** Cirrus: zonal stretch (fibres), detail-volume tiles per unit, and peak opacity of the veil. */
-export const CIRRUS_ANISO = 3;
-export const CIRRUS_SCALE = 1.6;
+/**
+ * Cirrus: zonal stretch (fibres ≈ 4× longer than wide: ~0.03 × 0.007 rad), detail-volume tiles per
+ * unit, and peak opacity of the veil.
+ */
+export const CIRRUS_ANISO = 4;
+export const CIRRUS_SCALE = 2.2;
 export const CIRRUS_TAU = 0.3;
-/** Cirrus fibre warp by the shape fetch's GBA channels (tile units per σ). */
-export const CIRRUS_WARP = 0.2;
+/**
+ * Cirrus fibre warp by the shape fetch's GBA channels (tile units per σ): gently curved fibres. At 0.2
+ * the warp's strain (~0.9) turned fibres every which way (straight beams in random directions).
+ */
+export const CIRRUS_WARP = 0.06;
+/** Mean strand weight (E[smoothstep(0.2, 1.3, n)] for n ~ N(0,1)): the veil where the fibres are sub-pixel. */
+export const CIRRUS_STRAND_MEAN = 0.235;
+/**
+ * Anvils: a smooth translucent sheet spreading ANVIL_SPREAD σ (of the synoptic noise) beyond the
+ * deep-convective cores, with soft edges and peak opacity ANVIL_TAU.
+ */
+export const ANVIL_SPREAD = 0.55;
+export const ANVIL_TAU = 0.92;
+/** Width (σ of the synoptic noise) of the anvils' soft outer edge (~10 px at the default zoom). */
+export const ANVIL_SOFT = 0.25;
 /**
  * Mesoscale cellular convection (cell volume, CLOUD_CELL_PERIOD cells per tile): tiles per unit
  * (cells ≈ 0.0072 rad ≈ 46 km: closed stratocumulus cells, open cells), the warp of the cell lattice
@@ -97,6 +137,11 @@ export const CIRRUS_WARP = 0.2;
  */
 export const CELL_SCALE = 17.3;
 export const CELL_WARP = 0.1;
+/**
+ * Warp of the cell lattice by the second detail octave's gradient (tile units per σ/cell, ≈ 0.25 cell
+ * per σ): wobbly, organic cell walls instead of straight Voronoi polygons (a chicken-wire net).
+ */
+export const CELL_DETAIL_WARP = 0.03;
 export const CELL_FADE_PX = [2.0, 4.0];
 /** Open cells are about twice as large as closed ones (scale factor on CELL_SCALE). */
 export const OPEN_CELL_SCALE = 0.5;
@@ -236,7 +281,7 @@ export function cycloneEffect(
     // Sample the template at the un-swirled position (rotate by −θ).
     const xs = cs * x + sn * y, ys = -sn * x + cs * y;
     const env = 1 - smoothstep(1.9, 2.6, r);
-    bias += inten * env * cycloneTemplate(xs, ys, scratchAux);
+    bias += CYCLONE_BIAS_GAIN * inten * env * cycloneTemplate(xs, ys, scratchAux);
     ci += inten * env * scratchAux[0];
     op += inten * env * scratchAux[1];
     if (swirl) {
@@ -299,9 +344,12 @@ const OFFS = [OFF_D, OFF_E, OFF_F, OFF_G];
 /**
  * Raw detail octaves n1..n4 (σ units, unshaped) at a shapeStage point → out[0..octaves−1]: fetches
  * rotated, 2.6× finer and warped by the previous one's gradient. Mirrors phaseDetail()'s fetches.
+ * `grad2` (optional, ≥ 2 octaves) receives the second octave's gradient (σ per lattice cell, detail
+ * domain): the cell lattice's warp (cellStage).
  */
 export function detailOctaves(
   dvol: CloudNoiseVolume, st: Float64Array, tmp: Float32Array, out: Float64Array | Float32Array, octaves = 3,
+  grad2: Float64Array | null = null,
 ): void {
   let ax = st[0], ay = st[1], az = st[2] * DANISO_Z;
   let gx = st[4], gy = st[5], gz = st[6];
@@ -315,6 +363,11 @@ export function detailOctaves(
     const s = DETAIL_SCALES[k], o = OFFS[k];
     sampleCloudNoise(dvol, ax * s + gx + o[0], ay * s + gy + o[1], az * s + gz + o[2], tmp);
     out[k] = (tmp[0] - 0.5) * INV_STD;
+    if (k === 1 && grad2) {
+      grad2[0] = (tmp[1] - 0.5) / CLOUD_DETAIL_GRAD_K;
+      grad2[1] = (tmp[2] - 0.5) / CLOUD_DETAIL_GRAD_K;
+      grad2[2] = (tmp[3] - 0.5) / CLOUD_DETAIL_GRAD_K;
+    }
     gx = (tmp[1] - 0.5) * GRAD_WARP;
     gy = (tmp[2] - 0.5) * GRAD_WARP;
     gz = (tmp[3] - 0.5) * GRAD_WARP;
@@ -337,17 +390,26 @@ export function cirrusFibre(dvol: CloudNoiseVolume, st: Float64Array, tmp: Float
 
 /**
  * Cell-volume sample at a shapeStage point → out: [edge (distance to the cell border, cell units),
- * id (0..1 per cell)]. Mirrors the shader's cell fetch (without the flow map).
+ * id (0..1 per cell), centre distance F1 (cell units)]. `g2` (optional): the second detail octave's
+ * gradient (detailOctaves' grad2), which wobbles the cell walls. Mirrors the shader's cell fetch
+ * (without the flow map).
  */
-export function cellStage(cvol: CloudNoiseVolume, st: Float64Array, tmp: Float32Array, out: Float64Array | number[], scale = CELL_SCALE): void {
+export function cellStage(
+  cvol: CloudNoiseVolume, st: Float64Array, tmp: Float32Array, out: Float64Array | number[], scale = CELL_SCALE,
+  g2: ArrayLike<number> | null = null,
+): void {
   const ax = st[0], ay = st[1], az = st[2] * DANISO_Z;
   const bx = ROT[0] * ax + ROT[3] * ay + ROT[6] * az;
   const by = ROT[1] * ax + ROT[4] * ay + ROT[7] * az;
   const bz = ROT[2] * ax + ROT[5] * ay + ROT[8] * az;
   const k = CELL_WARP / DETAIL_WARP; // st[4..6] carry the shape GBA × INV_STD·DETAIL_WARP
-  sampleCloudNoise(cvol, bx * scale + st[4] * k + OFF_H[0], by * scale + st[5] * k + OFF_H[1], bz * scale + st[6] * k + OFF_H[2], tmp);
+  const wx = g2 ? g2[0] * CELL_DETAIL_WARP : 0, wy = g2 ? g2[1] * CELL_DETAIL_WARP : 0, wz = g2 ? g2[2] * CELL_DETAIL_WARP : 0;
+  sampleCloudNoise(
+    cvol, bx * scale + st[4] * k + wx + OFF_H[0], by * scale + st[5] * k + wy + OFF_H[1], bz * scale + st[6] * k + wz + OFF_H[2], tmp,
+  );
   out[0] = tmp[0] * CLOUD_CELL_EDGE_RANGE;
   out[1] = tmp[2];
+  if (out.length > 2) out[2] = tmp[1] * 1.2;
 }
 
 /** Footprint fade of cells at `scale` (tiles per unit) for a pixel footprint of `px` radians. Mirrored in GLSL. */
@@ -356,11 +418,12 @@ export function cellFade(px: number, scale = CELL_SCALE): number {
 }
 
 /**
- * Closed stratocumulus cells: optical-depth factor (dark borders, per-cell brightness variation),
- * weighted by the stratocumulus regime `sc` and the footprint fade. Mirrored in GLSL.
+ * Closed stratocumulus cells: optical-depth factor (thin, darker walls; domed, brighter centres, f1 =
+ * distance to the cell centre in cell units; per-cell brightness variation), weighted by the
+ * stratocumulus regime `sc` and the footprint fade. Mirrored in GLSL.
  */
-export function closedCells(edge: number, id: number, sc: number, fade: number): number {
-  const cell = (0.55 + 0.45 * smoothstep(0.02, 0.32, edge)) * (0.82 + 0.36 * id);
+export function closedCells(edge: number, id: number, sc: number, fade: number, f1 = 0.3): number {
+  const cell = (0.72 + 0.28 * smoothstep(0.0, 0.25, edge)) * (0.85 + 0.3 * id) * (1.1 - 0.4 * Math.min(1, f1 * f1));
   return 1 + sc * fade * (cell - 1);
 }
 
@@ -382,14 +445,22 @@ export interface DetailShaping {
   bc: number;
   lf: number;
   bf: number;
-  /** Octave amplitude ratio. */
+  /** Amplitude ratio between the finer octaves (2 → 3 → 4). */
   gain: number;
   /** Detail amplitude factor. */
   amp: number;
+  /**
+   * Weight of the coarse (first, ~130 km) octave relative to the second: 1 in frontal / convective
+   * cloud (red spectrum: clumps), low in cumulus fields and stratocumulus decks (the texture lives at
+   * the finest resolved scales: speckle, cells).
+   */
+  coarse: number;
+  /** Detail amplitude floor inside the cloud (fraction of DETAIL_AMP; see combineNoise). */
+  floor: number;
 }
 
 export function newDetailShaping(): DetailShaping {
-  return { lc: 1, bc: 0, lf: 1, bf: 0, gain: DETAIL_GAIN, amp: 1 };
+  return { lc: 1, bc: 0, lf: 1, bf: 0, gain: DETAIL_GAIN, amp: 1, coarse: 1, floor: DETAIL_FLOOR };
 }
 
 /** Linear and billow weights for shaping parameter beta (−1 ridges … 0 plain … +1 billows). */
@@ -409,15 +480,18 @@ const clamp1 = (x: number): number => Math.min(1, Math.max(-1, x));
 
 /**
  * Texture parameters per regime (mirror detailParams() in GLSL): billows for convection, cumulus and
- * closed stratocumulus cells, ridges for open cells; clumpy (low gain) convection, speckled cumulus
- * and finely cellular stratocumulus (high gain); `vary` (≈ N(0,1), the shape fetch's A channel)
- * mixes smooth sheets and broken fields.
+ * closed stratocumulus cells, ridges for open cells; clumpy (low gain, full coarse octave) convection,
+ * speckled cumulus fields (high gain, weak coarse octave, strong detail throughout: fields of small
+ * clouds rather than blobs with fringes) and finely cellular, otherwise uniform stratocumulus decks;
+ * `vary` (≈ N(0,1), the shape fetch's A channel) mixes smooth sheets and broken fields.
  */
 export function detailParams(sc: number, cv: number, cu: number, open: number, vary: number, out: DetailShaping): DetailShaping {
   shaping(clamp1(0.05 + 0.6 * cv + 0.45 * cu + 0.15 * sc - 0.5 * open), out, false);
   shaping(clamp1(0.15 + 0.35 * cv + 0.65 * cu + 0.85 * sc - 1.6 * open), out, true);
-  out.gain = Math.min(0.8, Math.max(0.4, 0.55 - 0.12 * cv + 0.17 * cu + 0.2 * sc + 0.15 * open + 0.06 * vary));
-  out.amp = (1 - 0.1 * cv + 0.3 * cu - 0.2 * sc) * Math.min(1.5, Math.max(0.55, 1 + 0.3 * vary));
+  out.gain = Math.min(1, Math.max(0.4, 0.62 - 0.15 * cv + 0.4 * cu + 0.3 * sc + 0.2 * open + 0.06 * vary));
+  out.amp = (1 - 0.1 * cv + 0.8 * cu + 0.4 * open - 0.2 * sc) * Math.min(1.5, Math.max(0.55, 1 + 0.3 * vary));
+  out.coarse = Math.min(1, Math.max(0.3, 1 - 0.65 * cu - 0.3 * open - 0.55 * sc));
+  out.floor = DETAIL_FLOOR + 0.55 * Math.min(1, cu + open);
   return out;
 }
 
@@ -426,32 +500,53 @@ export function shapeOctave(n: number, lin: number, bil: number): number {
   return lin * n + bil * (Math.sqrt(n * n + BILLOW_EPS * BILLOW_EPS) - BILLOW_MEAN);
 }
 
+/** 1/√(Σ a_k²) for octave amplitudes [coarse, g, g², g³]. */
+function detailNorm(coarse: number, g: number): number {
+  const g2 = g * g;
+  return 1 / Math.sqrt(coarse * coarse + g2 * (1 + g2 * (1 + g2)));
+}
+
 /**
- * Detail noise nd ≈ N(0,1) from raw octaves (detailOctaves), shaped per regime, with per-octave
- * footprint fades (1 = resolved; null: all resolved). Mirrors the sum in phaseDetail().
+ * Detail noise nd ≈ N(0,1) from raw octaves (detailOctaves), shaped per regime, octave amplitudes
+ * [coarse, g, g², g³], with per-octave footprint fades (1 = resolved; null: all resolved). Mirrors the
+ * sum in phaseDetail().
  */
 export function detailSum(oct: ArrayLike<number>, octaves: number, sh: DetailShaping, fade: ArrayLike<number> | null = null): number {
   const g = sh.gain;
-  let d = 0, a = 1;
+  let d = 0, a = sh.coarse;
   for (let k = 0; k < octaves; k++) {
     const f = fade ? fade[k] : 1;
     const v = k < 2 ? shapeOctave(oct[k], sh.lc, sh.bc) : shapeOctave(oct[k], sh.lf, sh.bf);
     d += a * f * v;
-    a *= g;
+    a = k === 0 ? g : a * g;
   }
-  const g2 = g * g;
-  return d / Math.sqrt(1 + g2 * (1 + g2 * (1 + g2)));
+  return d * detailNorm(sh.coarse, g);
 }
 
-/** Unshaped detail sum (same octaves and gain as detailSum): drives the optical-depth texture. */
-export function detailPlain(oct: ArrayLike<number>, octaves: number, gain: number, fade: ArrayLike<number> | null = null): number {
-  let d = 0, a = 1;
+/** Unshaped detail sum (same octaves and amplitudes as detailSum; `coarse` = 1: a geometric fbm). */
+export function detailPlain(oct: ArrayLike<number>, octaves: number, gain: number, fade: ArrayLike<number> | null = null, coarse = 1): number {
+  let d = 0, a = coarse;
   for (let k = 0; k < octaves; k++) {
     d += a * (fade ? fade[k] : 1) * oct[k];
+    a = k === 0 ? gain : a * gain;
+  }
+  return d * detailNorm(coarse, gain);
+}
+
+/**
+ * Optical-depth texture noise (≈ N(0,1) when resolved): mostly the finer octaves (2–4, amplitude
+ * ratio `gain`), little of the coarse one. Brightness mottling at the finest resolved scales, as in
+ * satellite imagery; the coarse octave's ~130 km light and shade read as brush strokes. Mirrored in
+ * GLSL.
+ */
+export function detailTexture(oct: ArrayLike<number>, octaves: number, gain: number, fade: ArrayLike<number> | null = null): number {
+  let fine = 0, a = 1;
+  for (let k = 1; k < octaves; k++) {
+    fine += a * (fade ? fade[k] : 1) * oct[k];
     a *= gain;
   }
   const g2 = gain * gain;
-  return d / Math.sqrt(1 + g2 * (1 + g2 * (1 + g2)));
+  return 0.35 * (fade ? fade[0] : 1) * oct[0] + (0.94 * fine) / Math.sqrt(1 + g2 * (1 + g2));
 }
 
 const plainShaping = newDetailShaping();
@@ -499,8 +594,11 @@ export function noiseDrift(k: number, out: number[] = [0, 0, 0]): number[] {
 const DRIFT0 = noiseDrift(-0.5);
 
 const scratchCyc = new Float64Array(6);
-const scratchCell = new Float64Array(2);
+const scratchCell = new Float64Array(3);
 const scratchSh = newDetailShaping();
+const scratchStD = new Float64Array(SHAPE_STAGE_SIZE);
+const scratchStC = new Float64Array(SHAPE_STAGE_SIZE);
+const scratchG2 = new Float64Array(3);
 
 /**
  * Evaluates the cloud field at unit vector (px, py, pz) (SPEC axes: z north) with latitude `lat`
@@ -543,33 +641,68 @@ export function cloudAt(
   }
   const dvol = inp.dvol ?? cloudDetailVolume();
   const st = shapeStage(inp.vol, qx, qy, qz, tmp, scratchStage);
+  // The detail follows only DETAIL_SWIRL of the storms' swirl, the cirrus fibres none of it (as the
+  // shader): undo the rest in the warped coordinates.
+  const stD = unswirl(st, qx - px, qy - py, qz - pz, 1 - DETAIL_SWIRL, scratchStD);
+  const stC = unswirl(st, qx - px, qy - py, qz - pz, 1, scratchStC);
   const nb = st[3];
   const zthr = coverageThreshold(f) - bias;
-  let tau = 0, lowEx = nb - zthr;
+  let tau = 0, lowEx = nb - zthr, n1 = 0, ndt = 0;
   if (nb > zthr - 2.8) {
     const sh = detailParams(sc, cv, cu, open, st[8], scratchSh);
-    detailOctaves(dvol, st, tmp, scratchOct, octaves);
+    detailOctaves(dvol, stD, tmp, scratchOct, octaves, scratchG2);
+    n1 = scratchOct[0];
+    ndt = detailTexture(scratchOct, octaves, sh.gain);
     const nd = detailSum(scratchOct, octaves, sh);
-    let ex = combineNoise(nb, nd, zthr, sc, cv, cu, sh.amp, bias) - zthr;
+    let ex = combineNoise(nb, nd, zthr, sc, cv, cu, sh.amp, bias, sh.floor) - zthr;
     let cellTau = 1;
+    const g2 = octaves >= 2 ? scratchG2 : null;
     if (inp.cvol && sc > 0.02 && ex > -1.5) {
-      cellStage(inp.cvol, st, tmp, scratchCell);
-      cellTau = closedCells(scratchCell[0], scratchCell[1], sc, inp.px ? cellFade(inp.px) : 1);
+      cellStage(inp.cvol, stD, tmp, scratchCell, CELL_SCALE, g2);
+      cellTau = closedCells(scratchCell[0], scratchCell[1], sc, inp.px ? cellFade(inp.px) : 1, scratchCell[2]);
     }
     if (inp.cvol && open > 0.02 && ex > -1.5) {
-      cellStage(inp.cvol, st, tmp, scratchCell, CELL_SCALE * OPEN_CELL_SCALE);
+      cellStage(inp.cvol, stD, tmp, scratchCell, CELL_SCALE * OPEN_CELL_SCALE, g2);
       ex += openCells(scratchCell[0], open, inp.px ? cellFade(inp.px, CELL_SCALE * OPEN_CELL_SCALE) : 1, 0, nd);
     }
     lowEx = ex;
-    tau = opticalDepth(ex, sc, cv, cu, Math.abs(lat), cellularTexture(detailPlain(scratchOct, octaves, sh.gain), nd, sc, open), bias, cellTau);
+    tau = opticalDepth(ex, sc, cv, cu, Math.abs(lat), cellularTexture(ndt, nd, sc, open), bias, cellTau);
   }
-  const low = ALPHA_MAX * (1 - Math.exp(-tau));
-  // Not over optically thick low cloud (as the shader: invisible there).
-  const ci = aux && lowEx < 1.6 ? cirrusAlpha(cirrus, st[7], cirrusFibre(dvol, st, tmp)) * (1 - smoothstep(1.1, 1.6, lowEx)) : 0;
+  // Anvils spread under the convective cores' tops (the cores show through), cirrus veils over them
+  // (not over optically thick low cloud, as the shader: invisible there).
+  const core = ALPHA_MAX * (1 - Math.exp(-tau));
+  const anv = anvilAlpha(nb, zthr, cv, n1, ndt);
+  const low = core + anv * (1 - core);
+  const ci = aux && lowEx < 1.6 ? cirrusAlpha(cirrus, st[7], cirrusFibre(dvol, stC, tmp)) * (1 - smoothstep(1.1, 1.6, lowEx)) : 0;
   out.tau = tau;
   out.cirrus = ci;
   out.alpha = ci + low * (1 - ci);
   return out;
+}
+
+/**
+ * Shape-stage copy with a fraction `k` of the noise-domain swirl displacement (dx, dy, dz; unit-sphere
+ * units, before the anisotropy) removed from the warped coordinates.
+ */
+function unswirl(st: Float64Array, dx: number, dy: number, dz: number, k: number, out: Float64Array): Float64Array {
+  out.set(st);
+  out[0] -= k * dx;
+  out[1] -= k * dy;
+  out[2] -= k * dz * ANISO;
+  return out;
+}
+
+/**
+ * Anvil of deep convection: a smooth, bright sheet around the convective cores (under their tops),
+ * spreading ANVIL_SPREAD σ of the synoptic noise beyond their threshold with a soft (ANVIL_SOFT σ),
+ * slightly ragged outer edge, thickening toward the cores (peak ANVIL_TAU), weighted by the convective
+ * regime `cv`; the coarse detail octave `n1` lobes its outline, the fine texture `ndt` frays it.
+ * Mirrored in GLSL.
+ */
+export function anvilAlpha(nb: number, zthr: number, cv: number, n1: number, ndt = 0): number {
+  if (!(cv > 0.02)) return 0;
+  const x = nb - zthr + ANVIL_SPREAD + 0.5 * n1 + 0.3 * ndt;
+  return ANVIL_TAU * cv * smoothstep(0, ANVIL_SOFT, x) * (0.75 + 0.25 * smoothstep(ANVIL_SOFT, 4 * ANVIL_SOFT, x));
 }
 
 /**
@@ -599,28 +732,47 @@ export function coverageThreshold(f: number): number {
  * (detailParams), calmer in organized frontal cloud (strong positive cyclone `bias`); shallow-cumulus
  * regimes are biased clearer, stratocumulus and deep convection cloudier. Mirrored in GLSL.
  */
-export function combineNoise(nb: number, nd: number, zthr: number, sc: number, cv: number, cu: number, am = 1, bias = 0): number {
+export function combineNoise(
+  nb: number, nd: number, zthr: number, sc: number, cv: number, cu: number, am = 1, bias = 0, floor = DETAIL_FLOOR,
+): number {
   const x2 = 2 * (nb - zthr) * (nb - zthr);
   // exp(−x2) via its rational Taylor bound (the CPU raster calls this per pixel; within 1e-2).
   const edge = 1 / (1 + x2 * (1 + x2 * (0.5 + x2 * (1 / 6))));
-  const a = DETAIL_AMP * (DETAIL_FLOOR + DETAIL_EDGE_BOOST * edge) * am * (1 - 0.45 * organized(bias));
-  return (nb + a * nd) / Math.sqrt(1 + a * a) - 0.5 * cu + 0.15 * sc + 0.2 * cv;
+  const a = DETAIL_AMP * (floor + DETAIL_EDGE_BOOST * edge) * am * (1 - 0.45 * organized(bias));
+  return (nb + a * nd) / Math.sqrt(1 + a * a) + REGIME_OFFSET_CU * cu + REGIME_OFFSET_SC * sc + REGIME_OFFSET_CV * cv;
 }
 
 /**
- * Optical depth for a noise excess ex (σ units above the threshold; ≤ 0 → 0): a crisp edge step, then
- * growing super-linearly (thin veils, bright cores; more so in deep convection) with log-normal
- * texture from the unshaped detail noise nd (detailPlain: mottled cumulus / stratocumulus, gentle in
- * stratiform and frontal cloud) and the closed-cell factor `cells` (closedCells); thinner in marine
- * stratocumulus, shallow cumulus and polar regions. Mirrored in GLSL.
+ * Coverage offsets (σ) per regime: shallow cumulus clearer, stratocumulus cloudier; deep-convective
+ * cores a little rarer (their anvils fill in around them).
  */
-export function opticalDepth(ex: number, sc: number, cv: number, cu: number, absLat: number, nd: number, bias = 0, cells = 1): number {
+export const REGIME_OFFSET_CU = -0.2;
+export const REGIME_OFFSET_SC = 0.3;
+export const REGIME_OFFSET_CV = -0.8;
+
+/**
+ * Optical depth for a noise excess ex (σ units above the threshold; ≤ 0 → 0): a crisp edge step, a
+ * cloud body that thickens within ~TAU_BODY_EX σ of the edge (cloud masses are opaque right behind
+ * their outline instead of fading in over hundreds of km of grey haze), then a super-linear growth
+ * toward bright cores (more so in deep convection); log-normal texture from the fine detail noise nd
+ * (detailTexture: mottled cumulus / stratocumulus, gentle in stratiform and frontal cloud) and the
+ * closed-cell factor `cells` (closedCells); thinner in marine stratocumulus, shallow cumulus and polar
+ * regions. `edgeW`: the edge step's width in σ (about a pixel on the globe). Mirrored in GLSL.
+ */
+export function opticalDepth(
+  ex: number, sc: number, cv: number, cu: number, absLat: number, nd: number, bias = 0, cells = 1, edgeW = 0.12,
+): number {
   if (!(ex > 0)) return 0;
-  const texture = Math.exp(TAU_TEXTURE * (0.45 + 0.6 * cu + 0.5 * sc + 0.25 * cv) * (1 - 0.5 * organized(bias)) * nd);
-  const thick = (1 - 0.45 * smoothstep(1.05, 1.4, absLat)) * (1 - 0.4 * sc - 0.65 * cu + 0.35 * cv);
+  const texture = Math.exp(TAU_TEXTURE * (0.3 + 0.7 * cu + 0.45 * sc + 0.25 * cv) * (1 - 0.5 * organized(bias)) * nd);
+  const thick = (1 - 0.45 * smoothstep(1.05, 1.4, absLat)) * (1 - 0.25 * sc - 0.72 * cu + 0.35 * cv);
   const k = 0.6 + 0.3 * cv;
-  return (TAU_PER_SIGMA * ex * (1 - k + k * ex) * texture * cells + EDGE_TAU * smoothstep(0, 0.12, ex)) * thick;
+  const body = TAU_BODY * (1 - Math.exp(-ex / TAU_BODY_EX)) + TAU_PER_SIGMA * k * ex * ex;
+  return (body * texture * cells + EDGE_TAU * smoothstep(0, edgeW, ex)) * thick;
 }
+
+/** Optical depth of the cloud body (reached within a few TAU_BODY_EX σ of the edge). */
+export const TAU_BODY = 1.8;
+export const TAU_BODY_EX = 0.35;
 
 /**
  * Cirrus veil opacity (mirror of the shader): coverage fraction `cirrus`, patch noise cp (shape
@@ -631,10 +783,15 @@ export function cirrusAlpha(cirrus: number, cp: number, nc: number, fade = 1): n
   return cirrusAlphaThr(coverageThreshold(cirrus), cp, nc, fade);
 }
 
-/** cirrusAlpha for a precomputed coverage threshold (coverageThreshold of the cirrus fraction). */
+/**
+ * cirrusAlpha for a precomputed coverage threshold (coverageThreshold of the cirrus fraction): patches
+ * whose veil is striated into streaks by the stretched fibre noise (elongated bright strands; their
+ * mean where the fibres are sub-pixel). Its zero-crossing ridges would curl into smoke-like loops.
+ */
 export function cirrusAlphaThr(thr: number, cp: number, nc: number, fade = 1): number {
   const exP = 0.93 * cp - thr;
   if (exP <= -0.6) return 0;
   const n = nc * fade;
-  return CIRRUS_TAU * smoothstep(0.05, 1.2, exP + 0.2 * n) * (0.45 + 0.55 * smoothstep(-0.6, 1.4, n));
+  const strand = smoothstep(0.2, 1.3, nc);
+  return CIRRUS_TAU * smoothstep(0, 0.7, exP + 0.3 * n) * (0.15 + 0.85 * (CIRRUS_STRAND_MEAN + fade * (strand - CIRRUS_STRAND_MEAN)));
 }

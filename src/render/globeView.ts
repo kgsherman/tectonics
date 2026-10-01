@@ -391,6 +391,7 @@ export class GlobeView implements WorldView {
     this.renderer.setPixelRatio(dpr);
     this.renderer.setSize(w, h, false);
     this.sky.setDpr(dpr);
+    this.surface.setPixelRatio(dpr);
     this.markers.setDpr(dpr);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();

@@ -1,7 +1,7 @@
 /**
  * Earth validation metrics for a ClimateResult computed on buildEarthClimateInput (SPEC §6.4):
  * zonal-mean temperature vs observations, global precipitation, Köppen group areas over land vs
- * Beck et al. (2018) and reference-city hit rates.
+ * Beck et al. (2018), reference-city hit rates and seasonal sea-ice extent / area / edge latitude.
  */
 import {
   EARTH_GLOBAL_PRECIP_MM, EARTH_KOPPEN_GROUP_TARGETS, EARTH_ZONAL_MEAN_TEMP, REFERENCE_CITIES, type ReferenceCity,
@@ -46,6 +46,34 @@ export interface CityResult {
   precipAnnual: number;
 }
 
+/** Monthly sea-ice diagnostics of one hemisphere (ocean area = (1 − landFraction) × cell area). */
+export interface SeaIceMonth {
+  /** Extent: ocean area of cells with ice fraction ≥ 0.15 (million km²). */
+  extent: number;
+  /** Area: Σ ice fraction × ocean area (million km²). */
+  area: number;
+  /**
+   * Part of `extent` poleward of 74°S (Southern Hemisphere only, else 0): mostly the Ross / Ronne ice
+   * shelves, which the Earth input treats as ocean (NSIDC does not count them).
+   */
+  shelfExtent: number;
+  /**
+   * Mean latitude (°, signed) of the ice edge over the longitudes that have one: scanning each column
+   * equatorward from the pole over ocean cells, the edge lies between the last cell with ice ≥ 0.15
+   * and the first open one. NaN when no column has an edge.
+   */
+  edgeLat: number;
+}
+
+export interface SeaIceMetrics {
+  /** 12 months each. */
+  north: SeaIceMonth[];
+  south: SeaIceMonth[];
+}
+
+/** Approximate NSIDC 1981–2010 monthly-mean extents (million km²) for the report. */
+export const NSIDC_EXTENT = { northMar: 15.5, northSep: 6.4, southFeb: 3.0, southSep: 18.6 } as const;
+
 export interface EarthMetrics {
   zonal: ZonalBand[];
   /** RMSE of zonal-mean annual T over the 18 bands (°C), cos-latitude weighted. */
@@ -66,6 +94,8 @@ export interface EarthMetrics {
   cellCodeHitRate: number;
   /** Per observed group: [hits, total] (station elevation). */
   groupHitsByGroup: Record<Group, [number, number]>;
+  /** Seasonal sea ice per hemisphere (null when the result has no sea-ice field). */
+  seaIce: SeaIceMetrics | null;
   /** Weighted sum of normalized errors (lower is better); see scoreOf(). */
   score: number;
 }
@@ -111,6 +141,69 @@ export function koppenGroupAreas(c: ClimateResult): Record<Group, number> {
   }
   for (const g of GROUPS) acc[g] = total > 0 ? (100 * acc[g]) / total : 0;
   return acc;
+}
+
+const EARTH_RADIUS_KM = 6371;
+const ICE_EXTENT_MIN = 0.15;
+const SHELF_LAT = -74;
+
+/** Monthly sea-ice extent, area and mean edge latitude per hemisphere. */
+export function seaIceMetrics(c: ClimateResult): SeaIceMetrics | null {
+  const { w, h } = c;
+  const n = w * h;
+  if (!c.seaIce || c.seaIce.length < 12 * n) return null;
+  const DEG = Math.PI / 180;
+  // Cell area (million km²) per row.
+  const cellArea = new Float64Array(h);
+  for (let r = 0; r < h; r++) {
+    const top = (90 - (r * 180) / h) * DEG, bottom = (90 - ((r + 1) * 180) / h) * DEG;
+    cellArea[r] = (EARTH_RADIUS_KM ** 2 * ((2 * Math.PI) / w) * (Math.sin(top) - Math.sin(bottom))) / 1e6;
+  }
+  const oceanFrac = (i: number): number => (c.landFraction ? Math.max(0, 1 - c.landFraction[i]) : c.land[i] ? 0 : 1);
+  const isOcean = (i: number): boolean => (c.landFraction ? c.landFraction[i] < 0.5 : !c.land[i]);
+  const north: SeaIceMonth[] = [], south: SeaIceMonth[] = [];
+  for (let m = 0; m < 12; m++) {
+    const ice = c.seaIce.subarray(m * n, (m + 1) * n);
+    for (const nh of [true, false]) {
+      let extent = 0, area = 0, shelf = 0;
+      for (let r = 0; r < h; r++) {
+        const lat = rowLatDeg(h, r);
+        if (nh ? lat <= 0 : lat >= 0) continue;
+        for (let col = 0; col < w; col++) {
+          const i = r * w + col;
+          const a = cellArea[r] * oceanFrac(i);
+          if (a <= 0) continue;
+          const f = Math.min(1, Math.max(0, ice[i]));
+          area += f * a;
+          if (f >= ICE_EXTENT_MIN) {
+            extent += a;
+            if (lat < SHELF_LAT) shelf += a;
+          }
+        }
+      }
+      // Edge: per column, from the pole equatorward over ocean cells.
+      let edgeSum = 0, edges = 0;
+      for (let col = 0; col < w; col++) {
+        let lastIce = NaN;
+        for (let k = 0; k < h / 2; k++) {
+          const r = nh ? k : h - 1 - k;
+          const i = r * w + col;
+          if (!isOcean(i)) continue;
+          if (ice[i] >= ICE_EXTENT_MIN) {
+            lastIce = rowLatDeg(h, r);
+          } else {
+            if (Number.isFinite(lastIce)) {
+              edgeSum += (lastIce + rowLatDeg(h, r)) / 2;
+              edges++;
+            }
+            break;
+          }
+        }
+      }
+      (nh ? north : south).push({ extent, area, shelfExtent: nh ? 0 : shelf, edgeLat: edges > 0 ? edgeSum / edges : NaN });
+    }
+  }
+  return { north, south };
 }
 
 /** The city's own cell if land, else the nearest land cell among its 8 neighbours, else its own cell. */
@@ -226,6 +319,7 @@ export function computeEarthMetrics(c: ClimateResult, cities: readonly Reference
     cellGroupHitRate: rate((r) => r.cellGroupHit),
     cellCodeHitRate: rate((r) => r.cellCodeHit),
     groupHitsByGroup,
+    seaIce: seaIceMetrics(c),
     ...partial,
     score: scoreOf(partial),
   };
@@ -272,6 +366,21 @@ export function formatEarthReport(m: EarthMetrics): string {
         `${pad(Math.round(r.precipAnnual), 6)}  ${mark}${r.movedToLand ? ' (land nbr)' : ''}`,
     );
   }
+  if (m.seaIce) {
+    const { north, south } = m.seaIce;
+    const row = (label: string, s: SeaIceMonth, obs: number, shelf: boolean): string =>
+      `  ${padR(label, 8)} ${pad(f1(s.extent), 7)} ${pad(shelf ? f1(s.extent - s.shelfExtent) : '', 8)} ${pad(f1(s.area), 6)} ` +
+      `${pad(f1(s.edgeLat), 7)} ${pad(f1(obs), 6)}`;
+    L.push('');
+    L.push('Sea ice (million km²; extent = ocean area with ice ≥ 15%; edge = mean ice-edge latitude, °)');
+    L.push('  month     extent  ex.74°S   area    edge  NSIDC');
+    L.push(row('NH Mar', north[2], NSIDC_EXTENT.northMar, false));
+    L.push(row('NH Sep', north[8], NSIDC_EXTENT.northSep, false));
+    L.push(row('SH Feb', south[1], NSIDC_EXTENT.southFeb, true));
+    L.push(row('SH Sep', south[8], NSIDC_EXTENT.southSep, true));
+    L.push('  (ex.74°S: SH extent without ocean cells poleward of 74°S, mostly the Ross/Ronne ice shelves the');
+    L.push('   Earth input treats as ocean; NSIDC ≈ 1981–2010 monthly means)');
+  }
   L.push('');
   L.push(`Composite score (lower is better): ${m.score.toFixed(3)}`);
   return L.join('\n');
@@ -291,6 +400,7 @@ export function metricsToJson(m: EarthMetrics): Record<string, unknown> {
     cellGroupHitRate: m.cellGroupHitRate,
     cellCodeHitRate: m.cellCodeHitRate,
     groupHitsByGroup: m.groupHitsByGroup,
+    seaIce: m.seaIce,
     zonal: m.zonal,
     cities: m.cities.map((r) => ({
       name: r.city.name, lat: r.city.lat, lon: r.city.lon, stationElev: r.city.elev, observed: r.city.koppen,

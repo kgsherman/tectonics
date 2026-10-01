@@ -43,6 +43,9 @@ export interface RiverNetwork {
   lines: Array<{ xy: Float32Array; width: Float32Array }>;
 }
 
+/** Extra open-water evaporation (mm/yr per m of altitude above 1000 m): high-plateau lakes. */
+const LAKE_EVAP_ALT = 0.2;
+
 /** Discharge (km³/yr) above which a channel is drawn, for an output width. */
 export function riverThreshold(w: number): number {
   return 120 * Math.pow(2048 / w, 1.5);
@@ -91,9 +94,12 @@ function routingClimate(climate: ClimateResult | null, rw: number, rh: number, e
   const P = sampleField(c.precipAnnual, c.w, c.h, -1, lk, rw, rh);
   for (let i = 0; i < n; i++) {
     runoff[i] = R[i];
-    // Lapse the annual temperature to the cell, then a simple open-water evaporation proxy.
-    const t = T[i] - LAPSE_RATE * Math.max(0, elev[i] - sea);
-    const ev = Math.max(150, Math.min(2600, 380 + 62 * t));
+    // Lapse the annual temperature to the cell, then a simple open-water evaporation proxy; thin,
+    // dry air and strong sunshine on high plateaus evaporate far more than their temperature says
+    // (Tibetan lakes lose ~0.8–1 m/yr at an annual mean below 0 °C).
+    const alt = Math.max(0, elev[i] - sea);
+    const t = T[i] - LAPSE_RATE * alt;
+    const ev = Math.max(150, Math.min(2600, 380 + 62 * t)) + LAKE_EVAP_ALT * Math.max(0, alt - 1000);
     lakeEvap[i] = ev;
     arid[i] = 1 - smooth(0.25, 1.1, P[i] / ev);
   }
@@ -285,11 +291,16 @@ export function getRiverNetwork(heightKey: string, hf: HeightField, climate: Cli
 /** Upstream area (routing cells, log scale) where valley lines start / reach full strength. */
 const LINE_A0 = 6;
 const LINE_A1 = 60;
+/** Valley-line half width (routing cells) at the channel head and at full strength. */
+const LINE_R0 = 0.55;
+const LINE_R1 = 1.25;
 
 /**
  * Output-resolution valley-line field (0..255) from the drainage network: 0 on interfluves, rising
  * along every channel whose upstream area exceeds LINE_A0 routing cells (full at LINE_A1) — the
- * dendritic valley network of the actual height field, bilinearly upsampled (≈ 2–4 px wide lines).
+ * dendritic valley network of the actual height field. The channels are traced into polylines, the
+ * D8 staircase removed and corner-cut (as the drawn rivers), and rasterised with a soft profile
+ * (≈ 2–5 px wide at 2048): sinuous valleys at any angle, no axis-aligned runs of routing cells.
  * Cached with the network.
  */
 export function drainageLines(heightKey: string, hf: HeightField, climate: ClimateResult | null, opts: PaintOptions, cache: PaintCache): Uint8Array {
@@ -299,40 +310,93 @@ export function drainageLines(heightKey: string, hf: HeightField, climate: Clima
 
 function buildLines(net: RiverNetwork, w: number, h: number): Uint8Array {
   const d = net.drainage, f = net.f;
-  const dw = d.w, dh = d.h;
-  const cellV = new Float32Array(dw * dh);
+  const dw = d.w, n = dw * d.h;
+  const { recv, area, ocean } = d;
+  // Channel cells and their strength (log ramp of the upstream area).
+  const strength = new Float32Array(n);
   const l0 = Math.log(LINE_A0), inv = 1 / (Math.log(LINE_A1) - l0);
-  for (let i = 0; i < cellV.length; i++) {
-    if (d.ocean[i]) continue;
-    const a = d.area[i];
+  for (let i = 0; i < n; i++) {
+    if (ocean[i]) continue;
+    const a = area[i];
     if (!(a > LINE_A0)) continue;
     let t = (Math.log(a) - l0) * inv;
     t = t > 1 ? 1 : t;
-    cellV[i] = t * t * (3 - 2 * t);
+    strength[i] = 0.05 + 0.95 * t * t * (3 - 2 * t);
+  }
+  const upstream = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const j = recv[i];
+    if (strength[i] > 0 && j >= 0 && strength[j] > 0 && upstream[j] < 255) upstream[j]++;
+  }
+  const acc = new Float32Array(w * h);
+  const visited = new Uint8Array(n);
+  const xs: number[] = [], ys: number[] = [], ts: number[] = [];
+  for (let s = 0; s < n; s++) {
+    if (strength[s] === 0 || upstream[s] !== 0) continue;
+    // Channel head: trace downstream to the sea, a lake-free sink or a junction already traced.
+    xs.length = 0; ys.length = 0; ts.length = 0;
+    let i = s, prevX = NaN;
+    for (let guard = 0; guard < n; guard++) {
+      const r = (i / dw) | 0, c = i - r * dw;
+      let x = (c + 0.5) * f;
+      if (prevX === prevX) {
+        while (x - prevX > w / 2) x -= w;
+        while (prevX - x > w / 2) x += w;
+      }
+      prevX = x;
+      xs.push(x);
+      ys.push((r + 0.5) * f);
+      ts.push(strength[i]);
+      if (strength[i] === 0 || visited[i]) break;
+      visited[i] = 1;
+      const j = recv[i];
+      if (j < 0) break;
+      i = j;
+    }
+    if (xs.length < 2) continue;
+    const keep = simplify(xs, ys, 0.6 * f);
+    const line = chaikin(keep.map((k) => xs[k]), keep.map((k) => ys[k]), keep.map((k) => ts[k]), 2);
+    rasterLine(acc, w, h, line.xy, line.width, f);
   }
   const out = new Uint8Array(w * h);
-  const cx0 = new Int32Array(w), cx1 = new Int32Array(w), cxt = new Float32Array(w);
-  for (let x = 0; x < w; x++) {
-    const u = (x + 0.5) / f - 0.5;
-    const u0 = Math.floor(u);
-    cx0[x] = ((u0 % dw) + dw) % dw;
-    cx1[x] = (cx0[x] + 1) % dw;
-    cxt[x] = u - u0;
-  }
-  for (let y = 0; y < h; y++) {
-    let v = (y + 0.5) / f - 0.5;
-    if (v < 0) v = 0;
-    else if (v > dh - 1) v = dh - 1;
-    const r0 = Math.min(dh - 1, Math.floor(v)), r1 = Math.min(dh - 1, r0 + 1), tv = v - r0;
-    const o0 = r0 * dw, o1 = r1 * dw;
-    for (let x = 0; x < w; x++) {
-      const a = cx0[x], b = cx1[x], tu = cxt[x];
-      const top = cellV[o0 + a] + (cellV[o0 + b] - cellV[o0 + a]) * tu;
-      const bot = cellV[o1 + a] + (cellV[o1 + b] - cellV[o1 + a]) * tu;
-      out[y * w + x] = ((top + (bot - top) * tv) * 255 + 0.5) | 0;
-    }
+  for (let p = 0; p < w * h; p++) {
+    const v = acc[p];
+    out[p] = v >= 1 ? 255 : (v * 255 + 0.5) | 0;
   }
   return out;
+}
+
+/**
+ * Max-combine a soft valley profile along a polyline (per-vertex strength t in `ts`): half width
+ * (LINE_R0 + (LINE_R1 − LINE_R0)·t)·f px, value t·(1 − smoothstep(dist / halfWidth)).
+ */
+function rasterLine(acc: Float32Array, w: number, h: number, xy: Float32Array, ts: Float32Array, f: number): void {
+  for (let k = 0; k + 1 < ts.length; k++) {
+    const x0 = xy[2 * k], y0 = xy[2 * k + 1], x1 = xy[2 * k + 2], y1 = xy[2 * k + 3];
+    const t0 = ts[k], t1 = ts[k + 1];
+    const R0 = (LINE_R0 + (LINE_R1 - LINE_R0) * t0) * f, R1 = (LINE_R0 + (LINE_R1 - LINE_R0) * t1) * f;
+    const hr = R0 > R1 ? R0 : R1;
+    const minX = Math.floor((x0 < x1 ? x0 : x1) - hr), maxX = Math.ceil((x0 > x1 ? x0 : x1) + hr);
+    const minY = Math.max(0, Math.floor((y0 < y1 ? y0 : y1) - hr)), maxY = Math.min(h - 1, Math.ceil((y0 > y1 ? y0 : y1) + hr));
+    const dx = x1 - x0, dy = y1 - y0;
+    const il2 = 1 / (dx * dx + dy * dy || 1e-9);
+    for (let y = minY; y <= maxY; y++) {
+      const py = y + 0.5;
+      for (let x = minX; x <= maxX; x++) {
+        const px = x + 0.5;
+        let t = ((px - x0) * dx + (py - y0) * dy) * il2;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const ex = px - (x0 + t * dx), ey = py - (y0 + t * dy);
+        const rad = R0 + (R1 - R0) * t;
+        const d2 = ex * ex + ey * ey;
+        if (d2 >= rad * rad) continue;
+        const u = Math.sqrt(d2) / rad;
+        const v = (t0 + (t1 - t0) * t) * (1 - u * u * (3 - 2 * u));
+        const p = y * w + (x >= 0 && x < w ? x : ((x % w) + w) % w);
+        if (v > acc[p]) acc[p] = v;
+      }
+    }
+  }
 }
 
 // Water colours (linear light).

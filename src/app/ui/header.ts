@@ -1,7 +1,7 @@
 /** Header: brand, tab bar, world/climate status chips and the running-task indicator. */
 import type { UiContext } from '../commands';
 import { fmtMyr, fmtPercent } from '../format';
-import { displayedTime, TABS, type AppState } from '../state';
+import { climateIsStale, displayedTime, TABS, type AppState } from '../state';
 import { shallowEqual } from '../store';
 import { h, setText, toggleClass } from './dom';
 
@@ -61,12 +61,17 @@ export function createHeader(ctx: UiContext): HTMLElement {
     if (c.phase === 'computing') return `Climate ${Math.round(c.progress * 100)}%`;
     if (c.phase === 'error') return 'Climate failed';
     if (c.phase === 'none') return 'No climate';
+    // Paused on a newer world than the climate (auto climate off): say so instead of "ready".
+    if (outdated(s)) return 'Climate outdated';
     return c.fast ? 'Climate (fast)' : 'Climate ready';
   };
+  const outdated = (s: AppState): boolean =>
+    s.runtime.climate.phase === 'ready' && !s.runtime.playing && s.runtime.viewingKeyframe === null && climateIsStale(s.runtime);
   store.watch((s) => `${s.runtime.climate.phase}|${climLabel(s)}`, () => {
-    const c = store.getState().runtime.climate;
+    const s = store.getState();
+    const c = s.runtime.climate;
     toggleClass(climDot, 'is-busy', c.phase === 'computing');
-    toggleClass(climDot, 'is-live', c.phase === 'ready');
+    toggleClass(climDot, 'is-live', c.phase === 'ready' && !outdated(s));
     toggleClass(climDot, 'is-error', c.phase === 'error');
     setText(climText, climLabel(store.getState()));
   }, { immediate: true });

@@ -321,7 +321,7 @@ export function buildCloudGrids(spec: CloudSpec): CloudGrids {
       const i = r * w + c;
       const x = cov[i] / COVER_REFERENCE_DENSITY;
       const f = regime[4 * i] / 255;
-      const ci = Math.min(1, 0.9 * conv[i] + jet * smoothstep(0.35, 0.8, x) * 0.35 + 0.08 * smoothstep(0.3, 0.7, x));
+      const ci = Math.min(1, 0.35 * conv[i] + jet * smoothstep(0.35, 0.8, x) * 0.35 + 0.03 * smoothstep(0.3, 0.7, x));
       const vv = V ? V[i] : 0;
       const eq = Number.isFinite(vv) ? -vv * hs : 0;
       const open = midLat * smoothstep(0.5, 3, eq) * smoothstep(0.15, 0.4, f) * (1 - smoothstep(0.75, 0.95, f)) * smoothstep(-0.5, 1.5, div[i] + 1);

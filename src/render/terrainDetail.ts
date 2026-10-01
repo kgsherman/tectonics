@@ -15,6 +15,13 @@
  *             coastline breakup — many small headlands, coves and skerries per unit of displaced
  *             area, rather than broad shifts of the simulated coast.
  *   CH_LITH   very-low-frequency fbm, ≈[-1, 1] (lithology / soil colour variation)
+ *   CH_VEG    two packed signed bytes (× VEG_Q, ≈ unit variance): the high byte is patch noise at
+ *             the rotated direction (see below) — the hill fbm's octaves re-weighted with a redder
+ *             spectrum, a band limit of a few texels and two domain-warped coarse octaves — whose
+ *             thresholds give organic patches with smooth, few-pixel-wide edges instead of
+ *             pixel-scale fragments; the low byte is the same re-weighting of CH_HILL's own (fine)
+ *             octaves at the texel's direction: a smooth proxy of the hill relief the height map
+ *             carries (terrain-following patches). sampleDetail() decodes them into two channels.
  */
 import { createNoise3 } from '../core/noise';
 import type { Noise3 } from '../core/noise';
@@ -28,16 +35,25 @@ export const CH_LITH = 3;
  * Texel layout: DETAIL_STRIDE Int16 values per texel, scaled by DETAIL_SCALE — the four channels
  * above at the texel's direction, then CH_RIDGE / CH_HILL / CH_COAST at the ROTATED direction
  * (x, y, z) → (y, z, x) (CH_RIDGE2 / CH_HILL2 / CH_COAST2): independent plate-frame noises for
- * colouring, read from the same texels (one bilinear footprint instead of two). The rotation maps
- * the equi-angular cube grid onto itself, so these channels are exact copies of other texels.
+ * colouring, read from the same texels (one bilinear footprint instead of two), and CH_VEG (also
+ * at the rotated direction). The rotation maps the equi-angular cube grid onto itself, so these
+ * channels are exact copies of other texels.
  */
 export const CH_RIDGE2 = 4;
 export const CH_HILL2 = 5;
 export const CH_COAST2 = 6;
+export const CH_VEG = 7;
+/** sampleDetail() output slot of CH_VEG's low byte (the smooth relief proxy). */
+export const CH_VREL = 8;
 export const DETAIL_STRIDE = 8;
+/** CH_VEG byte units per unit of noise. */
+export const VEG_Q = 40;
 /** Int16 → value scale of DetailTexture.data (range ±4). */
 export const DETAIL_SCALE = 1 / 8192;
 
+/** Standard deviation of one octave of the simplex noise (CH_VEG normalisation, empirical). */
+const VEG_NOISE_STD = 0.41;
+const VREL_NOISE_STD = 0.41;
 /** Fixed resolution of the coarse (low-octave) cube, per face edge. */
 const COARSE_N = 128;
 /** Octaves with frequency ≤ SPLIT_F (features/radian) live on the coarse cube. */
@@ -73,6 +89,20 @@ const WARP_AMP = [0.075, 0.03];
  */
 const FINE_WARP = 0.22;
 const RIDGE_FINE_WARP = 0.45;
+/**
+ * CH_VEG patch noise: amplitudes of the fine hill octaves (from the first above SPLIT_F), band
+ * limited at VEG_FMAX × the texel limit (≥ ~3 texels: patch edges stay smooth), and of the coarse
+ * octaves between VEG_COARSE_F0 and SPLIT_F, evaluated on the coarse cube with the full domain warp
+ * (swirled density modulation). Fine-heavy: at 2048 px most patches are 2–10 px across, clustered
+ * by the coarse octaves — a mottle at the native scale, organic blobs when magnified.
+ */
+const VEG_FINE_AMPS = [0.75, 0.85, 0.6, 0.35];
+const VEG_FMAX = 0.75;
+const VEG_COARSE_F0 = 5;
+const VEG_COARSE_AMPS = [0.3, 0.45];
+/** CH_VEG relief proxy: gain per fine octave (redder than FINE_GAIN) and band limit. */
+const VREL_GAIN = 0.55;
+const VREL_FMAX = 0.62;
 
 function amplitudeSum(o: OctaveSet, from: (f: number) => boolean): number {
   let s = 0;
@@ -110,8 +140,8 @@ const RIDGE_NORM = (() => {
 const LITH_NORM = amplitudeSum(LITH, () => true);
 
 // Coarse channels.
-const K_RSUM = 0, K_RW = 1, K_LITH = 2, K_WX = 3, K_WY = 4, K_WZ = 5;
-const COARSE_CH = 6;
+const K_RSUM = 0, K_RW = 1, K_LITH = 2, K_WX = 3, K_WY = 4, K_WZ = 5, K_VEG = 6;
+const COARSE_CH = 7;
 
 export interface DetailTexture {
   /** Texels per face edge (without the 1-texel border). */
@@ -250,6 +280,11 @@ function buildCoarse(nz: Noises): Float32Array {
         for (let o = 0, f = LITH.f0, a = 1; o < LITH.octaves; o++, f *= LACUNARITY, a *= LITH.gain) {
           lsum += a * nz.lith(x * f + o * 11.3, y * f + o * 3.1, z * f - o * 8.9);
         }
+        // Coarse CH_VEG octaves (same fbm, same per-octave offsets as the fine ones).
+        let vsum = 0;
+        for (let o = 0, f = FBM.f0, kc = 0; o < FBM.octaves && f <= SPLIT_F; o++, f *= LACUNARITY) {
+          if (f >= VEG_COARSE_F0) vsum += VEG_COARSE_AMPS[kc++] * nz.fbm(X * f + o * 17.13, Y * f - o * 9.71, Z * f + o * 5.37);
+        }
         const q = ((face * stride + j) * stride + i) * COARSE_CH;
         data[q + K_RSUM] = rsum;
         data[q + K_RW] = rw;
@@ -257,6 +292,7 @@ function buildCoarse(nz: Noises): Float32Array {
         data[q + K_WX] = wx;
         data[q + K_WY] = wy;
         data[q + K_WZ] = wz;
+        data[q + K_VEG] = vsum;
       }
     }
   }
@@ -301,17 +337,34 @@ export function buildDetailTexture(seed: number, n: number): DetailTexture {
     cf[i] = Math.min(1, Math.max(0, s - i0));
   }
   // Fine octave tables (frequency, amplitude × band-limit weight).
-  const fbmF: number[] = [], fbmA: number[] = [], fbmC: number[] = [], ridF: number[] = [], ridA: number[] = [], ridK: number[] = [];
+  const fbmF: number[] = [], fbmA: number[] = [], fbmC: number[] = [], fbmV: number[] = [], fbmR: number[] = [], ridF: number[] = [], ridA: number[] = [], ridK: number[] = [];
+  let vegNorm = 1, vrelNorm = 1;
   {
     let { k, f } = fineStart(FBM);
     let a = 1;
     let ac = 1;
-    for (; k < FBM.octaves; k++, f *= LACUNARITY, a *= FINE_GAIN, ac *= COAST_GAIN) {
+    let ar = 1, vVar = 0, rVar = 0;
+    for (const c of VEG_COARSE_AMPS) vVar += c * c;
+    for (let kv = 0; k < FBM.octaves; k++, kv++, f *= LACUNARITY, a *= FINE_GAIN, ac *= COAST_GAIN, ar *= VREL_GAIN) {
       const wh = hillOctaveWeight(f, fmax), w = octaveWeight(f, fmax);
       if (wh <= 0) break;
       fbmF.push(f);
       fbmA.push((wh * a) / FBM_HIGH_NORM);
       fbmC.push((w * ac) / COAST_NORM);
+      const wv = octaveWeight(f, VEG_FMAX * fmax) * (kv < VEG_FINE_AMPS.length ? VEG_FINE_AMPS[kv] : 0);
+      fbmV.push(wv);
+      vVar += wv * wv;
+      const wr = octaveWeight(f, VREL_FMAX * fmax) * ar;
+      fbmR.push(wr);
+      rVar += wr * wr;
+    }
+    // ≈ unit variance (simplex noise std ≈ VEG_NOISE_STD per octave).
+    vegNorm = 1 / (VEG_NOISE_STD * Math.sqrt(vVar || 1));
+    // The relief proxy has the fine octaves only: its own normalisation (applied at the store).
+    vrelNorm = 1 / (VREL_NOISE_STD * Math.sqrt(rVar || 1));
+    for (let m = 0; m < fbmV.length; m++) {
+      fbmV[m] *= vegNorm;
+      fbmR[m] *= vrelNorm;
     }
     ({ k, f, a } = fineStart(RIDGE));
     for (; k < RIDGE.octaves; k++, f *= LACUNARITY, a *= RIDGE_FINE_GAIN) {
@@ -323,6 +376,7 @@ export function buildDetailTexture(seed: number, n: number): DetailTexture {
     }
   }
   const fbmK0 = fineStart(FBM).k;
+  const vegHi = new Int8Array(6 * stride * stride), vegLo = new Int8Array(6 * stride * stride);
   const d = new Float64Array(3);
   const cs = new Float64Array(COARSE_CH);
   for (let face = 0; face < 6; face++) {
@@ -340,12 +394,14 @@ export function buildDetailTexture(seed: number, n: number): DetailTexture {
           cs[k] = w00 * coarse[q00 + k] + w01 * coarse[q01 + k] + w10 * coarse[q10 + k] + w11 * coarse[q11 + k];
         }
         const X = d[0] + FINE_WARP * cs[K_WX], Y = d[1] + FINE_WARP * cs[K_WY], Z = d[2] + FINE_WARP * cs[K_WZ];
-        let hsum = 0, csum = 0;
+        let hsum = 0, csum = 0, fsum = 0, rsum2 = 0;
         for (let m = 0; m < fbmF.length; m++) {
           const f = fbmF[m], o = fbmK0 + m;
           const v = nz.fbm(X * f + o * 17.13, Y * f - o * 9.71, Z * f + o * 5.37);
           hsum += fbmA[m] * v;
           csum += fbmC[m] * v;
+          fsum += fbmV[m] * v;
+          rsum2 += fbmR[m] * v;
         }
         const XR = d[0] + RIDGE_FINE_WARP * cs[K_WX], YR = d[1] + RIDGE_FINE_WARP * cs[K_WY], ZR = d[2] + RIDGE_FINE_WARP * cs[K_WZ];
         let rsum = cs[K_RSUM], rw = cs[K_RW];
@@ -368,12 +424,17 @@ export function buildDetailTexture(seed: number, n: number): DetailTexture {
         data[q + CH_HILL] = hsum * K;
         data[q + CH_COAST] = csum * K;
         data[q + CH_LITH] = cs[K_LITH] * K;
+        // Patch noise (unrotated: the rotation pass moves it to the high byte) and relief proxy.
+        const t = q >> 3;
+        vegHi[t] = quantVeg(cs[K_VEG] * vegNorm + fsum);
+        vegLo[t] = quantVeg(rsum2);
       }
     }
   }
   const ridgeMean = rs / (6 * stride * stride);
   // Rotated-direction channels: the direction (y, z, x) of texel (face, j, i) is texel
-  // (face + 4, j, i) for the x faces, (face − 2, i, j) for the y and z faces.
+  // (face + 4, j, i) for the x faces, (face − 2, i, j) for the y and z faces. CH_VEG is rotated
+  // through a copy (source and destination share the channel).
   for (let face = 0; face < 6; face++) {
     const rf = face < 2 ? face + 4 : face - 2;
     for (let j = 0; j < stride; j++) {
@@ -383,15 +444,24 @@ export function buildDetailTexture(seed: number, n: number): DetailTexture {
         data[o + CH_RIDGE2] = data[r + CH_RIDGE];
         data[o + CH_HILL2] = data[r + CH_HILL];
         data[o + CH_COAST2] = data[r + CH_COAST];
+        data[o + CH_VEG] = (vegHi[r >> 3] << 8) | (vegLo[o >> 3] & 0xff);
       }
     }
   }
   return { n, stride, data, fmax, ridgeMean, ridgeUp: rMax - ridgeMean, coastAbs: cAbs, hillAbs: hAbs, coastMeanAbs: cSum / (6 * stride * stride) };
 }
 
+/** Round a unit-variance noise value to a CH_VEG byte. */
+function quantVeg(v: number): number {
+  const x = v * VEG_Q;
+  return x >= 127 ? 127 : x <= -127 ? -127 : x < 0 ? -((0.5 - x) | 0) : (x + 0.5) | 0;
+}
+
 /**
  * Bilinear sample at unit direction (x, y, z) in the texture's frame; writes the first `channels`
- * texel channels (default DETAIL_CHANNELS; up to 7 with the rotated-direction ones) to out[o..].
+ * texel channels (default DETAIL_CHANNELS; up to 7 with the rotated-direction ones) to out[o..];
+ * channels = 8 also decodes CH_VEG into out[o + CH_VEG] (patch noise) and out[o + CH_VREL] (relief
+ * proxy), both in noise units (out needs 9 slots).
  * Hot path: no allocation.
  */
 export function sampleDetail(tex: DetailTexture, x: number, y: number, z: number, out: Float64Array, o: number, channels = DETAIL_CHANNELS): void {
@@ -426,7 +496,14 @@ export function sampleDetail(tex: DetailTexture, x: number, y: number, z: number
   const q10 = q00 + (stride << 3);
   const S = DETAIL_SCALE;
   const a = (1 - fu) * (1 - fv) * S, b = fu * (1 - fv) * S, c = (1 - fu) * fv * S, e = fu * fv * S;
-  for (let k = 0; k < channels; k++) {
+  const nc = channels > CH_VEG ? CH_VEG : channels;
+  for (let k = 0; k < nc; k++) {
     out[o + k] = a * d[q00 + k] + b * d[q00 + 8 + k] + c * d[q10 + k] + e * d[q10 + 8 + k];
+  }
+  if (channels > CH_VEG) {
+    const v00 = d[q00 + 7], v01 = d[q00 + 15], v10 = d[q10 + 7], v11 = d[q10 + 15];
+    const k = 1 / (S * VEG_Q);
+    out[o + CH_VEG] = (a * (v00 >> 8) + b * (v01 >> 8) + c * (v10 >> 8) + e * (v11 >> 8)) * k;
+    out[o + CH_VREL] = (a * ((v00 << 24) >> 24) + b * ((v01 << 24) >> 24) + c * ((v10 << 24) >> 24) + e * ((v11 << 24) >> 24)) * k;
   }
 }

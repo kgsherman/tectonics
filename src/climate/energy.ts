@@ -17,8 +17,9 @@
  *
  * Land snow and ice (energyStep.ts, energyIce.ts): a mass M per land cell gains Clausius–Clapeyron
  * scaled snowfall and loses melt (a snow or ice surface cannot warm above 0 °C; the surplus melts
- * it). Perennial mass is glacier: ice-sheet albedo, and once a year an ice-flow budget feeds each
- * sheet's ablation zone from its accumulation surplus and a plastic-ice profile raises its surface.
+ * it). Perennial mass is glacier: ice-sheet albedo, and once a year an ice-flow budget sets each
+ * sheet's margin where its accumulation surplus feeds its ablation zone (settled in the first years of
+ * the cold pass 1, then held) and a plastic-ice profile raises its surface.
  * Sea ice carries volume (−E) and area separately (Hibler 1979), with basal ocean heat.
  *
  * State per cell:
@@ -42,7 +43,7 @@ import type { ClimateParams } from '../core/types';
 import type { SLStencil } from './dynAdvect';
 import type { LatLonGrid } from './dynGrid';
 import { insolationTable } from './insolation';
-import { makeCyclicWork, type CyclicWork } from './numerics';
+import { makeCyclicWork, nearestValidIndex, type CyclicWork } from './numerics';
 import { overturningHeating } from './energyOverturning';
 import { ebmTuning } from './tuning';
 
@@ -61,6 +62,13 @@ export interface EbmModel {
   iceMask: Uint8Array;
   accY: Float64Array;
   ablY: Float64Array;
+  /**
+   * Melt the year's surface temperatures could still have done after the snow was gone (kg/m²):
+   * the ablation an ice surface would suffer on bare land (energyIce.ts ranks margin cells by it).
+   */
+  potY: Float64Array;
+  /** Distance of each land cell from the nearest ocean cell (km; π·R without ocean). */
+  coastKm: Float64Array;
   /** Smallest land snow/ice mass of the current year (kg/m²). */
   minY: Float64Array;
   iceYears: number;
@@ -304,6 +312,27 @@ export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Arr
   }
   const eFull = t.iceLatent * t.iceFullThickness;
   const eMax = t.iceLatent * t.iceMaxThickness;
+  // Distance of land cells from the ocean (great circle between cell centres, less half a cell).
+  const coastKm = new Float64Array(n);
+  const sea = new Uint8Array(n);
+  for (let i = 0; i < n; i++) sea[i] = land[i] ? 0 : 1;
+  const nearSea = nearestValidIndex(nx, ny, sea);
+  const R = 6371;
+  for (let j = 0; j < ny; j++) {
+    for (let c = 0; c < nx; c++) {
+      const i = j * nx + c;
+      if (!land[i]) continue;
+      const k = nearSea[i];
+      if (k < 0) {
+        coastKm[i] = Math.PI * R;
+        continue;
+      }
+      const j2 = (k / nx) | 0;
+      const c2 = k - j2 * nx;
+      const cosD = g.sinLat[j] * g.sinLat[j2] + g.cosLat[j] * g.cosLat[j2] * Math.cos(g.lon[c] - g.lon[c2]);
+      coastKm[i] = Math.max(0, R * Math.acos(Math.max(-1, Math.min(1, cosD))) - 0.5 * R * g.dLat);
+    }
+  }
   const m = Math.max(nx, ny);
   const work: EbmWork = {
     F: new Float64Array(n), dep: new Float64Array(n), To: new Float64Array(n), tAirMean: new Float64Array(n),
@@ -314,7 +343,7 @@ export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Arr
     cp: new Float64Array(m), cyc: makeCyclicWork(nx),
   };
   return {
-    g, land, lapse, bedHeight, iceRaise: new Float64Array(n), iceMask: new Uint8Array(n), accY: new Float64Array(n), ablY: new Float64Array(n), minY: new Float64Array(n), iceYears: 0, freeTrop, stepsPerMonth, stepsPerYear, dt: SECONDS_PER_YEAR / stepsPerYear,
+    g, land, lapse, bedHeight, iceRaise: new Float64Array(n), iceMask: new Uint8Array(n), accY: new Float64Array(n), ablY: new Float64Array(n), potY: new Float64Array(n), coastKm, minY: new Float64Array(n), iceYears: 0, freeTrop, stepsPerMonth, stepsPerYear, dt: SECONDS_PER_YEAR / stepsPerYear,
     insol: insolationTable(g, stepsPerYear, params.axialTilt, params.solarMultiplier),
     albLand, albWater, cOcean, kE, kN, kS, oE, oN, oS, overturning: scaleOverturning(overturningHeating(g, land), params.oceanCurrents), eFull, eMax, work,
   };

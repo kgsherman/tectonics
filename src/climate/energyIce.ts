@@ -32,7 +32,8 @@ export function iceSurfaceRaise(M: EbmModel, S: EbmState, out: Float64Array): Fl
   let anyIce = false;
   let anyOpen = false;
   for (let i = 0; i < n; i++) {
-    const ice = land[i] === 1 && glacierWeight(S.M[i]) >= 0.5;
+    // The glacier mask of the year (applyIceFlow), not the mass: deep seasonal snow is not a sheet.
+    const ice = land[i] === 1 && M.iceMask[i] === 1;
     open[i] = ice ? 0 : 1;
     if (ice) anyIce = true;
     else anyOpen = true;
@@ -44,7 +45,7 @@ export function iceSurfaceRaise(M: EbmModel, S: EbmState, out: Float64Array): Fl
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
       if (!land[i]) continue;
-      const G = glacierWeight(S.M[i]);
+      const G = open[i] ? 0 : glacierWeight(S.M[i]);
       if (G <= 0) continue;
       let dKm: number;
       if (!near || near[i] < 0) dKm = Math.PI * R;
@@ -81,63 +82,192 @@ export function applyIceSurface(M: EbmModel, S: EbmState): void {
 }
 
 /**
- * Ice flow, in its simplest budget form: an ice sheet's ablation zone is fed by flow from its
- * accumulation zone. For every connected glacier region of last year's mask the ablating cells get
- * their annual deficit (melt − snowfall) back, scaled by f = min(1, surplus / deficit) with the
- * surplus the region's area-integrated net accumulation. A sheet whose accumulation outweighs its
- * margin melt keeps its extent (ablation-area ratio set by its own climate); one whose margin melt
- * dominates shrinks, faster the smaller its accumulation area. Cells whose ice melted out during
- * the year are no longer part of the sheet. Resets the yearly accumulators.
+ * Ice flow and glacier margins, in budget form, once per model year from last year's accumulators.
+ *
+ * Every connected glacier region of last year's mask has a surplus (area-integrated net
+ * accumulation of its accumulation zone) and a deficit (net ablation of its ablation zone). Ice flow
+ * carries the surplus to the margin, so the margin settles where the two balance (the
+ * accumulation-area ratio of the sheet's own climate):
+ *  - deficit > surplus: the margin retreats — the most strongly ablating cells melt out, until the
+ *    remaining ablation zone is fed by the accumulation;
+ *  - surplus > deficit: the sheet advances onto adjacent bare land, best-placed cells first (least
+ *    melt left over once their seasonal snow is gone, `potY`), as far as the surplus can feed their
+ *    ablation;
+ *  - the ablation zone of a sheet in balance gets its annual loss back (flow from upstream).
+ * Cells whose ice melted out during the year have left their sheet. Bare land nucleates new ice
+ * where its snow survived the year with a positive balance. Conversions are immediate (a whole
+ * ice cap forms or disappears), so the margins converge within a few years; topology changes only
+ * at the first ebmTuning.glacierTopologyYears year boundaries of a run (inside the cold pass 1,
+ * identical for every schedule) and is held afterwards (mask kept, sheets nourished, bare land
+ * kept below glacier mass), which makes the glacier state independent of the run length and of
+ * warm starts.
+ * Resets the yearly accumulators.
  */
 export function applyIceFlow(M: EbmModel, S: EbmState): void {
-  const { g, land, iceMask, accY, ablY, minY } = M;
-  const { nx, ny, n } = g;
+  const { g, land, iceMask, accY, ablY, potY, minY } = M;
+  const { n } = g;
   const t = ebmTuning;
-  if (M.iceYears > 0) {
-    const region = new Int32Array(n).fill(-1);
-    const queue = new Int32Array(n);
-    for (let s0 = 0; s0 < n; s0++) {
-      if (!iceMask[s0] || region[s0] >= 0) continue;
-      // Flood the region (4-neighbourhood, longitude wraps).
-      let head = 0;
-      let tail = 0;
-      queue[tail++] = s0;
-      region[s0] = s0;
-      let surplus = 0;
-      let deficit = 0;
-      while (head < tail) {
-        const i = queue[head++];
-        const j = (i / nx) | 0;
-        const c = i - j * nx;
-        const b = (accY[i] - ablY[i]) * g.area[j];
-        if (b > 0) surplus += b;
-        else deficit -= b;
-        const nb0 = j * nx + (c === 0 ? nx - 1 : c - 1);
-        const nb1 = j * nx + (c === nx - 1 ? 0 : c + 1);
-        const nb2 = j > 0 ? i - nx : -1;
-        const nb3 = j < ny - 1 ? i + nx : -1;
-        for (const k of [nb0, nb1, nb2, nb3]) {
-          if (k >= 0 && iceMask[k] && region[k] < 0) {
-            region[k] = s0;
-            queue[tail++] = k;
-          }
-        }
-      }
-      if (!(deficit > 0)) continue;
-      const f = Math.min(1, surplus / deficit);
-      for (let q = 0; q < tail; q++) {
-        const i = queue[q];
-        const d = ablY[i] - accY[i];
-        // Cells whose ice melted out during the year left the sheet (no ice to flow into).
-        if (d > 0 && minY[i] > 0) S.M[i] = Math.min(t.glacierMassMax, S.M[i] + f * d);
-      }
-    }
-  }
+  // The mask is read from the mass only for the initial state; afterwards the topology update sets
+  // it from the sheets' budgets (a bare cell's deep winter snow at the year boundary is not glacier)
+  // and the held topology keeps it.
+  if (M.iceYears === 0) for (let i = 0; i < n; i++) iceMask[i] = land[i] === 1 && glacierWeight(S.M[i]) >= 0.5 ? 1 : 0;
+  else if (M.iceYears <= t.glacierTopologyYears) updateIceTopology(M, S);
+  else holdIceTopology(M, S);
   for (let i = 0; i < n; i++) {
-    iceMask[i] = land[i] === 1 && glacierWeight(S.M[i]) >= 0.5 ? 1 : 0;
     accY[i] = 0;
     ablY[i] = 0;
+    potY[i] = 0;
     minY[i] = S.M[i];
   }
   M.iceYears++;
+}
+
+/**
+ * Held topology (the mask itself is kept): sheets are nourished by flow from upstream, bare land
+ * keeps its snow below glacier mass (no perennial build-up that would depend on the run length).
+ */
+function holdIceTopology(M: EbmModel, S: EbmState): void {
+  const { land, iceMask } = M;
+  const t = ebmTuning;
+  for (let i = 0; i < M.g.n; i++) {
+    if (!land[i]) continue;
+    if (iceMask[i]) {
+      if (S.M[i] < t.glacierMassMax) S.M[i] = t.glacierMassMax;
+    } else if (S.M[i] > t.glacierMassLow) S.M[i] = t.glacierMassLow;
+  }
+}
+
+/** Neighbours (4-connected, longitude wraps) of cell i into out; returns the count. */
+function neighbours4(nx: number, ny: number, i: number, out: Int32Array): number {
+  const j = (i / nx) | 0;
+  const c = i - j * nx;
+  let k = 0;
+  out[k++] = j * nx + (c === 0 ? nx - 1 : c - 1);
+  out[k++] = j * nx + (c === nx - 1 ? 0 : c + 1);
+  if (j > 0) out[k++] = i - nx;
+  if (j < ny - 1) out[k++] = i + nx;
+  return k;
+}
+
+function updateIceTopology(M: EbmModel, S: EbmState): void {
+  const { g, land, iceMask, accY, ablY, potY, minY } = M;
+  const { nx, ny, n } = g;
+  const t = ebmTuning;
+  const mMax = t.glacierMassMax;
+  const mLow = t.glacierMassLow;
+  const area = (i: number): number => g.area[(i / nx) | 0];
+  // Annual balance including the melt left over on bare ground (kg/m²/yr).
+  const bal = new Float64Array(n);
+  for (let i = 0; i < n; i++) if (land[i]) bal[i] = accY[i] - ablY[i] - potY[i];
+  // 1 = ice, 0 = bare, −1 = melted out / removed this year (not re-added).
+  const state = new Int8Array(n);
+  for (let i = 0; i < n; i++) {
+    if (!iceMask[i]) continue;
+    if (minY[i] > 0) state[i] = 1;
+    else {
+      state[i] = -1;
+      if (S.M[i] > mLow) S.M[i] = mLow;
+    }
+  }
+  const region = new Int32Array(n).fill(-1);
+  const queue = new Int32Array(n);
+  const nb = new Int32Array(4);
+  // Max-heap of advance candidates (cell ids keyed by bal). Every push crosses a distinct ice–bare
+  // face (≤ 2n faces on the grid), so 2n entries can never overflow, duplicates included.
+  const heap = new Int32Array(2 * n);
+  let hn = 0;
+  const push = (i: number): void => {
+    let k = hn++;
+    while (k > 0) {
+      const p = (k - 1) >> 1;
+      if (bal[heap[p]] >= bal[i]) break;
+      heap[k] = heap[p];
+      k = p;
+    }
+    heap[k] = i;
+  };
+  const pop = (): number => {
+    const top = heap[0];
+    const last = heap[--hn];
+    let k = 0;
+    for (;;) {
+      let ch = 2 * k + 1;
+      if (ch >= hn) break;
+      if (ch + 1 < hn && bal[heap[ch + 1]] > bal[heap[ch]]) ch++;
+      if (bal[heap[ch]] <= bal[last]) break;
+      heap[k] = heap[ch];
+      k = ch;
+    }
+    heap[k] = last;
+    return top;
+  };
+  for (let s0 = 0; s0 < n; s0++) {
+    if (state[s0] !== 1 || region[s0] >= 0) continue;
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = s0;
+    region[s0] = s0;
+    let surplus = 0;
+    let deficit = 0;
+    while (head < tail) {
+      const i = queue[head++];
+      const b = bal[i] * area(i);
+      if (b > 0) surplus += b;
+      else deficit -= b;
+      const k = neighbours4(nx, ny, i, nb);
+      for (let q = 0; q < k; q++) {
+        const m = nb[q];
+        if (state[m] === 1 && region[m] < 0) {
+          region[m] = s0;
+          queue[tail++] = m;
+        }
+      }
+    }
+    const cells = Array.from(queue.subarray(0, tail));
+    if (deficit > surplus) {
+      // Retreat: the most strongly ablating cells melt out until the rest is fed.
+      cells.sort((a, b) => bal[a] - bal[b] || a - b);
+      for (const i of cells) {
+        if (!(deficit > surplus) || bal[i] >= 0) break;
+        deficit -= -bal[i] * area(i);
+        state[i] = -1;
+        if (S.M[i] > mLow) S.M[i] = mLow;
+      }
+    } else {
+      // Advance onto adjacent bare land while the surplus can feed the new ablation.
+      let budget = surplus - deficit;
+      hn = 0;
+      for (const i of cells) {
+        const k = neighbours4(nx, ny, i, nb);
+        for (let q = 0; q < k; q++) if (land[nb[q]] && state[nb[q]] === 0) push(nb[q]);
+      }
+      while (hn > 0) {
+        const c = pop();
+        if (state[c] !== 0) continue;
+        if (-bal[c] > t.glacierAdvanceMaxDeficit) break;
+        const cost = Math.max(0, -bal[c]) * area(c);
+        if (cost > budget) break;
+        budget += bal[c] * area(c);
+        state[c] = 1;
+        region[c] = s0;
+        S.M[c] = mMax;
+        const k = neighbours4(nx, ny, c, nb);
+        for (let q = 0; q < k; q++) if (land[nb[q]] && state[nb[q]] === 0) push(nb[q]);
+      }
+    }
+    // Flow from upstream returns the annual loss of the remaining ablation zone.
+    for (const i of cells) {
+      if (state[i] !== 1) continue;
+      const d = ablY[i] - accY[i];
+      if (d > 0) S.M[i] = Math.min(mMax, S.M[i] + d);
+    }
+  }
+  // Nucleation: bare land whose snow survived the year and still gained mass.
+  for (let i = 0; i < n; i++) {
+    if (land[i] && state[i] === 0 && minY[i] > 0 && bal[i] > 0) {
+      S.M[i] = mMax;
+      state[i] = 1;
+    }
+  }
+  for (let i = 0; i < n; i++) iceMask[i] = state[i] === 1 ? 1 : 0;
 }

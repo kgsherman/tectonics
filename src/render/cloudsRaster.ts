@@ -1,31 +1,53 @@
 /**
  * Equirectangular cloud raster for the 2D map (pure, DOM-free; runs in the cloud worker): the globe's
- * cloud model (cloudsField.ts) without animation, at map resolution:
+ * cloud model (cloudsField.ts) without animation, at map resolution, for the whole world or for a
+ * geographic window (the visible part of a zoomed-in map, rasterized at screen resolution):
  *  - the climate-independent noise (synoptic shape, cirrus patches and texture variation at half
- *    resolution; the raw detail octaves and cirrus fibres per pixel) is computed once per raster size
- *    and cached;
+ *    resolution; the raw detail octaves resolved at the raster's footprint, the cirrus fibres and the
+ *    mesoscale cells per pixel) is computed once per raster size / window and cached by the caller;
  *  - per cloud spec: the regime grids, a coarse cyclone field (coverage bias, cirrus, open cells) and
- *    one pass per pixel (regime shaping of the octaves → threshold → optical depth → opacity), then
- *    cloud-top relief from per-pixel finite differences (lit from the north-west like the map's
+ *    one pass per pixel (regime shaping of the octaves → threshold → optical depth, anvils → opacity),
+ *    then cloud-top relief from per-pixel finite differences (lit from the north-west like the map's
  *    hillshade) and sRGB-encoded colours as on the globe in relief lighting.
  * No noise-domain swirl for the cyclones (their comma templates still shape the clouds).
  */
 import type { CloudSpec } from '../core/types';
 import {
-  ALPHA_MAX, CELL_SCALE, cellFade, cellStage, cellularTexture, cirrusAlphaThr, cirrusFibre, closedCells, combineNoise, coverageThreshold, cycloneEffect, detailOctaves, detailParams,
-  detailPlain, detailSum, newDetailShaping, octaveFade, OPEN_CELL_SCALE, openCells, opticalDepth, SHAPE_STAGE_SIZE, shapeStage,
+  ALPHA_MAX, ANVIL_TAU, anvilAlpha, CELL_SCALE, cellFade, cellStage, cellularTexture, CIRRUS_ANISO, CIRRUS_SCALE, cirrusAlphaThr, cirrusFibre,
+  closedCells, combineNoise, coverageThreshold, cycloneEffect, detailOctaves, detailParams, detailSum, detailTexture, newDetailShaping,
+  octaveFade, OPEN_CELL_SCALE, openCells, opticalDepth, SHAPE_STAGE_SIZE, shapeStage,
 } from './cloudsField';
 import { analyzeCloudClimate, buildCloudGrids, CYCLONE_COUNT, CYCLONE_STRIDE, cycloneStates } from './cloudsModel';
-import { CLOUD_CELL_EDGE_RANGE, cloudCellVolume, cloudDetailVolume, cloudNoiseVolume, type CloudNoiseVolume } from './cloudsNoise';
+import {
+  CLOUD_CELL_EDGE_RANGE, CLOUD_DETAIL_PERIOD, cloudCellVolume, cloudDetailVolume, cloudNoiseVolume, type CloudNoiseVolume,
+} from './cloudsNoise';
 
-/** Detail octaves resolved on the map raster (the finer ones are sub-pixel at 2048 × 1024). */
-const RASTER_OCTAVES = 2;
+/** Most detail octaves a raster resolves (all four of the globe's). */
+const MAX_OCTAVES = 4;
 /** Quantization of the raw octave rasters (σ units → Int16). */
 const Q = 4096;
+
+/**
+ * Geographic window of a raster (radians): longitudes lon0 < lon1 (unwrapped: lon1 may exceed π, the
+ * span at most 2π), latitudes lat0 (south) < lat1 (north). Row 0 is lat1, column 0 lon0.
+ */
+export interface CloudRasterWindow {
+  lon0: number;
+  lon1: number;
+  lat0: number;
+  lat1: number;
+}
+
+/** The whole world (column 0 at −180°, row 0 at the north pole). */
+export const WORLD_WINDOW: CloudRasterWindow = { lon0: -Math.PI, lon1: Math.PI, lat0: -Math.PI / 2, lat1: Math.PI / 2 };
 
 export interface CloudNoiseRaster {
   w: number;
   h: number;
+  /** The geographic window the raster covers. */
+  win: CloudRasterWindow;
+  /** The raster spans all longitudes (wraps). */
+  wraps: boolean;
   /** Synoptic shape noise per pixel (≈ N(0,1)). */
   nb: Float32Array;
   /** Half-resolution cirrus patch and texture-variation noise (≈ N(0,1)), hw × hh. */
@@ -33,39 +55,57 @@ export interface CloudNoiseRaster {
   hh: number;
   cp: Float32Array;
   va: Float32Array;
-  /** Raw detail octaves per pixel (σ·Q), RASTER_OCTAVES of them. */
+  /** Raw detail octaves per pixel (σ·Q): those resolved at this raster's footprint. */
   oct: Int16Array[];
   /** Raw cirrus fibre noise per pixel (σ·Q). */
   nc: Int16Array;
   /** Footprint fade of each octave at this raster's resolution. */
   fade: number[];
-  /** Mesoscale cells per pixel: distance to the cell border (× 255 / CLOUD_CELL_EDGE_RANGE), cell id (× 255). */
+  /**
+   * Mesoscale cells per pixel: distance to the cell border (× 255 / CLOUD_CELL_EDGE_RANGE), cell id
+   * (× 255), distance to the cell centre (× 255 / 1.2).
+   */
   cellEdge: Uint8Array;
   cellId: Uint8Array;
-  /** The same for the (larger) open cells. */
+  cellF1: Uint8Array;
+  /** The same for the (larger) open cells (edge only). */
   openEdge: Uint8Array;
   cellFade: number;
   openFade: number;
+  /** Pixel footprint (radians, along a meridian). */
+  px: number;
 }
 
 /**
- * Static noise raster (row 0 north, column 0 at −180°); cache it. The smooth shape stage (warp and
- * synoptic noise, ≥ 500 km features) runs at half resolution and is interpolated; the detail fetches
- * run per pixel (~0.3–0.6 s at 2048 × 1024: build it off the main thread).
+ * Static noise raster of `win` (default: the whole world; row 0 north); cache it. The smooth shape
+ * stage (warp and synoptic noise, ≥ 500 km features) runs at half resolution and is interpolated; the
+ * detail fetches (as many octaves as the footprint resolves), cirrus fibres and cells run per pixel
+ * (~0.3–0.6 s per million pixels: build it off the main thread).
  */
 export function buildCloudNoiseRaster(
   w: number, h: number, vol: CloudNoiseVolume = cloudNoiseVolume(), dvol: CloudNoiseVolume = cloudDetailVolume(),
-  cvol: CloudNoiseVolume = cloudCellVolume(),
+  cvol: CloudNoiseVolume = cloudCellVolume(), win: CloudRasterWindow = WORLD_WINDOW,
 ): CloudNoiseRaster {
   const n = w * h;
+  const wraps = win.lon1 - win.lon0 >= 2 * Math.PI - 1e-9;
+  const px = (win.lat1 - win.lat0) / h;
   const nb = new Float32Array(n), nc = new Int16Array(n);
-  // Cells only where resolved at this raster's resolution (closed cells are sub-pixel at ≤ 2048 px).
-  const cf0 = cellFade(Math.PI / h), of0 = cellFade(Math.PI / h, CELL_SCALE * OPEN_CELL_SCALE);
+  // Octaves and cells only where resolved at this raster's footprint (as the globe's band-limiting).
+  const fade: number[] = [];
+  for (let k = 0; k < MAX_OCTAVES; k++) {
+    const f = octaveFade(px, k);
+    if (k >= 2 && f <= 0.02) break;
+    fade.push(f);
+  }
+  const octaves = fade.length;
+  const cf0 = cellFade(px), of0 = cellFade(px, CELL_SCALE * OPEN_CELL_SCALE);
   const closedOn = cf0 > 0.02, openOn = of0 > 0.02;
-  const cellEdge = new Uint8Array(closedOn ? n : 0), cellId = new Uint8Array(closedOn ? n : 0), openEdge = new Uint8Array(openOn ? n : 0);
-  const cell = new Float64Array(2);
+  const cellEdge = new Uint8Array(closedOn ? n : 0), cellId = new Uint8Array(closedOn ? n : 0), cellF1 = new Uint8Array(closedOn ? n : 0);
+  const openEdge = new Uint8Array(openOn ? n : 0);
+  const cell = new Float64Array(3);
+  const g2 = new Float64Array(3);
   const oct: Int16Array[] = [];
-  for (let k = 0; k < RASTER_OCTAVES; k++) oct.push(new Int16Array(n));
+  for (let k = 0; k < octaves; k++) oct.push(new Int16Array(n));
   const tmp = new Float32Array(4);
   const hw = Math.max(4, w >> 1), hh = Math.max(2, h >> 1);
   const S = SHAPE_STAGE_SIZE;
@@ -73,19 +113,20 @@ export function buildCloudNoiseRaster(
   const st = new Float64Array(S);
   const cp = new Float32Array(hw * hh), va = new Float32Array(hw * hh);
   for (let r = 0; r < hh; r++) {
-    const lat = Math.PI / 2 - ((r + 0.5) * Math.PI) / hh;
+    const lat = win.lat1 - ((r + 0.5) * (win.lat1 - win.lat0)) / hh;
     const cl = Math.cos(lat), z = Math.sin(lat);
     for (let c = 0; c < hw; c++) {
-      const lon = -Math.PI + ((c + 0.5) * 2 * Math.PI) / hw;
+      const lon = win.lon0 + ((c + 0.5) * (win.lon1 - win.lon0)) / hw;
       shapeStage(vol, cl * Math.cos(lon), cl * Math.sin(lon), z, tmp, st);
       half.set(st, (r * hw + c) * S);
       cp[r * hw + c] = st[7];
       va[r * hw + c] = st[8];
     }
   }
-  const ax = axisTable(w, hw, true), ay = axisTable(h, hh, false);
-  const o = new Float64Array(RASTER_OCTAVES);
+  const ax = axisTable(w, hw, 0, 1 / w, wraps), ay = axisTable(h, hh, 0, 1 / h, false);
+  const o = new Float64Array(octaves);
   const q = (x: number): number => Math.max(-32767, Math.min(32767, Math.round(x * Q)));
+  const byte = (x: number): number => Math.min(255, Math.round(x * 255));
   for (let r = 0; r < h; r++) {
     const r0 = ay.i0[r] * hw, r1 = ay.i1[r] * hw, tr = ay.t[r];
     for (let c = 0; c < w; c++) {
@@ -95,26 +136,24 @@ export function buildCloudNoiseRaster(
       for (let k = 0; k < S; k++) st[k] = w00 * half[o00 + k] + w01 * half[o01 + k] + w10 * half[o10 + k] + w11 * half[o11 + k];
       const i = r * w + c;
       nb[i] = st[3];
-      detailOctaves(dvol, st, tmp, o, RASTER_OCTAVES);
-      for (let k = 0; k < RASTER_OCTAVES; k++) oct[k][i] = q(o[k]);
+      detailOctaves(dvol, st, tmp, o, octaves, g2);
+      for (let k = 0; k < octaves; k++) oct[k][i] = q(o[k]);
       nc[i] = q(cirrusFibre(dvol, st, tmp));
       if (closedOn) {
-        cellStage(cvol, st, tmp, cell);
-        cellEdge[i] = Math.min(255, Math.round((cell[0] / CLOUD_CELL_EDGE_RANGE) * 255));
-        cellId[i] = Math.round(cell[1] * 255);
+        cellStage(cvol, st, tmp, cell, CELL_SCALE, g2);
+        cellEdge[i] = byte(cell[0] / CLOUD_CELL_EDGE_RANGE);
+        cellId[i] = byte(cell[1]);
+        cellF1[i] = byte(cell[2] / 1.2);
       }
       if (openOn) {
-        cellStage(cvol, st, tmp, cell, CELL_SCALE * OPEN_CELL_SCALE);
-        openEdge[i] = Math.min(255, Math.round((cell[0] / CLOUD_CELL_EDGE_RANGE) * 255));
+        cellStage(cvol, st, tmp, cell, CELL_SCALE * OPEN_CELL_SCALE, g2);
+        openEdge[i] = byte(cell[0] / CLOUD_CELL_EDGE_RANGE);
       }
     }
   }
-  // Footprint fades as on the globe (a raster pixel spans π/h).
-  const fade: number[] = [];
-  for (let k = 0; k < RASTER_OCTAVES; k++) fade.push(octaveFade(Math.PI / h, k));
   return {
-    w, h, nb, hw, hh, cp, va, oct, nc, fade, cellEdge, cellId, openEdge,
-    cellFade: closedOn ? cf0 : 0, openFade: openOn ? of0 : 0,
+    w, h, win, wraps, nb, hw, hh, cp, va, oct, nc, fade, cellEdge, cellId, cellF1, openEdge,
+    cellFade: closedOn ? cf0 : 0, openFade: openOn ? of0 : 0, px,
   };
 }
 
@@ -125,12 +164,16 @@ interface Axis {
   t: Float32Array;
 }
 
-function axisTable(n: number, gn: number, wrap: boolean): Axis {
+/**
+ * Pixel i of n (centre at fraction u0 + (i + 0.5)·du of the grid's extent) → grid cells of a gn-cell
+ * axis (cell centres at (j + 0.5)/gn); wrapping or clamped.
+ */
+function axisTable(n: number, gn: number, u0: number, du: number, wrap: boolean): Axis {
   const i0 = new Int32Array(n), i1 = new Int32Array(n), t = new Float32Array(n);
   for (let i = 0; i < n; i++) {
-    let f = ((i + 0.5) * gn) / n - 0.5;
+    let f = (u0 + (i + 0.5) * du) * gn - 0.5;
     if (wrap) {
-      if (f < 0) f += gn;
+      f = ((f % gn) + gn) % gn;
       const a = Math.floor(f);
       i0[i] = a % gn;
       i1[i] = (a + 1) % gn;
@@ -146,7 +189,16 @@ function axisTable(n: number, gn: number, wrap: boolean): Axis {
   return { i0, i1, t };
 }
 
-const BIAS_DIV = 6;
+/** Axis tables of a raster window onto a global grid (gw × gh cells, lon wraps, lat clamps). */
+function globalAxes(win: CloudRasterWindow, w: number, h: number, gw: number, gh: number): { x: Axis; y: Axis } {
+  const u0 = (win.lon0 + Math.PI) / (2 * Math.PI), du = (win.lon1 - win.lon0) / (2 * Math.PI * w);
+  const v0 = (Math.PI / 2 - win.lat1) / Math.PI, dv = (win.lat1 - win.lat0) / (Math.PI * h);
+  return { x: axisTable(w, gw, u0, du, true), y: axisTable(h, gh, v0, dv, false) };
+}
+
+/** Cyclone field resolution (a global grid: templates are smooth at ≥ 0.05 rad). */
+const BIAS_W = 256;
+const BIAS_H = 128;
 
 export interface CycloneFields {
   /** Coverage bias (σ units). */
@@ -221,30 +273,38 @@ function srgbByte(x: number): number {
   return srgbLut[i < 0 ? 0 : i > 1280 ? 1280 : i];
 }
 
-/** Cloud-top relief height per σ of synoptic noise and of (thickness-weighted) detail, in map pixels. */
+/**
+ * Cloud-top relief: height per σ of synoptic noise and of (thickness-weighted) detail, and the light
+ * gain (a slope of 1 per pixel of the 768-row world raster ≈ this many σ per radian).
+ */
 const RELIEF_SHAPE = 0.8;
-const RELIEF_DETAIL = 0.35;
+const RELIEF_DETAIL = 0.1;
+const RELIEF_PX_REF = Math.PI / 768;
 
 /**
  * Paints the clouds of `spec` into `out` (w·h·4 RGBA, straight alpha): cloud as on the globe in relief
- * lighting (thin cloud grey and translucent, mottled mid-thick cloud, bright cores, cloud-top relief
- * lit from the north-west, cirrus veils), with opacity × `opacity`. Returns area-weighted statistics.
- * `time` picks the cyclone snapshot (seconds on the globe's animation clock).
+ * lighting (thin cloud grey and translucent, mottled thick cloud, bright cores and anvils, cloud-top
+ * relief lit from the north-west, cirrus veils), with opacity × `opacity`. Returns area-weighted
+ * statistics. `time` picks the cyclone snapshot (seconds on the globe's animation clock).
  */
 export function rasterizeClouds(
   raster: CloudNoiseRaster, spec: CloudSpec, opacity: number, out: Uint8ClampedArray, time = 0,
 ): CloudRasterStats {
-  const { w, h, nb, hw, hh, cp, va, oct, nc, fade, cellEdge, cellId, openEdge, cellFade: cf0, openFade: of0 } = raster;
+  const { w, h, win, wraps, nb, hw, hh, cp, va, oct, nc, fade, cellEdge, cellId, cellF1, openEdge, cellFade: cf0, openFade: of0 } = raster;
   const gw = spec.w, gh = spec.h;
   const grids = buildCloudGrids(spec);
   const grid = grids.regime, aux = grids.aux;
   const climate = grids.climate ?? analyzeCloudClimate(spec);
   const cyc = cycloneStates(time, spec, climate, new Float32Array(CYCLONE_COUNT * CYCLONE_STRIDE));
-  const bw = Math.max(8, Math.floor(w / BIAS_DIV)), bh = Math.max(4, Math.floor(h / BIAS_DIV));
+  // Global cyclone grid at ~1/6 of the raster's resolution, as for the world raster the window's
+  // resolution would make (sized from the window's own pixels it was ~4° coarse for a small window:
+  // blurred commas, not those of the world raster around it).
+  const worldW = (w * 2 * Math.PI) / (win.lon1 - win.lon0), worldH = (h * Math.PI) / (win.lat1 - win.lat0);
+  const bw = Math.min(BIAS_W, Math.max(8, Math.floor(worldW / 6))), bh = Math.min(BIAS_H, Math.max(4, Math.floor(worldH / 6)));
   const cf = cycloneFields(cyc, bw, bh);
-  const cx = axisTable(w, gw, true), cy = axisTable(h, gh, false);
-  const bx = axisTable(w, bw, true), by = axisTable(h, bh, false);
-  const hx = axisTable(w, hw, true), hy = axisTable(h, hh, false);
+  const { x: cx, y: cy } = globalAxes(win, w, h, gw, gh);
+  const { x: bx, y: by } = globalAxes(win, w, h, bw, bh);
+  const hx = axisTable(w, hw, 0, 1 / w, wraps), hy = axisTable(h, hh, 0, 1 / h, false);
   const op = Math.max(0, Math.min(1, opacity));
   // Per-cell channels as floats (threshold in threshold space: bilinear there is close enough and
   // saves a log per pixel), then per raster row the vertically interpolated grid rows: the per-pixel
@@ -266,16 +326,22 @@ export function rasterizeClouds(
   const rowG = new Float32Array(gw * CH);
   const rowB = new Float32Array(bw * 3);
   const rowH = new Float32Array(hw * 2);
-  // First pass: optical depth, cirrus opacity and cloud-top height per pixel.
-  const tauA = new Float32Array(w * h), cirA = new Float32Array(w * h), hgt = new Float32Array(w * h);
+  // First pass: optical depth, anvil and cirrus opacity and cloud-top height per pixel.
+  const tauA = new Float32Array(w * h), cirA = new Float32Array(w * h), anvA = new Float32Array(w * h), hgt = new Float32Array(w * h);
   const sh = newDetailShaping();
   // Coverage threshold of the cirrus fraction (0..1, 1/1023 steps; a log per pixel otherwise).
   const thrLut = new Float32Array(1024);
   for (let k = 0; k < 1024; k++) thrLut[k] = coverageThreshold(k / 1023);
   const o2 = new Float64Array(oct.length);
   const invQ = 1 / Q;
+  // Edge step width (σ): about a pixel of the synoptic noise's typical gradient (~9 σ per radian).
+  const edgeW = Math.min(0.12, Math.max(0.02, 9 * raster.px));
+  // Cirrus fibres fade to their mean veil below 2 px per lattice cell across them (as the shader's
+  // fadeC: the world raster resolves them only partly, a coarse raster not at all: no aliased speckle).
+  const fibrePx = 1 / (raster.px * CIRRUS_SCALE * CLOUD_DETAIL_PERIOD * CIRRUS_ANISO);
+  const tf = Math.min(1, Math.max(0, fibrePx - 1)), fibreFade = tf * tf * (3 - 2 * tf);
   for (let r = 0; r < h; r++) {
-    const lat = Math.PI / 2 - ((r + 0.5) * Math.PI) / h;
+    const lat = win.lat1 - ((r + 0.5) * (win.lat1 - win.lat0)) / h;
     const aLat = Math.abs(lat);
     const g0 = cy.i0[r] * gw * CH, g1 = cy.i1[r] * gw * CH, tr = cy.t[r];
     for (let k = 0; k < gw * CH; k++) rowG[k] = cells[g0 + k] + tr * (cells[g1 + k] - cells[g0 + k]);
@@ -296,6 +362,7 @@ export function rasterizeClouds(
       const f = rowG[c0] + tc * (rowG[c1] - rowG[c0]);
       tauA[i] = 0;
       cirA[i] = 0;
+      anvA[i] = 0;
       hgt[i] = nb[i];
       // No coverage, no cloud (the globe shader discards the same way).
       if (f < 0.004) continue;
@@ -317,59 +384,69 @@ export function rasterizeClouds(
         detailParams(sc, cv, cu, open, vary, sh);
         for (let k = 0; k < o2.length; k++) o2[k] = oct[k][i] * invQ;
         const ndv = detailSum(o2, o2.length, sh, fade);
-        let ex = combineNoise(nbv, ndv, zthr, sc, cv, cu, sh.amp, bias) - zthr;
-        let cells = 1;
-        if (cf0 > 0 && sc > 0.02 && ex > -1.5) cells = closedCells(cellEdge[i] * (CLOUD_CELL_EDGE_RANGE / 255), cellId[i] / 255, sc, cf0);
+        const ndt = detailTexture(o2, o2.length, sh.gain, fade);
+        let ex = combineNoise(nbv, ndv, zthr, sc, cv, cu, sh.amp, bias, sh.floor) - zthr;
+        let cellsTau = 1;
+        if (cf0 > 0 && sc > 0.02 && ex > -1.5) cellsTau = closedCells(cellEdge[i] * (CLOUD_CELL_EDGE_RANGE / 255), cellId[i] / 255, sc, cf0, cellF1[i] * (1.2 / 255));
         if (of0 > 0 && open > 0.02 && ex > -1.5) ex += openCells(openEdge[i] * (CLOUD_CELL_EDGE_RANGE / 255), open, of0, 0.3, ndv);
         exLow = ex;
-        const tau = opticalDepth(ex, sc, cv, cu, aLat, cellularTexture(detailPlain(o2, o2.length, sh.gain, fade), ndv, sc, open), bias, cells);
+        const tau = opticalDepth(ex, sc, cv, cu, aLat, cellularTexture(ndt, ndv, sc, open), bias, cellsTau, edgeW);
         tauA[i] = tau;
-        const depth = tau > 0 ? Math.min(1, tau / 1.5) * (0.6 + 0.5 * cv + 0.3 * cu) : 0;
+        anvA[i] = anvilAlpha(nbv, zthr, cv, o2[0] * fade[0], ndt);
+        const depth = tau > 0 ? Math.min(1, tau / 1.5) * (0.15 + 0.9 * cv + 0.4 * cu) * (1 - 0.6 * sc) : 0;
         hgt[i] = nbv + bias + (RELIEF_DETAIL / RELIEF_SHAPE) * ndv * depth;
       }
       // Cirrus (not over optically thick low cloud, as on the globe).
       if (cirrus > 0.02 && exLow < 1.6) {
         const cpv = rowH[e0] + the * (rowH[e1] - rowH[e0]);
         const t = Math.max(0, Math.min(1, (exLow - 1.1) / 0.5));
-        cirA[i] = cirrusAlphaThr(thrLut[(cirrus * 1023 + 0.5) | 0], cpv, nc[i] * invQ) * (1 - t * t * (3 - 2 * t));
+        cirA[i] = cirrusAlphaThr(thrLut[(cirrus * 1023 + 0.5) | 0], cpv, nc[i] * invQ, fibreFade) * (1 - t * t * (3 - 2 * t));
       }
     }
   }
-  // Second pass: relief (north-west light, per-pixel finite differences), colour, opacity.
+  // Second pass: relief (north-west light, per-pixel finite differences), colour, opacity. The slope
+  // is per radian (a zoomed window's pixels are smaller): scaled to the world raster's pixel.
   const px32 = new Uint32Array(out.buffer, out.byteOffset, w * h);
+  const slopeK = (RELIEF_SHAPE * 0.25 * RELIEF_PX_REF) / raster.px;
   let sa = 0, sf = 0, sw = 0;
   for (let r = 0; r < h; r++) {
-    const lat = Math.PI / 2 - ((r + 0.5) * Math.PI) / h;
+    const lat = win.lat1 - ((r + 0.5) * (win.lat1 - win.lat0)) / h;
     const area = Math.cos(lat);
-    const kx = (RELIEF_SHAPE * 0.25) / Math.max(0.2, area);
+    const kx = slopeK / Math.max(0.2, area);
     const rn = Math.max(0, r - 1) * w, rs = Math.min(h - 1, r + 1) * w, ro = r * w;
     let rowA = 0, rowF = 0;
     for (let c = 0; c < w; c++) {
       const i = ro + c;
-      const tau = tauA[i], aC = cirA[i];
-      if (tau <= 0 && aC <= 0) {
+      const tau = tauA[i], aC = cirA[i], aAnv = anvA[i];
+      if (tau <= 0 && aC <= 0 && aAnv <= 0) {
         px32[i] = 0;
         continue;
       }
-      const al = ALPHA_MAX * (1 - Math.exp(-tau));
+      const core = ALPHA_MAX * (1 - Math.exp(-tau));
+      // Anvils under the cores' tops, cirrus over everything (as on the globe).
+      const aA = aAnv * (1 - core);
+      const al = core + aA;
       const aTot = aC + al * (1 - aC);
       rowA += aTot;
       if (aTot > 0.1) rowF++;
       let relief = 1;
       if (tau > 0) {
-        const cw = c === 0 ? w - 1 : c - 1, ce = c === w - 1 ? 0 : c + 1;
+        const cw = c === 0 ? (wraps ? w - 1 : 0) : c - 1, ce = c === w - 1 ? (wraps ? 0 : w - 1) : c + 1;
         const dx = (hgt[ro + ce] - hgt[ro + cw]) * kx; // eastward slope
-        const dy = (hgt[rn + c] - hgt[rs + c]) * RELIEF_SHAPE * 0.25; // northward slope
+        const dy = (hgt[rn + c] - hgt[rs + c]) * slopeK; // northward slope
         // Surfaces rising toward the light (north-west, 60° up) are lit.
-        relief = Math.min(1.3, Math.max(0.6, 1 + (-dx + dy) * 0.6124));
+        relief = Math.min(1.25, Math.max(0.7, 1 + (-dx + dy) * 0.6124));
       }
-      const bright = (0.66 + 0.34 * (1 - Math.exp(-0.55 * tau))) * relief;
-      // Cirrus over the low cloud (as on the globe).
-      const lowW = al * (1 - aC);
+      // Reflectance saturates slowly with optical depth (as on the globe): thick decks stay mottled.
+      const anv = 0.84 + 0.13 * (aAnv / ANVIL_TAU);
+      // A core's thin edge inside an anvil is no darker than the anvil around it (as on the globe).
+      const ta = Math.min(1, aAnv / 0.3), anvLift = anv * ta * ta * (3 - 2 * ta);
+      const bright = Math.max(0.55 + 0.45 * (1 - Math.exp(-0.22 * tau)), anvLift) * relief;
       const k = aTot > 0 ? 1 / aTot : 0;
-      const lr = (0.9 * aC + 0.93 * bright * lowW) * k;
-      const lg = (0.93 * aC + 0.95 * bright * lowW) * k;
-      const lb = (0.98 * aC + 0.98 * bright * lowW) * k;
+      const lowW = (1 - aC) * k;
+      const lr = 0.92 * aC * k + (0.93 * bright * core + 0.93 * anv * aA) * lowW;
+      const lg = 0.94 * aC * k + (0.95 * bright * core + 0.95 * anv * aA) * lowW;
+      const lb = 0.98 * aC * k + (0.98 * bright * core + 0.98 * anv * aA) * lowW;
       px32[i] = ((((255 * aTot * op + 0.5) | 0) << 24) | (srgbByte(lb) << 16) | (srgbByte(lg) << 8) | srgbByte(lr)) >>> 0;
     }
     sa += (rowA / w) * area;

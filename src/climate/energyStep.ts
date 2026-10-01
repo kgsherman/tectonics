@@ -61,7 +61,8 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
   const mMax = t.glacierMassMax;
   const rampLand = 1 / (t.seaIceRampWarm - t.seaIceRampCold);
   const LfSnow = t.latentFusion;
-  const { accY, ablY } = M;
+  const { accY, ablY, potY } = M;
+  const kPot = t.meltCoupling / LfSnow;
   const qOff = k * ny;
 
   // (0) Land forcing with snow albedo lagged from the previous step (plus the free-troposphere
@@ -150,6 +151,8 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
             ablY[i] += dm;
           }
         }
+        // Melt an ice surface would still have had here (bare land warmer than 0 °C).
+        if (tn > lapse[i] && Mass[i] <= 0) potY[i] += kPot * (tn - lapse[i]) * dts;
         Tc[i] = tn;
       } else {
         const a = ice[i];

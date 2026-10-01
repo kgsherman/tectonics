@@ -243,13 +243,19 @@ export class App implements Commands {
     this.epoch++;
     this.setPlaying(false);
     this.expectStill();
-    // A climate in flight may be for the discarded future; the branch point gets its own below.
+    // A climate in flight may be for the discarded future; the branch gets its own below (live
+    // climates while it plays, or a full one when it stays paused).
     this.climate.branch();
+    const epoch = this.epoch;
     this.sim.request({ type: 'playFromKeyframe', epoch: this.epoch, index, display: displaySettings(this.store.getState()) })
       .then((loaded) => {
         this.store.dispatch({ type: 'worldLoaded', ...loaded });
-        this.toasts.show('info', 'History branched', `Continuing from ${fmtNum(loaded.time, 1)} Myr; later keyframes were discarded.`);
-        this.climateAfterChange('full');
+        // "Play from here" plays, unless the user moved on meanwhile (new world, editor, pause/step).
+        const rt = this.store.getState().runtime;
+        const play = epoch === this.epoch && !rt.editorActive && !this.generating && !rt.playing;
+        this.toasts.show('info', 'History branched', `${play ? 'Playing' : 'Continuing'} from ${fmtNum(loaded.time, 1)} Myr; later keyframes were discarded.`);
+        if (play) this.play();
+        else this.climateAfterChange('full');
       })
       .catch((e) => this.toasts.error('Could not branch from this keyframe', errorMessage(e)));
   }
@@ -355,7 +361,9 @@ export class App implements Commands {
     const prevMesh = this.store.getState().runtime.meshN;
     this.store.dispatch({ type: 'worldLoaded', ...loaded, paramsKey });
     this.editor.worldChanged(prevMesh !== loaded.meshN);
-    this.climateAfterChange('full');
+    // A new world always gets its climate (the satellite view is meaningless without one); "Auto
+    // climate" only governs updates while the world evolves (playback, pause, step, scrub).
+    this.climate.request('full', false);
     this.viewSync.legend();
     if (this.store.getState().settings.tab === 'plates' && !this.editor.isActive) void this.enterEditor();
   }

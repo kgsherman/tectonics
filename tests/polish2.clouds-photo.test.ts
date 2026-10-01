@@ -9,7 +9,7 @@ import type { CloudSpec } from '../src/core/types';
 import {
   CELL_SCALE, cellFade, CIRRUS_TAU, cirrusAlpha, closedCells, combineNoise, coverageThreshold, cycloneTemplate, DETAIL_SCALES,
   detailOctaves, detailParams, detailPlain, detailSum, newDetailShaping, OCTAVE_FADE_PX, octaveFade, OPEN_CELL_SCALE, openCells,
-  opticalDepth, SHAPE_STAGE_SIZE, shapeOctave, shapeStage,
+  opticalDepth, REGIME_OFFSET_CU, REGIME_OFFSET_CV, REGIME_OFFSET_SC, SHAPE_STAGE_SIZE, shapeOctave, shapeStage,
 } from '../src/render/cloudsField';
 import { GlobeClouds } from '../src/render/cloudsGlobe';
 import { runCloudJob, type CloudJob } from '../src/render/cloudsJobs';
@@ -128,8 +128,9 @@ describe('cell volume (mesoscale cellular convection)', () => {
   });
 
   it('darkens closed-cell borders, rings open cells, and only where resolved', () => {
-    expect(closedCells(0, 0.5, 1, 1)).toBeLessThan(0.7); // border
-    expect(closedCells(0.4, 0.5, 1, 1)).toBeGreaterThan(0.9); // interior
+    // Walls (edge 0, ~0.6 cell from the centre) thinner than the domed centres (polish 3: softer walls).
+    expect(closedCells(0, 0.5, 1, 1, 0.6)).toBeLessThan(0.75); // border
+    expect(closedCells(0.4, 0.5, 1, 1, 0.1)).toBeGreaterThan(0.95); // interior
     expect(closedCells(0, 0.5, 0, 1)).toBe(1); // no stratocumulus
     expect(openCells(0.02, 1, 1)).toBeGreaterThan(0.1); // ring: cloudier
     expect(openCells(0.02, 1, 1, 0, 1)).toBeGreaterThan(0.4); // lumps along the ring
@@ -181,7 +182,7 @@ describe('regime shaping', () => {
     expect(cu.gain).toBeGreaterThan(plain.gain); // speckled
     for (const p of [conv, cu, sc, open, plain]) {
       expect(p.gain).toBeGreaterThanOrEqual(0.4);
-      expect(p.gain).toBeLessThanOrEqual(0.8);
+      expect(p.gain).toBeLessThanOrEqual(1);
       expect(p.amp).toBeGreaterThan(0.4);
       expect(p.amp).toBeLessThan(2.2);
     }
@@ -197,8 +198,8 @@ describe('regime shaping', () => {
         for (let i = 0; i < st.length; i++) {
           detailParams(sc, cv, cu, open, st[i][8], sh);
           const nd = detailSum(oct[i], 3, sh);
-          // The regime offsets (cv +0.2σ, sc +0.15σ) are deliberate; compare against them removed.
-          const z = combineNoise(st[i][3], nd, zthr, sc, cv, cu, sh.amp) - 0.15 * sc - 0.2 * cv;
+          // The regime offsets are deliberate; compare against them removed.
+          const z = combineNoise(st[i][3], nd, zthr, sc, cv, cu, sh.amp, 0, sh.floor) - REGIME_OFFSET_SC * sc - REGIME_OFFSET_CV * cv - REGIME_OFFSET_CU * cu;
           if (z > zthr) k++;
         }
         expect(Math.abs(k / st.length - f)).toBeLessThan(0.09);
@@ -224,9 +225,12 @@ describe('band-limiting (anti-aliasing contract shared by the shader and the map
     const px1 = 0.0029, px2 = px1 / 2;
     expect(octaveFade(px1, 0)).toBe(1);
     expect(octaveFade(px1, 1)).toBe(1);
-    expect(octaveFade(px1, 2)).toBe(0);
-    expect(octaveFade(px2, 2)).toBeGreaterThan(0.2); // high-DPI: the third octave shows
-    expect(octaveFade(px2, 3)).toBe(0);
+    // The third (~1 px per cell) partly: pixel-scale speckle in cumulus fields (polish 3).
+    expect(octaveFade(px1, 2)).toBeGreaterThan(0.2);
+    expect(octaveFade(px1, 2)).toBeLessThan(0.8);
+    expect(octaveFade(px1, 3)).toBe(0);
+    expect(octaveFade(px2, 2)).toBe(1); // high-DPI: the third octave in full
+    expect(octaveFade(px2, 3)).toBeLessThan(0.05);
     expect(octaveFade(0.0006, 3)).toBeGreaterThan(0.2); // close-ups: all four
     // Ratio between octaves is constant (self-similar fbm, no tile alignment: non-integer).
     for (let k = 1; k < DETAIL_SCALES.length; k++) expect(DETAIL_SCALES[k] / DETAIL_SCALES[k - 1]).toBeCloseTo(2.6, 6);

@@ -16,6 +16,13 @@ export interface HydroTuning {
    * κ = 0 is the plain surface-temperature form.
    */
   columnAnomalyDamping: number;
+  /**
+   * Gaussian σ (km) of the horizontal smoothing of the sea-level-reduced temperature anomaly that
+   * reaches the column (T_col): the free troposphere does not follow cell-scale surface contrasts
+   * (sea-ice leads, coastal cells), which the steep humidity gate would otherwise print into the
+   * precipitation (N–S streaks over the polar oceans, where 1° of longitude is a few tens of km).
+   */
+  columnSmoothKm: number;
   /** Weight of land cells relative to ocean cells in the zonal reference means (T_ref, SST_ref). */
   referenceLandWeight: number;
 
@@ -159,6 +166,27 @@ export interface HydroTuning {
    * rain shadows). 0 disables.
    */
   diffusionBlockHeight: number;
+  /**
+   * Level-referenced transport onto high terrain: a column over terrain at height h holds only the
+   * part of the vapour profile above h, a share e^{−h/H} with this scale height (m; the vapour scale
+   * height, cf. waterScaleHeight). Eddies mix only the layer above the higher of two surfaces
+   * (moistureDiffusion.ts), and air advected onto higher terrain carries only its vapour above the
+   * new surface: the moist layer below cannot climb the barrier and stays upstream, flowing around it
+   * (moistureSolver.ts). High plateaus get the dry upper air, not the lowland moisture. 0 = off.
+   */
+  levelScaleHeight: number;
+  /**
+   * Depth (m) of the moist boundary layer that the eddies stir along the terrain: gentle slopes and
+   * moderate plateaus lie inside it and are mixed as flat terrain; the level-referenced mixing acts
+   * on the smoothed height in excess of it.
+   */
+  levelBoundaryLayer: number;
+  /**
+   * Height (m) the moist lower troposphere carried by the steering wind climbs without being
+   * blocked (it rises over ranges and moderate plateaus, raining on their windward slopes); the
+   * level-referenced advection acts on the smoothed height in excess of it.
+   */
+  levelLiftHeight: number;
   eddyDiffusivityMax: number;
   baroclinicForMaxDiffusivity: number;
 
@@ -235,6 +263,7 @@ export interface HydroTuning {
 export const HYDRO_TUNING: HydroTuning = {
   waterScaleHeight: 2200,
   columnAnomalyDamping: 0.5,
+  columnSmoothKm: 200,
   referenceLandWeight: 0.1,
 
   gateSteepness: 15,
@@ -243,7 +272,7 @@ export const HYDRO_TUNING: HydroTuning = {
   stormGateShift: 0.4,
   baroclinicForMaxGateShift: 1.5,
   landGateShift: 0.25,
-  landConvectionGateShift: 0.15,
+  landConvectionGateShift: 0.1,
   landConvectionRefK: 8,
   subsidenceCapping: 3,
   subsidenceCappingLand: 1.8,
@@ -290,6 +319,9 @@ export const HYDRO_TUNING: HydroTuning = {
   divergenceMax: 4e-5,
   eddyDiffusivityMin: 5e5,
   diffusionBlockHeight: 1500,
+  levelScaleHeight: 2200,
+  levelBoundaryLayer: 1000,
+  levelLiftHeight: 2000,
   eddyDiffusivityMax: 8e6,
   baroclinicForMaxDiffusivity: 1,
 

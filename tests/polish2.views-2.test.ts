@@ -10,7 +10,7 @@ import { GlobeSurface, LIGHT_RELIEF } from '../src/render/globeSurface';
 import { HeightTextureSlot, RgbaTextureSlot } from '../src/render/globeTextures';
 import { MAP_BASE_FRAGMENT, MAP_OVERLAY_FRAGMENT } from '../src/render/mapGl';
 import * as mapShading from '../src/render/mapShading';
-import { GLSL_OVERLAY_SHARP, GLSL_RELIEF_RESPONSE, GLSL_TERRAIN_RECON } from '../src/render/shadersCommon';
+import { GLSL_OVERLAY_LINES, GLSL_RELIEF_RESPONSE, GLSL_TERRAIN_RECON } from '../src/render/shadersCommon';
 import { SURFACE_FRAGMENT } from '../src/render/shadersSurface';
 import { copyIfChanged, premultiply, SizeCache } from '../src/render/viewBuffers';
 import { DetailFader } from '../src/render/viewDetail';
@@ -224,20 +224,18 @@ describe('shader contracts (polish 2)', () => {
     expect(MAP_BASE_FRAGMENT).toContain(boost);
   });
 
-  it('overlays are magnified crisply on the globe and in the map overlay pass', () => {
-    expect(GLSL_OVERLAY_SHARP).toContain('vec4 overlaySharp(sampler2D tex, vec2 size, vec2 st, float pxTex)');
-    // Smooth soft-max peak (no texel-shaped plateaus) and threshold at 0.4 of it.
-    expect(GLSL_OVERLAY_SHARP).toContain('float peak = p4 / p3;');
-    expect(GLSL_OVERLAY_SHARP).toContain('float thr = 0.4 * peak;');
-    expect(SURFACE_FRAGMENT).toContain('overlaySharp(uOverlay, uOverlaySize, st, ovTex)');
+  it('overlays are magnified as constant-width lines on the globe and in the map overlay pass', () => {
+    expect(GLSL_OVERLAY_LINES).toContain('OverlayRidge overlayRidge(sampler2D tex, vec2 size, vec2 st, vec2 jx, vec2 jy)');
+    expect(SURFACE_FRAGMENT).toContain('overlayRidge(uOverlay, uOverlaySize, st, dsx * uOverlaySize, dsy * uOverlaySize)');
     expect(MAP_OVERLAY_FRAGMENT.startsWith('#version 300 es')).toBe(true);
-    expect(MAP_OVERLAY_FRAGMENT).toContain('overlaySharp(uOverlay, uOverlaySize, st, ovTex)');
+    expect(MAP_OVERLAY_FRAGMENT).toContain('overlayRidge(uOverlay, uOverlaySize, st, dsx * uOverlaySize, dsy * uOverlaySize)');
   });
 
   it('rebuilds binary colour edges on land only (lakes, Köppen, snow), gated to two-colour stencils', () => {
     expect(GLSL_TERRAIN_RECON).toContain('vec3 classEdge(');
-    expect(GLSL_TERRAIN_RECON).toContain('classEdge(cv, lv, 1.0,');
-    expect(GLSL_TERRAIN_RECON).not.toContain('classEdge(cv, lv, 0.0,');
+    // Land only (le: the land/sea stencil with coastal anti-aliased texels excluded, polish 3).
+    expect(GLSL_TERRAIN_RECON).toContain('classEdge(cv, le, 1.0,');
+    expect(GLSL_TERRAIN_RECON).not.toContain('classEdge(cv, le, 0.0,');
     expect(GLSL_TERRAIN_RECON).toContain('float binary = 1.0 - smoothstep(0.004, 0.03, dev / max(nc, 1.0));');
     // Both callers pass the pixel footprint for the edge anti-aliasing width.
     expect(SURFACE_FRAGMENT).toContain('stw, uSeaLevel, pxRad / texRadH)');
