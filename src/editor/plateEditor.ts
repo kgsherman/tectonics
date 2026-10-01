@@ -12,7 +12,8 @@ import type { FullRenderFn } from './fullRender';
 import { WorkerFullRenderer } from './fullRender';
 import type { InteractionHost, ToolSettings } from './interaction';
 import { PointerInteraction } from './interaction';
-import { omegaFromMotion } from './motion';
+import { MotionHandles } from './handles';
+import { motionAt, omegaFromMotion } from './motion';
 import type { PerfSummary } from './perf';
 import { PerfRing } from './perf';
 import type { ToolId } from './tools';
@@ -91,6 +92,8 @@ export class PlateEditor {
     style: 'plates',
   };
   private readonly seeds: Vec3[] = [];
+  /** Where motion arrows are drawn (user's drag points, visible stand-ins for hidden anchors). */
+  private readonly handles = new MotionHandles();
   private seaLevel: number;
   private selectedId: number;
   private active = false;
@@ -143,6 +146,7 @@ export class PlateEditor {
           console.error('[plate editor] full-quality preview failed', err);
           this.panel.setStatus(`Full-quality preview unavailable (${errorText(err)}); showing the fast preview.`, 'warn', 8000);
         },
+        handles: this.handles,
       },
       { preview: opts.previewSize ?? [1024, 512], full: opts.fullSize ?? [2048, 1024] },
       opts.renderFull ?? null,
@@ -151,6 +155,7 @@ export class PlateEditor {
       core: this.core,
       settings: this.settings,
       seeds: this.seeds,
+      handles: this.handles,
       view: () => this.renderer.view,
       selectedIndex: () => this.selectedIndex(),
       select: (k) => this.selectIndex(k),
@@ -394,6 +399,7 @@ export class PlateEditor {
   }
 
   private afterLoad(): void {
+    this.handles.clear();
     this.selectedId = this.core.plates[0].id;
     this.lastPieces = null;
     this.interaction.refreshHover();
@@ -547,9 +553,11 @@ export class PlateEditor {
       recolor: (id, color) => byId(id, (k) => this.opDone(this.core.recolorPlate(k, color))),
       setMotion: (id, speedCmYr, bearingDeg, spinDegMyr) =>
         byId(id, (k) => {
-          const a = this.core.anchors()[k];
+          // The list shows the motion where the plate's arrow starts (the user's drag point, else
+          // its anchor): edits there round-trip.
+          const a = this.handles.preferred(this.core, k);
           if (!a) return;
-          this.opDone(this.core.setMotion(k, omegaFromMotion(a, speedCmYr * 10, bearingDeg, spinDegMyr * DEG)));
+          this.opDone(this.core.setMotion(k, omegaFromMotion(a, speedCmYr * 10, bearingDeg, spinDegMyr * DEG), a));
         }),
     };
   }
@@ -580,7 +588,8 @@ export class PlateEditor {
     if (!core.busy || !this.lastPieces || this.lastPieces.pieces.length !== d.plates.length) this.lastPieces = core.pieces();
     const pieces = this.lastPieces;
     const rows: PlateRow[] = d.plates.map((p, k) => {
-      const m = counts[k] > 0 ? core.plateMotion(k) : null;
+      const at = counts[k] > 0 ? this.handles.preferred(core, k) : null;
+      const m = at ? motionAt(p.omega, at) : null;
       return {
         id: p.id,
         name: p.name,

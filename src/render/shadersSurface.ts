@@ -83,6 +83,9 @@ uniform vec3 uBrushColor;
 uniform float uGratOn;
 uniform float uGratStep;
 uniform vec3 uAtmoColor;
+uniform sampler2D uCloudGrid;
+uniform sampler2D uCloudWind;
+uniform int uCloudOn;
 varying vec2 vUv;
 varying vec3 vDir;
 varying vec3 vWorld;
@@ -93,6 +96,37 @@ const float COS_ALT = 0.819152;
 // Largest shading tilt (tan of the normal's deviation): steep exaggerated slopes saturate instead of
 // turning into black walls / blown-out faces.
 const float MAX_TILT = 1.6;
+// Sun glint: share of the Cox–Munk mean-square wave slope (0.003 + 0.00512·U) in the specular lobe
+// (the rest is wave structure far below a pixel, spread too thin to show as a halo), the wind speed
+// without wind data (m/s), the gustiness added to the monthly-mean wind (m/s), the gain on the
+// physical radiance and the soft cap of the result (bright-ish, never a saturated white disc), and the
+// warm-white tint of the sun's image.
+const float GLINT_SLOPE_SHARE = 0.12;
+const float GLINT_WIND_DEFAULT = 6.0;
+const float GLINT_GUST = 3.0;
+const float GLINT_GAIN = 0.25;
+const float GLINT_PEAK = 0.8;
+const vec3 GLINT_TINT = vec3(1.0, 0.87, 0.68);
+
+float beckmann(float nh2, float m2) {
+  return exp((nh2 - 1.0) / (nh2 * m2)) / (PI * m2 * nh2 * nh2);
+}
+
+// Sun glint radiance on water (white = 1; no derivatives, any control flow). Microfacet lobe whose
+// slope variance m² follows the wind (Cox & Munk), peaked like the observed wave-slope distribution
+// (a mix of a narrow and a broader Beckmann lobe, mean slope variance 0.9·m²: a bright core, no wide
+// halo),
+// Schlick Fresnel, the radiance F·D/(4 n·v) in the shader's units (×π), softly capped.
+float sunGlint(vec3 n, vec3 V, vec3 L, float windSpeed) {
+  float m2 = GLINT_SLOPE_SHARE * (0.003 + 0.00512 * windSpeed);
+  vec3 H = normalize(L + V);
+  float nh = max(dot(n, H), 1e-3);
+  float nh2 = nh * nh;
+  float D = 0.6 * beckmann(nh2, 0.5 * m2) + 0.4 * beckmann(nh2, 1.5 * m2);
+  float F = 0.02 + 0.98 * pow(1.0 - max(dot(H, V), 0.0), 5.0);
+  float spec = PI * D * F / (4.0 * max(dot(n, V), 0.1));
+  return GLINT_PEAK * (1.0 - exp(-GLINT_GAIN * spec / GLINT_PEAK));
+}
 
 float seaClampedHeight(vec2 st, vec2 dx, vec2 dy) {
   return max(textureGrad(uHeight, st, dx, dy).r, uSeaLevel);
@@ -227,6 +261,10 @@ void main() {
 
   vec3 n = normalize(n0 - saturateTilt(tilt));
   float ocean = hasH ? 1.0 - land : 0.0;
+  // Whiteness of the surface albedo before lighting (its darkest channel): the glint skips sea ice
+  // (grey-white) but not bright turquoise shelves, whose red channel stays dark (a luminance test
+  // dimmed the glint by 20–40 % over warm seas shallower than ~30 m).
+  float albedoMin = min(col.r, min(col.g, col.b));
 
   vec3 V = normalize(cameraPosition - vWorld);
   float nv = max(dot(n0, V), 0.0);
@@ -256,17 +294,21 @@ void main() {
     // Sky fill on slopes facing away from the sun (keeps shadowed mountainsides readable).
     float fill = 0.06 * day * (0.5 + 0.5 * dot(n, n0));
     col = col * (1.02 * diff + fill + 0.012) + vec3(0.0012, 0.0018, 0.0035) * (1.0 - day);
-    // Sun glint on water only: microfacet (Beckmann, rms wave slope ~0.19) × Schlick Fresnel. A
-    // soft, moderately bright patch, never a saturated white disk.
+    // Sun glint on open water only (not sea ice): a small, bright, warm-white image of the sun spread
+    // by wind-roughened waves (the cloud layer's smoothed wind when clouds are shown, else a moderate
+    // breeze), dimmed under the cloud cover (the beam crosses it twice) on top of the clouds' own
+    // opacity, fading out toward the terminator.
     if (ocean > 0.0) {
-      vec3 H = normalize(uSunDir + V);
-      float nh = max(dot(n0, H), 1e-3);
-      float nh2 = nh * nh;
-      const float M2 = 0.036;
-      float D = exp((nh2 - 1.0) / (nh2 * M2)) / (PI * M2 * nh2 * nh2);
-      float F = 0.02 + 0.98 * pow(1.0 - max(dot(H, V), 0.0), 5.0);
-      float spec = D * F / (4.0 * max(nv, 0.08));
-      col += ocean * smoothstep(0.0, 0.08, mu0) * min(spec, 0.6) * 2.2 * vec3(1.0, 0.97, 0.92);
+      float water = ocean * (1.0 - smoothstep(0.06, 0.2, albedoMin)) * smoothstep(0.0, 0.08, mu0);
+      float wind = GLINT_WIND_DEFAULT, cover = 0.0;
+      if (uCloudOn > 0) {
+        cover = textureLod(uCloudGrid, st, 0.0).r;
+        if (uCloudOn > 1) {
+          vec2 w = textureLod(uCloudWind, st, 0.0).rg;
+          wind = sqrt(dot(w, w) + GLINT_GUST * GLINT_GUST);
+        }
+      }
+      if (water > 0.0) col += water * (1.0 - 0.7 * cover) * sunGlint(n0, V, uSunDir, wind) * GLINT_TINT;
     }
     col = mix(col, uAtmoColor * 1.1, 0.4 * pow(1.0 - nv, 3.0) * smoothstep(-0.25, 0.3, mu0));
     overlayLight = mix(0.22, 1.0, day);

@@ -33,6 +33,11 @@ export interface SurfaceState {
   trees?: Uint8Array;
   /** Optional: glacier / ice-sheet cover (no lakes or rivers drawn on the ice). */
   ice?: Uint8Array;
+  /**
+   * Optional: riparian-forest potential — dry, sparsely wooded land (steppe, dry savanna, desert)
+   * where the trees and shrubs lining a river stand out as a dark green strip.
+   */
+  rip?: Uint8Array;
 }
 
 export interface RiverNetwork {
@@ -406,7 +411,7 @@ const LAKE_ICE = [SRGB_TO_LINEAR[214], SRGB_TO_LINEAR[224], SRGB_TO_LINEAR[234]]
 const SALT = [SRGB_TO_LINEAR[222], SRGB_TO_LINEAR[216], SRGB_TO_LINEAR[200]];
 /** Shallow saline lakes of closed basins: greener, more turbid than open lakes. */
 const LAKE_SALINE = [SRGB_TO_LINEAR[40], SRGB_TO_LINEAR[92], SRGB_TO_LINEAR[96]];
-const RIPARIAN = [SRGB_TO_LINEAR[62], SRGB_TO_LINEAR[88], SRGB_TO_LINEAR[44]];
+const RIPARIAN = [SRGB_TO_LINEAR[56], SRGB_TO_LINEAR[80], SRGB_TO_LINEAR[44]];
 /** Snow on a frozen river and its treeless floodplain. */
 const FROZEN_RIVER = [SRGB_TO_LINEAR[226], SRGB_TO_LINEAR[232], SRGB_TO_LINEAR[240]];
 
@@ -498,8 +503,13 @@ function drawRivers(rgba: Uint8ClampedArray, hf: HeightField, net: RiverNetwork,
     if (height[p] <= sea) continue;
     if (surf.ice && surf.ice[p] > 128) continue;
     const snow = surf.snow[p] / 255;
-    // Riparian vegetation strips stand out in drylands (Nile-like oases).
-    const arid = surf.desert[p] / 255;
+    // Riparian vegetation strips stand out in drylands (Nile-like oases) and as gallery forests
+    // through dry steppe and savanna.
+    let arid = surf.desert[p] / 255;
+    if (surf.rip) {
+      const r = surf.rip[p] / 255;
+      if (r > arid) arid = r;
+    }
     blendPixel(rgba, p, RIPARIAN, 0.5 * halo[p] * arid * (1 - snow));
     // Frozen, snow-covered rivers vanish under the snow on open ground, but through a winter
     // forest the treeless floodplain and the frozen channel show as a white corridor.

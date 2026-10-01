@@ -15,17 +15,20 @@
  *     cellular decks). The detail follows only DETAIL_SWIRL of the storms' swirl, the cirrus none;
  *  3. the normalized noise z (≈ N(0,1)) plus the cyclone bias is compared with the coverage
  *     threshold z_thr = Φ⁻¹(1 − f): the cloudy area fraction follows the climate's coverage f, and the
- *     excess above the threshold sets a continuous, log-normally textured optical depth (a crisp
- *     edge, an opaque body right behind it, mottled at the finest resolved scales, bright cores);
- *  4. upper cloud: anvils (smooth bright sheets around deep-convective cores, under their tops) and
- *     cirrus (an independent thin veil: patches from the shape fetch's B channel, streaks from a
- *     zonally stretched detail fetch).
+ *     excess above the threshold (relative to a reference that grows in overcast climates, with only
+ *     part of the detail noise) sets a continuous, log-normally textured optical depth that rises
+ *     from zero at the outline: soft, detailed edges and thin translucent cloud over most of the
+ *     cloudy area, bright opaque cloud only well inside (fronts, storm centres, convective cores),
+ *     thicker in cloudier climates (the aux grid's thickness);
+ *  4. a thin, wispy veil around and under the cloud masses; upper cloud: anvils (translucent sheets
+ *     around deep-convective cores, under their tops) and cirrus (an independent thin veil: patches
+ *     from the shape fetch's B channel, streaks from a zonally stretched detail fetch).
  */
 import {
   CLOUD_CELL_EDGE_RANGE, CLOUD_CELL_PERIOD, CLOUD_DETAIL_GRAD_K, CLOUD_DETAIL_PERIOD, CLOUD_NOISE_STD, cloudDetailVolume, sampleCloudNoise,
   type CloudNoiseVolume,
 } from './cloudsNoise';
-import { CYCLONE_COUNT, CYCLONE_STRIDE } from './cloudsModel';
+import { CYCLONE_COUNT, CYCLONE_STRIDE, THICK_MAX } from './cloudsModel';
 
 /* Shared constants (interpolated into the GLSL source). */
 /** Tiles per unit length for the domain-warp fetch (GBA channels; wavelengths ≈ 4200 / 2100 km). */
@@ -41,14 +44,77 @@ export const DETAIL_AMP = 0.78;
  * its strain (~7 σ per unit of domain × warp) stretches the detail into smeared strokes.
  */
 export const DETAIL_WARP = 0.02;
-/** Optical depth per σ² of noise excess above the coverage threshold (super-linear core growth, see opticalDepth). */
-export const TAU_PER_SIGMA = 0.8;
+/**
+ * Optical depth at the reference excess (excessRef: opacity ≈ 0.6 there at the reference thickness,
+ * plain regime). It grows as (excess / reference)^TAU_POW from zero at the coverage threshold, so
+ * cloud edges are soft (translucent wisps fading into clear air, their outline detailed by the detail
+ * noise) and most of the cloudy area is thin; only large excesses (well inside cloud masses: fronts,
+ * storm centres, convective cores) become bright and opaque.
+ */
+export const TAU_SCALE = 0.85;
+export const TAU_POW = 2.5;
+/**
+ * Reference excess (σ) for a climate coverage threshold zthr (without the cyclones' bias):
+ * EXCESS_REF − EXCESS_REF_K·min(zthr, 0). Where the climate is cloudy (negative threshold) the excess
+ * runs high everywhere, and measured from the threshold alone overcast regions would be one opaque
+ * mass: the reference grows there instead, so a storm track stays a mix of thin and thick cloud
+ * (~1/3 opaque); fair-weather regions keep their scattered clouds thin.
+ */
+export const EXCESS_REF = 1.4;
+export const EXCESS_REF_K = 0.7;
+/**
+ * Share of a positive cyclone bias (σ) added to the reference excess: a storm widens its cloud by the
+ * whole bias but thickens it by less, so comma heads and bands are brighter than the cloud around them
+ * yet keep thin parts and texture instead of turning into uniform opaque masses.
+ */
+export const BIAS_REF = 0.35;
+/**
+ * Share of the detail noise in the excess that sets the optical depth (the full detail still shapes
+ * the cloud outline): thick and thin parts follow the synoptic and mesoscale structure (bright bands
+ * and cores, thin sheets between them) instead of pixel-scale detail, which a steep optical-depth curve
+ * turned into glitter.
+ */
+export const TAU_DETAIL = 0.4;
+/** Least share of the full excess kept for the optical depth inside the outline (detail-made fringes). */
+export const TAU_EDGE = 0.35;
+
+/**
+ * Excess driving the optical depth: exS (the excess with only TAU_DETAIL of the detail noise) inside
+ * the cloud outline (ex > 0), at least TAU_EDGE·ex. Mirrored in GLSL.
+ */
+export function tauExcess(ex: number, exS: number): number {
+  return ex > 0 ? Math.max(exS, TAU_EDGE * ex) : 0;
+}
+
+/** Reference excess (σ) for the climate coverage threshold zthr (see EXCESS_REF). Mirrored in GLSL. */
+export function excessRef(zthr: number): number {
+  return EXCESS_REF - EXCESS_REF_K * Math.min(zthr, 0);
+}
+/** Extra optical depth of organized frontal / comma cloud (× organized()) and of deep convection (× cv). */
+export const TAU_FRONT = 0.3;
+export const TAU_CONVECTIVE = 1.2;
 /** Log-normal optical-depth variability per σ of detail noise (mottled mid-thick cloud). */
 export const TAU_TEXTURE = 1.0;
 /** Opacity of the thickest cloud (a little ground always shows through). */
 export const ALPHA_MAX = 0.95;
-/** Optical depth reached right past the cloud edge (crisp outlines instead of fuzzy blobs). */
-export const EDGE_TAU = 0.7;
+
+/**
+ * Opacity of low cloud of optical depth τ: ALPHA_MAX·(1 − (1 + τ/2)^−2), ≈ τ for thin cloud but
+ * saturating more slowly than 1 − e^−τ (as a cloud's reflectance does), so thick cores and decks keep
+ * their optical-depth texture instead of flattening into uniform white. Mirrored in GLSL.
+ */
+export function cloudOpacity(tau: number): number {
+  if (!(tau > 0)) return 0;
+  const q = 1 + 0.5 * tau;
+  return ALPHA_MAX * (1 - 1 / (q * q));
+}
+/**
+ * Cloud brightness (before lighting) from the optical depth τ: THIN_BRIGHT for thin veils, rising as
+ * 1 − exp(−BRIGHT_K·τ) toward white (thin cloud reads as a pale translucent veil over the ground, not
+ * a grey haze; thick cores are white yet still mottled by their optical-depth texture).
+ */
+export const THIN_BRIGHT = 0.75;
+export const BRIGHT_K = 0.35;
 /**
  * Contrast of the storms' coverage bias (× the comma template): clear dry slots and a broken cold
  * sector against the bright frontal band and head, so the comma reads even in overcast storm tracks.
@@ -124,12 +190,13 @@ export const CIRRUS_WARP = 0.06;
 export const CIRRUS_STRAND_MEAN = 0.235;
 /**
  * Anvils: a smooth translucent sheet spreading ANVIL_SPREAD σ (of the synoptic noise) beyond the
- * deep-convective cores, with soft edges and peak opacity ANVIL_TAU.
+ * deep-convective cores, with soft edges and peak opacity ANVIL_TAU (the cores inside stay the only
+ * bright, opaque part of a convective cluster).
  */
 export const ANVIL_SPREAD = 0.55;
-export const ANVIL_TAU = 0.92;
-/** Width (σ of the synoptic noise) of the anvils' soft outer edge (~10 px at the default zoom). */
-export const ANVIL_SOFT = 0.25;
+export const ANVIL_TAU = 0.45;
+/** Width (σ of the synoptic noise) of the anvils' soft outer edge (~15 px at the default zoom). */
+export const ANVIL_SOFT = 0.4;
 /**
  * Mesoscale cellular convection (cell volume, CLOUD_CELL_PERIOD cells per tile): tiles per unit
  * (cells ≈ 0.0072 rad ≈ 46 km: closed stratocumulus cells, open cells), the warp of the cell lattice
@@ -240,7 +307,10 @@ export interface CloudFieldInputs {
   px?: number;
   /** RGBA8 regime grid from buildCloudRegimeGrid. */
   grid: Uint8Array;
-  /** RGBA8 auxiliary grid (cirrus, open cells) from buildCloudGrids; none: no cirrus / open cells. */
+  /**
+   * RGBA8 auxiliary grid (cirrus, open cells, thickness) from buildCloudGrids; none: no cirrus / open
+   * cells, reference thickness.
+   */
   aux?: Uint8Array;
   gw: number;
   gh: number;
@@ -627,6 +697,7 @@ export function cloudAt(
   if (f < 0.004) return out;
   const sc = at(grid, 1), cv = at(grid, 2), cu = at(grid, 3);
   let cirrus = aux ? at(aux, 0) : 0, open = aux ? at(aux, 1) : 0;
+  const thickness = aux ? at(aux, 2) * THICK_MAX : 1;
   let bias = 0, qx = px, qy = py, qz = pz;
   if (inp.cyclones) {
     const e = cycloneEffect(inp.cyclones, px, py, pz, scratchCyc);
@@ -646,7 +717,8 @@ export function cloudAt(
   const stD = unswirl(st, qx - px, qy - py, qz - pz, 1 - DETAIL_SWIRL, scratchStD);
   const stC = unswirl(st, qx - px, qy - py, qz - pz, 1, scratchStC);
   const nb = st[3];
-  const zthr = coverageThreshold(f) - bias;
+  const zthr0 = coverageThreshold(f);
+  const zthr = zthr0 - bias;
   let tau = 0, lowEx = nb - zthr, n1 = 0, ndt = 0;
   if (nb > zthr - 2.8) {
     const sh = detailParams(sc, cv, cu, open, st[8], scratchSh);
@@ -655,6 +727,8 @@ export function cloudAt(
     ndt = detailTexture(scratchOct, octaves, sh.gain);
     const nd = detailSum(scratchOct, octaves, sh);
     let ex = combineNoise(nb, nd, zthr, sc, cv, cu, sh.amp, bias, sh.floor) - zthr;
+    // The same excess with only part of the detail (optical depth, see TAU_DETAIL).
+    const exD = ex - (combineNoise(nb, TAU_DETAIL * nd, zthr, sc, cv, cu, sh.amp, bias, sh.floor) - zthr);
     let cellTau = 1;
     const g2 = octaves >= 2 ? scratchG2 : null;
     if (inp.cvol && sc > 0.02 && ex > -1.5) {
@@ -666,12 +740,13 @@ export function cloudAt(
       ex += openCells(scratchCell[0], open, inp.px ? cellFade(inp.px, CELL_SCALE * OPEN_CELL_SCALE) : 1, 0, nd);
     }
     lowEx = ex;
-    tau = opticalDepth(ex, sc, cv, cu, Math.abs(lat), cellularTexture(ndt, nd, sc, open), bias, cellTau);
+    tau = opticalDepth(tauExcess(ex, ex - exD), sc, cv, cu, Math.abs(lat), cellularTexture(ndt, nd, sc, open), bias, cellTau, thickness, excessRef(zthr0));
   }
-  // Anvils spread under the convective cores' tops (the cores show through), cirrus veils over them
-  // (not over optically thick low cloud, as the shader: invisible there).
-  const core = ALPHA_MAX * (1 - Math.exp(-tau));
-  const anv = anvilAlpha(nb, zthr, cv, n1, ndt);
+  // Anvils and the thin veil spread under the cloud masses (the cores show through), cirrus veils over
+  // them (not over optically thick low cloud, as the shader: invisible there).
+  const core = cloudOpacity(tau);
+  const anvA = anvilAlpha(nb, zthr, cv, n1, ndt);
+  const anv = anvA + veilAlpha(nb, zthr, cu, n1, thickness, ndt) * (1 - anvA);
   const low = core + anv * (1 - core);
   const ci = aux && lowEx < 1.6 ? cirrusAlpha(cirrus, st[7], cirrusFibre(dvol, stC, tmp)) * (1 - smoothstep(1.1, 1.6, lowEx)) : 0;
   out.tau = tau;
@@ -702,8 +777,29 @@ function unswirl(st: Float64Array, dx: number, dy: number, dz: number, k: number
 export function anvilAlpha(nb: number, zthr: number, cv: number, n1: number, ndt = 0): number {
   if (!(cv > 0.02)) return 0;
   const x = nb - zthr + ANVIL_SPREAD + 0.5 * n1 + 0.3 * ndt;
-  return ANVIL_TAU * cv * smoothstep(0, ANVIL_SOFT, x) * (0.75 + 0.25 * smoothstep(ANVIL_SOFT, 4 * ANVIL_SOFT, x));
+  return ANVIL_TAU * cv * smoothstep(0, ANVIL_SOFT, x) * (0.45 + 0.55 * smoothstep(ANVIL_SOFT, 5 * ANVIL_SOFT, x));
 }
+
+/**
+ * Thin veil around and under the cloud masses (thin stratiform cloud and haze: cloud systems fade out
+ * through a translucent margin instead of ending at their outline): opacity up to VEIL_ALPHA, spreading
+ * VEIL_SPREAD σ of the synoptic noise beyond the threshold with a wide soft ramp (VEIL_SOFT σ), lobed
+ * by the coarse detail octave n1 (smooth: fine noise in its outline gave crisp, blotchy edges) and
+ * streaked inside by the texture noise ndt (wisps, not a uniform grey film over the ground); none in
+ * fair-weather cumulus (distinct puffs in clear air), faint in dry climates (thin cloud `thickness`:
+ * about a quarter of VEIL_ALPHA at THICK_MIN, full from a thickness of 0.9). Mirrored in GLSL.
+ */
+export function veilAlpha(nb: number, zthr: number, cu: number, n1: number, thickness = 1, ndt = 0): number {
+  const x = nb - zthr + VEIL_SPREAD + 0.35 * n1;
+  if (!(x > 0) || !(cu < 1)) return 0;
+  const wisps = 0.1 + 0.9 * smoothstep(-0.6, 1.0, 0.3 * n1 + ndt);
+  return VEIL_ALPHA * (1 - cu) * smoothstep(0.3, 0.9, thickness) * smoothstep(0, VEIL_SOFT, x) * wisps;
+}
+
+/** Veil opacity, spread (σ) and soft ramp width (σ) (see veilAlpha). */
+export const VEIL_ALPHA = 0.26;
+export const VEIL_SPREAD = 0.75;
+export const VEIL_SOFT = 1.0;
 
 /**
  * Detail driving the optical-depth texture: the unshaped sum `plain`, blended toward the shaped
@@ -751,28 +847,24 @@ export const REGIME_OFFSET_SC = 0.3;
 export const REGIME_OFFSET_CV = -0.8;
 
 /**
- * Optical depth for a noise excess ex (σ units above the threshold; ≤ 0 → 0): a crisp edge step, a
- * cloud body that thickens within ~TAU_BODY_EX σ of the edge (cloud masses are opaque right behind
- * their outline instead of fading in over hundreds of km of grey haze), then a super-linear growth
- * toward bright cores (more so in deep convection); log-normal texture from the fine detail noise nd
- * (detailTexture: mottled cumulus / stratocumulus, gentle in stratiform and frontal cloud) and the
- * closed-cell factor `cells` (closedCells); thinner in marine stratocumulus, shallow cumulus and polar
- * regions. `edgeW`: the edge step's width in σ (about a pixel on the globe). Mirrored in GLSL.
+ * Optical depth for a noise excess ex (σ units above the threshold; ≤ 0 → 0):
+ * TAU_SCALE·(ex / exRef)^TAU_POW (exRef: excessRef of the climate threshold), zero at the threshold
+ * (soft, translucent edges; thin veils over most of the cloudy area) and super-linear toward bright,
+ * opaque cores; × the climate's cloud `thickness` (cloudThickness), thicker in organized frontal /
+ * comma cloud (strong positive cyclone `bias`, which also raises the excess) and deep convection,
+ * thinner in marine stratocumulus, shallow cumulus and polar regions; log-normal texture from the
+ * fine detail noise nd (detailTexture: mottled cumulus / stratocumulus, gentle in stratiform and
+ * frontal cloud) and the closed-cell factor `cells` (closedCells). Mirrored in GLSL.
  */
 export function opticalDepth(
-  ex: number, sc: number, cv: number, cu: number, absLat: number, nd: number, bias = 0, cells = 1, edgeW = 0.12,
+  ex: number, sc: number, cv: number, cu: number, absLat: number, nd: number, bias = 0, cells = 1, thickness = 1, exRef = 1,
 ): number {
   if (!(ex > 0)) return 0;
-  const texture = Math.exp(TAU_TEXTURE * (0.3 + 0.7 * cu + 0.45 * sc + 0.25 * cv) * (1 - 0.5 * organized(bias)) * nd);
-  const thick = (1 - 0.45 * smoothstep(1.05, 1.4, absLat)) * (1 - 0.25 * sc - 0.72 * cu + 0.35 * cv);
-  const k = 0.6 + 0.3 * cv;
-  const body = TAU_BODY * (1 - Math.exp(-ex / TAU_BODY_EX)) + TAU_PER_SIGMA * k * ex * ex;
-  return (body * texture * cells + EDGE_TAU * smoothstep(0, edgeW, ex)) * thick;
+  const org = organized(bias);
+  const texture = Math.exp(TAU_TEXTURE * (0.35 + 0.6 * cu + 0.4 * sc + 0.2 * cv) * (1 - 0.3 * org) * nd);
+  const regime = (1 - 0.45 * smoothstep(1.05, 1.4, absLat)) * (1 - 0.25 * sc - 0.6 * cu + TAU_CONVECTIVE * cv) * (1 + TAU_FRONT * org);
+  return TAU_SCALE * Math.pow(ex / (exRef + BIAS_REF * Math.max(bias, 0)), TAU_POW) * thickness * regime * texture * cells;
 }
-
-/** Optical depth of the cloud body (reached within a few TAU_BODY_EX σ of the edge). */
-export const TAU_BODY = 1.8;
-export const TAU_BODY_EX = 0.35;
 
 /**
  * Cirrus veil opacity (mirror of the shader): coverage fraction `cirrus`, patch noise cp (shape
@@ -793,5 +885,5 @@ export function cirrusAlphaThr(thr: number, cp: number, nc: number, fade = 1): n
   if (exP <= -0.6) return 0;
   const n = nc * fade;
   const strand = smoothstep(0.2, 1.3, nc);
-  return CIRRUS_TAU * smoothstep(0, 0.7, exP + 0.3 * n) * (0.15 + 0.85 * (CIRRUS_STRAND_MEAN + fade * (strand - CIRRUS_STRAND_MEAN)));
+  return CIRRUS_TAU * smoothstep(0, 0.9, exP + 0.15 * n) * (0.3 + 0.7 * (CIRRUS_STRAND_MEAN + fade * (strand - CIRRUS_STRAND_MEAN)));
 }

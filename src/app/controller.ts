@@ -17,9 +17,10 @@ import { EditorBridge } from './editorBridge';
 import { wireStoreEffects } from './effects';
 import { layerUsesClimate } from '../worker/layerInfo';
 import { downloadBlob, downloadUrl, exportName, rgbaToPngBlob } from './exportImage';
-import { fmtNum } from './format';
+import { fmtMyr, fmtNum } from './format';
 import { FrameTask } from './frameTask';
 import { HoverController } from './hoverController';
+import { landFractionAt } from './landStats';
 import { PlaybackPresenter } from './playbackPresenter';
 import { installShortcuts, type Command } from './keyboard';
 import { RateMeter } from './rateMeter';
@@ -35,6 +36,17 @@ import type { SimulateTab } from './ui/tabs/simulateTab';
 import { Toasts } from './ui/toasts';
 import type { Viewport } from './ui/viewport';
 import { ViewSync } from './viewSync';
+import {
+  fmtAgo, idbWorldStore, isReproducible, navigationType, rotateSessionToken, sessionToken, startupDecision, withTimeout,
+  type SavedWorld, type SavedWorldMeta, type WorldStore,
+} from './worldStore';
+
+/** Settle time before the current world is saved for the next reload, ms. */
+const PERSIST_DEBOUNCE_MS = 1500;
+/** During playback the world is saved at most this often, ms. */
+const PERSIST_PLAYING_MS = 20_000;
+/** A hung IndexedDB must not hold up the first world, ms. */
+const PERSIST_STARTUP_TIMEOUT_MS = 2500;
 
 export interface AppWorkers {
   sim: () => WorkerLike;
@@ -71,12 +83,35 @@ export class App implements Commands {
   private epoch = 1;
   private mesh: SphereMesh | null = null;
   private snapshot: WorldSnapshot | null = null;
+  /**
+   * Elevations of the latest LIVE snapshot (not a history keyframe): land % at the current sea level
+   * is shown beside the live simulation statistics, also while history is scrubbed.
+   */
+  private liveElev: Float32Array | null = null;
   private climateResult: ClimateResult | null = null;
   /** A full-quality still frame is on its way (pause, step, scrub, load). */
   private awaitingStill = false;
   private generating = false;
+  /** Settles when the world load in flight (`generating`) is done. */
+  private worldLoad: Promise<unknown> = Promise.resolve();
   private scrubTarget: number | null | undefined = undefined;
   private readonly scrubTask = new FrameTask(() => this.sendScrub());
+  /** Saved worlds (null: IndexedDB unavailable). */
+  private readonly worldStore: WorldStore | null;
+  private persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Identity of the last saved state (skip saving it twice) and when it was saved. */
+  private persistedKey = '';
+  private lastPersist = 0;
+  /** Bumped on every world load (an edited world at step 0 differs from the previous one). */
+  private loadSeq = 0;
+  /** `?fresh` in the URL: neither restore nor save worlds. */
+  private readonly fresh = ((): boolean => {
+    try {
+      return new URLSearchParams(globalThis.location?.search ?? '').has('fresh');
+    } catch {
+      return false;
+    }
+  })();
   /** Playback frames shown per second, and the paint worker's last paint time. */
   private readonly frameRate = new RateMeter();
   private lastPaintMs = 0;
@@ -90,8 +125,9 @@ export class App implements Commands {
     setTimer: (fn, ms) => void globalThis.setTimeout(fn, ms),
   });
 
-  constructor(root: HTMLElement, workers: AppWorkers) {
+  constructor(root: HTMLElement, workers: AppWorkers, worldStore: WorldStore | null = idbWorldStore()) {
     const storage = browserStorage();
+    this.worldStore = worldStore;
     this.store = createStore(initialState(loadSettings(storage)), reduce);
     const ctx: UiContext = { store: this.store, commands: this };
 
@@ -152,19 +188,156 @@ export class App implements Commands {
         this.sim.request({ type: 'setTectonicParams', epoch: this.epoch, params })
           .catch((e) => this.toasts.error('Invalid simulation parameters', errorMessage(e)));
       },
-      sendSpeed: (stepsPerFrame) => this.sim.send({ type: 'setSpeed', epoch: this.epoch, stepsPerFrame }),
+      sendSpeed: (stepsPerFrame, smooth) => this.sim.send({ type: 'setSpeed', epoch: this.epoch, stepsPerFrame, adaptiveFrames: smooth }),
     }, storage);
     installShortcuts(window, () => ({ editorActive: this.store.getState().runtime.editorActive }), (c) => this.runShortcut(c));
     this.store.watch((s) => ({
       phase: s.runtime.climate.phase, pct: Math.round(s.runtime.climate.progress * 100), layer: s.settings.view.layer,
       playing: s.runtime.playing, seasons: s.runtime.seasonsPlaying, editing: s.runtime.editorActive,
     }), () => this.updateRendering(), { equal: shallowEqual });
+    // Land % follows the one sea level (header, World and Simulate tabs).
+    this.store.watch((s) => s.settings.seaLevel, (sea) => {
+      if (this.liveElev) this.store.dispatch({ type: 'landFraction', value: landFractionAt(this.liveElev, sea) });
+    });
 
     const want = this.store.getState().settings.view.view;
     const kind = this.viewport.setKind(want);
     if (kind !== want) this.store.dispatch({ type: 'patchView', patch: { view: kind } });
     this.viewSync.viewProps();
+    void this.startup();
+    // Hidden tabs may be discarded: save the latest state while we still can.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') this.persistNow();
+    });
+  }
+
+  /**
+   * First world: this tab's previous world after a reload (when the World-tab settings would not
+   * rebuild it anyway), else a generated one — with an offer to restore the most recent saved
+   * world (see worldStore.ts for the policy; `?fresh` skips both).
+   */
+  private async startup(): Promise<void> {
+    const store = this.worldStore;
+    const fresh = this.fresh;
+    const key = worldParamsKey(this.store.getState().settings.world);
+    const nav = navigationType();
+    const token = sessionToken(false);
+    if (store && !fresh && nav === 'reload' && token) {
+      const own = await withTimeout(store.load(token), PERSIST_STARTUP_TIMEOUT_MS, null);
+      const d = startupDecision({ navigationType: nav, sessionToken: token, own: own?.meta ?? null, latest: null, currentParamsKey: key, fresh });
+      if (d.kind === 'restore' && own) {
+        void this.restoreWorld(own);
+        return;
+      }
+    }
+    // Not a reload of this tab's world: start a new lineage so the saved one stays restorable.
+    if (!fresh) rotateSessionToken();
     this.generate();
+    if (!store || fresh) return;
+    const latest = await withTimeout(store.latest(), PERSIST_STARTUP_TIMEOUT_MS, null);
+    const d = startupDecision({ navigationType: 'navigate', sessionToken: token, own: null, latest, currentParamsKey: key, fresh });
+    if (d.kind !== 'offer') return;
+    const m = d.meta;
+    this.toasts.show('info', 'Previous world available', `${fmtMyr(m.time)} · ${m.plates} plates · ${fmtNum(m.meshN / 1000)}k cells · saved ${fmtAgo(Date.now() - m.savedAt)}`, 12_000, {
+      label: 'Restore it',
+      onClick: () => {
+        void store.load(m.token).then(async (w) => {
+          if (!w) {
+            this.toasts.show('warn', 'That world is no longer available');
+            return;
+          }
+          // It continues in this tab's lineage (saved again under this tab's token).
+          if (await this.restoreWorld(w)) void store.remove(m.token);
+        });
+      },
+    });
+  }
+
+  /** Load a saved world into the simulation (with "Start fresh" to generate instead). */
+  private async restoreWorld(saved: SavedWorld): Promise<boolean> {
+    // "Restore it" clicked while a world loads (the startup world, the dice): restore once that load
+    // is done instead of silently dropping the click.
+    for (let i = 0; i < 4 && this.generating; i++) await this.worldLoad.catch(() => undefined);
+    if (this.generating) {
+      this.toasts.show('warn', 'A world is still loading', 'Try restoring again in a moment.');
+      return false;
+    }
+    this.generating = true;
+    let settled!: () => void;
+    this.worldLoad = new Promise<void>((resolve) => (settled = resolve));
+    const s = this.store.getState();
+    this.beginNewWorld('Restoring your world…');
+    const draft = saved.draft;
+    let failed: unknown = null;
+    try {
+      const loaded = await this.sim.request(
+        { type: 'loadDraft', epoch: this.epoch, draft, tectonic: s.settings.tectonic, display: displaySettings(s) },
+        // Read fresh from storage: its buffers can move.
+        transferList(draft.plate, draft.crust, draft.elev, draft.age, draft.orogeny),
+      );
+      this.onWorldLoaded(loaded, saved.meta.paramsKey);
+      const m = saved.meta;
+      this.toasts.show('success', 'Restored previous world', `${fmtMyr(loaded.time)} · ${m.plates} plates · saved ${fmtAgo(Date.now() - m.savedAt)}`, 10_000, {
+        label: 'Start fresh',
+        onClick: () => this.generate(),
+      });
+    } catch (e) {
+      failed = e;
+    } finally {
+      this.generating = false;
+      this.store.dispatch({ type: 'taskEnd', id: 'generate' });
+      settled();
+    }
+    if (failed !== null) {
+      this.toasts.show('warn', 'Could not restore the previous world', `${errorMessage(failed)} — generating a new one.`);
+      this.generate();
+      return false;
+    }
+    return true;
+  }
+
+  /** Save the current world for the next reload once it settles (debounced). */
+  private schedulePersist(delayMs = PERSIST_DEBOUNCE_MS): void {
+    if (!this.worldStore) return;
+    if (this.persistTimer) clearTimeout(this.persistTimer);
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null;
+      this.persistNow();
+    }, delayMs);
+  }
+
+  private persistNow(): void {
+    // `?fresh`: a session that neither restores nor saves worlds (also handy for automated checks).
+    const store = this.fresh ? null : this.worldStore;
+    const rt = this.store.getState().runtime;
+    if (!store || !rt.worldLoaded || this.generating || !rt.stats) return;
+    const key = `${this.loadSeq}|${rt.worldSeed}|${rt.meshN}|${rt.steps}`;
+    if (key === this.persistedKey) return;
+    const token = sessionToken(true);
+    if (!token) return;
+    this.persistedKey = key;
+    this.lastPersist = performance.now();
+    const epoch = this.epoch;
+    const plates = rt.stats.plateCount;
+    const paramsKey = rt.worldParams;
+    const current = worldParamsKey(this.store.getState().settings.world);
+    // A fresh world the World-tab settings rebuild exactly is not worth 2 MB: forget this tab's
+    // older world instead (a reload must not bring that one back).
+    if (isReproducible({ token, savedAt: 0, time: rt.time, meshN: rt.meshN, seed: rt.worldSeed, steps: rt.steps, plates, paramsKey }, current)) {
+      void store.remove(token);
+      return;
+    }
+    this.sim.request({ type: 'getDraft', epoch })
+      .then((draft) => {
+        const meta: SavedWorldMeta = {
+          token, savedAt: Date.now(), time: draft.time, meshN: draft.n, seed: draft.seed, steps: draft.stepIndex ?? 0, plates, paramsKey,
+        };
+        return store.save({ meta, draft });
+      })
+      .catch(() => {
+        // Persistence is a convenience: a failed save is retried at the next settle point.
+        this.persistedKey = '';
+      });
   }
 
   /* ------------------------------------------------------------------ */
@@ -177,7 +350,7 @@ export class App implements Commands {
     this.generating = true;
     this.beginNewWorld('Generating world…');
     const paramsKey = worldParamsKey(s.settings.world);
-    this.sim.request({
+    this.worldLoad = this.sim.request({
       type: 'generate', epoch: this.epoch, meshN: s.settings.world.meshN, params: generateParams(s.settings.world),
       tectonic: s.settings.tectonic, display: displaySettings(s),
     })
@@ -214,7 +387,10 @@ export class App implements Commands {
     this.setPlaying(false);
     this.expectStill();
     this.sim.request({ type: 'step', epoch: this.epoch, steps: s.settings.speed, display: displaySettings(s) })
-      .then(() => this.climateAfterChange('full'))
+      .then(() => {
+        this.climateAfterChange('full');
+        this.schedulePersist();
+      })
       .catch((e) => this.toasts.error('Step failed', errorMessage(e)));
   }
 
@@ -249,7 +425,9 @@ export class App implements Commands {
     const epoch = this.epoch;
     this.sim.request({ type: 'playFromKeyframe', epoch: this.epoch, index, display: displaySettings(this.store.getState()) })
       .then((loaded) => {
+        this.loadSeq++;
         this.store.dispatch({ type: 'worldLoaded', ...loaded });
+        this.schedulePersist();
         // "Play from here" plays, unless the user moved on meanwhile (new world, editor, pause/step).
         const rt = this.store.getState().runtime;
         const play = epoch === this.epoch && !rt.editorActive && !this.generating && !rt.playing;
@@ -310,7 +488,7 @@ export class App implements Commands {
     const s = this.store.getState();
     this.frameRate.reset();
     this.setPlaying(true);
-    this.sim.request({ type: 'play', epoch: this.epoch, stepsPerFrame: s.settings.speed, display: displaySettings(s) })
+    this.sim.request({ type: 'play', epoch: this.epoch, stepsPerFrame: s.settings.speed, display: displaySettings(s), adaptiveFrames: s.settings.smoothPlayback })
       .catch((e) => {
         this.toasts.error('Could not start playback', errorMessage(e));
         this.setPlaying(false);
@@ -324,6 +502,7 @@ export class App implements Commands {
     this.sim.request({ type: 'pause', epoch: this.epoch, display: displaySettings(this.store.getState()) })
       .then(() => {
         if (requestClimate) this.climateAfterChange('full');
+        this.schedulePersist();
       })
       .catch((e) => this.toasts.error('Pause failed', errorMessage(e)));
   }
@@ -359,7 +538,9 @@ export class App implements Commands {
 
   private onWorldLoaded(loaded: WorldLoaded, paramsKey: string): void {
     const prevMesh = this.store.getState().runtime.meshN;
+    this.loadSeq++;
     this.store.dispatch({ type: 'worldLoaded', ...loaded, paramsKey });
+    this.schedulePersist();
     this.editor.worldChanged(prevMesh !== loaded.meshN);
     // A new world always gets its climate (the satellite view is meaningless without one); "Auto
     // climate" only governs updates while the world evolves (playback, pause, step, scrub).
@@ -383,6 +564,8 @@ export class App implements Commands {
       return;
     }
     this.generating = true;
+    let settled!: () => void;
+    this.worldLoad = new Promise<void>((resolve) => (settled = resolve));
     const s = this.store.getState();
     this.beginNewWorld('Loading your world…');
     try {
@@ -399,6 +582,7 @@ export class App implements Commands {
     } finally {
       this.generating = false;
       this.store.dispatch({ type: 'taskEnd', id: 'generate' });
+      settled();
     }
   }
 
@@ -451,7 +635,10 @@ export class App implements Commands {
     sim.on('snapshot', (e) => {
       if (isStaleEpoch(e.epoch, this.epoch) && this.snapshot) return;
       this.snapshot = e.snapshot;
-      this.store.dispatch({ type: 'snapshot', snapshotId: e.snapshot.id, stats: e.stats });
+      // The stats are the live simulation's (also while a history keyframe is shown): land % too.
+      if (e.keyframe === null) this.liveElev = e.snapshot.elev;
+      const landFraction = this.liveElev ? landFractionAt(this.liveElev, this.store.getState().settings.seaLevel) : undefined;
+      this.store.dispatch({ type: 'snapshot', snapshotId: e.snapshot.id, stats: e.stats, landFraction });
       this.simulateTab.setPlates(e.snapshot.plates);
       this.viewSync.legend();
       this.hover.refresh();
@@ -464,14 +651,18 @@ export class App implements Commands {
       this.store.dispatch({ type: 'status', playing, time: e.time, steps: e.steps, perf });
       if (playing) {
         this.climate.playbackTick(e.time);
+        if (this.worldStore && performance.now() - this.lastPersist > PERSIST_PLAYING_MS && !this.persistTimer) this.schedulePersist(0);
         // Sim and paint workers run side by side: the frame rate follows the slower stage.
-        const simMs = perf.lastStepMs * this.store.getState().settings.speed + (perf.lastSnapshotMs ?? 0);
+        // Adaptive frames: the speed setting is an upper bound on steps per frame.
+        const stepsPerFrame = perf.stepsPerFrame ?? this.store.getState().settings.speed;
+        const simMs = perf.lastStepMs * stepsPerFrame + (perf.lastSnapshotMs ?? 0);
         // Several painters work side by side: each paints every n-th frame.
         const n = Math.max(1, this.sim.painterCount);
         const painters = n > 1 ? ` ×${n}` : '';
         this.viewport.setPerf(
           `${fmtNum(perf.framesPerSec, 0)} fps · sim ${fmtNum(simMs, 0)} ms ∥ paint ${fmtNum(perf.lastPaintMs, 0)} ms${painters}`,
-          `${fmtNum(perf.stepsPerSec, 1)} steps/s · per frame: ${this.store.getState().settings.speed} step(s) at ${fmtNum(perf.lastStepMs, 0)} ms` +
+          `${fmtNum(perf.stepsPerSec, 1)} steps/s · per frame: ${stepsPerFrame} step(s) at ${fmtNum(perf.lastStepMs, 0)} ms` +
+            (stepsPerFrame < this.store.getState().settings.speed ? ` (up to ${this.store.getState().settings.speed}: frames go out while the paint pipeline is free)` : '') +
             ` + snapshot ${fmtNum(perf.lastSnapshotMs ?? 0, 0)} ms (sim worker), paint ${fmtNum(perf.lastPaintMs, 0)} ms` +
             (n > 1 ? ` per frame on each of ${n} paint workers` : ' (paint worker)'),
         );

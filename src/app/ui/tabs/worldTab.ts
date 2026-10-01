@@ -2,7 +2,7 @@
 import type { UiContext } from '../../commands';
 import { fmtMyr, fmtNum, fmtPercent } from '../../format';
 import { CONTINENT_MODES, MESH_RESOLUTIONS, WORLD_SPECS } from '../../schema';
-import { worldParamsKey, type WorldSettings } from '../../state';
+import { shownLandFraction, worldParamsKey, type WorldSettings } from '../../state';
 import { shallowEqual } from '../../store';
 import { button, hint, section, seedField, segmented, slider, statGrid, type Control } from '../controls';
 import { h, setText, toggleClass } from '../dom';
@@ -57,10 +57,10 @@ export function createWorldTab(ctx: UiContext): HTMLElement {
     { key: 'elev', label: 'Highest peak' },
     { key: 'time', label: 'Simulated time' },
   ]);
-  store.watch((s) => ({ st: s.runtime.stats, n: s.runtime.meshN, seed: s.runtime.worldSeed }), ({ st, n }) => {
+  store.watch((s) => ({ st: s.runtime.stats, n: s.runtime.meshN, seed: s.runtime.worldSeed, land: shownLandFraction(s.runtime) }), ({ st, n, land }) => {
     stats.set('cells', n ? fmtNum(n) : '—');
     stats.set('plates', st ? String(st.plateCount) : '—');
-    stats.set('land', st ? fmtPercent(st.landFraction, 1) : '—');
+    stats.set('land', land !== null ? fmtPercent(land, 1) : '—');
     stats.set('cont', st ? fmtPercent(st.continentalFraction, 1) : '—');
     stats.set('elev', st ? `${fmtNum(st.maxElevation)} m` : '—');
     stats.set('time', st ? fmtMyr(st.time) : '—');

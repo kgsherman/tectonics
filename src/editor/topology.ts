@@ -177,3 +177,71 @@ export function plateAnchors(mesh: SphereMesh, plate: Int16Array, numPlates: num
   }
   return out;
 }
+
+/** Hops from every cell to the nearest plate boundary (0 on boundary cells; -1 everywhere if no boundary exists). */
+export function boundaryDistance(mesh: SphereMesh, plate: Int16Array): Int32Array {
+  const { n, adjOffset, adj } = mesh;
+  const dist = new Int32Array(n).fill(-1);
+  const queue = new Int32Array(n);
+  let tail = 0;
+  for (let i = 0; i < n; i++) {
+    const a = plate[i];
+    for (let e = adjOffset[i]; e < adjOffset[i + 1]; e++) {
+      if (plate[adj[e]] !== a) {
+        dist[i] = 0;
+        queue[tail++] = i;
+        break;
+      }
+    }
+  }
+  for (let head = 0; head < tail; head++) {
+    const i = queue[head];
+    for (let e = adjOffset[i]; e < adjOffset[i + 1]; e++) {
+      const j = adj[e];
+      if (dist[j] < 0) {
+        dist[j] = dist[i] + 1;
+        queue[tail++] = j;
+      }
+    }
+  }
+  return dist;
+}
+
+/** Lat/lon buckets for spreading interior points over a plate (≈15° × 15°). */
+const BUCKET_DEG = 15;
+const BUCKET_ROWS = Math.ceil(180 / BUCKET_DEG);
+const BUCKET_COLS = Math.ceil(360 / BUCKET_DEG);
+
+/**
+ * Alternative motion-arrow positions per plate: well-interior cells (boundary distance ≥ `minShare`
+ * of the plate's deepest cell, at least 1 hop) spread over the plate — the deepest cell of each
+ * ~15° lat/lon bucket the plate covers. When a plate's anchor is on the hidden side of the globe its
+ * arrow can be drawn at the visible one of these nearest the view centre. Plates without cells get
+ * an empty list; a plate covering the whole sphere gets one point per bucket.
+ */
+export function plateInteriorPoints(mesh: SphereMesh, plate: Int16Array, numPlates: number, minShare = 0.4): Vec3[][] {
+  const { n, xyz, lat, lon } = mesh;
+  const dist = boundaryDistance(mesh, plate);
+  const maxD = new Int32Array(numPlates).fill(-1);
+  for (let i = 0; i < n; i++) {
+    const k = plate[i];
+    if (k >= 0 && k < numPlates && dist[i] > maxD[k]) maxD[k] = dist[i];
+  }
+  const nb = BUCKET_ROWS * BUCKET_COLS;
+  const best = new Map<number, number>();
+  for (let i = 0; i < n; i++) {
+    const k = plate[i];
+    if (!(k >= 0 && k < numPlates)) continue;
+    const d = dist[i];
+    // Plates without a boundary (dist -1 everywhere) accept every cell.
+    if (maxD[k] >= 0 && d < Math.max(1, Math.round(minShare * maxD[k]))) continue;
+    const r = Math.min(BUCKET_ROWS - 1, Math.max(0, Math.floor(((lat[i] * 180) / Math.PI + 90) / BUCKET_DEG)));
+    const c = Math.min(BUCKET_COLS - 1, Math.max(0, Math.floor(((lon[i] * 180) / Math.PI + 180) / BUCKET_DEG)));
+    const key = k * nb + r * BUCKET_COLS + c;
+    const cur = best.get(key);
+    if (cur === undefined || dist[cur] < d) best.set(key, i);
+  }
+  const out: Vec3[][] = Array.from({ length: numPlates }, () => []);
+  for (const [key, i] of best) out[Math.floor(key / nb)].push([xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2]]);
+  return out;
+}

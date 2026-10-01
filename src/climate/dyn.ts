@@ -102,7 +102,10 @@ export function computeDynamics(
   // Land snow and ice always come from the cold pass 1 (deterministic in the input: glacier margins
   // are hysteretic, and a warm start from a previous result would carry its margins along); the
   // glacier topology is settled on pass-1 balances only and held afterwards (energyIce.ts).
-  if (S !== S1) S.M.set(S1.M);
+  if (S !== S1) {
+    S.M.set(S1.M);
+    S.Ms.set(S1.Ms);
+  }
   lap('dyn.pass1');
   progress(0.35);
 

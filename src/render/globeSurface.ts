@@ -19,6 +19,26 @@ export interface SharedUniforms {
   uLightMode: IUniform<number>;
   uSunDir: IUniform<Vector3>;
   uAtmoColor: IUniform<Color>;
+  /**
+   * The cloud layer's grids for the surface's sun glint (set by GlobeClouds while it shows clouds):
+   * the regime grid (R = cloud coverage fraction) and the smoothed wind (RG, m/s). uCloudOn: 0 = none
+   * (no cloud fade, a constant sea roughness), 1 = coverage only, 2 = coverage and wind.
+   */
+  uCloudGrid?: IUniform<Texture | null>;
+  uCloudWind?: IUniform<Texture | null>;
+  uCloudOn?: IUniform<number>;
+}
+
+/** The shared uniforms of a globe (lighting, atmosphere colour, cloud grids for the glint). */
+export function createSharedUniforms(atmosphere: Color): Required<SharedUniforms> {
+  return {
+    uLightMode: { value: LIGHT_RELIEF },
+    uSunDir: { value: new Vector3(1, 0, 0) },
+    uAtmoColor: { value: atmosphere.clone() },
+    uCloudGrid: { value: null },
+    uCloudWind: { value: null },
+    uCloudOn: { value: 0 },
+  };
 }
 
 /** Surface mesh resolution (segments around × pole to pole). */
@@ -65,6 +85,9 @@ export class GlobeSurface {
       uLightMode: shared.uLightMode,
       uSunDir: shared.uSunDir,
       uAtmoColor: shared.uAtmoColor,
+      uCloudGrid: shared.uCloudGrid ?? { value: null },
+      uCloudWind: shared.uCloudWind ?? { value: null },
+      uCloudOn: shared.uCloudOn ?? { value: 0 },
       uCamUpLeft: { value: new Vector3(0, 1, 0) },
       uBrushOn: { value: 0 },
       uBrushCenter: { value: new Vector3(0, 1, 0) },

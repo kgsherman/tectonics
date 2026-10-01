@@ -79,6 +79,12 @@ export const ebmTuning = {
   snowWetWeight: 0,
   albedoIceSheetMelt: 0.5,
   /**
+   * Planetary albedo of a melting glacier surface that still carries its seasonal snow (wet snow,
+   * firn: the percolation zone). The glacier darkens to albedoIceSheetMelt only as that layer
+   * (EbmState.Ms) melts away and bare ice is exposed (the ablation zone below the equilibrium line).
+   */
+  albedoIceSheetWet: 0.63,
+  /**
    * Perennial mass (firn and ice) turns snow into glacier: glacier weight G = smoothstep(glacierMassLow,
    * glacierMassHigh, M), which takes the ice-sheet albedo, is never patchy on high terrain and
    * behaves as an ice sheet at the output (EF/ET, perennial snow). Mass is capped at glacierMassMax
@@ -93,8 +99,11 @@ export const ebmTuning = {
    * glacierInitReachKm); the mass balance then keeps, spreads or removes the ice (the ice-covered
    * branch of the hysteresis: an ice sheet keeps its own summers cold). Other land starts bare and
    * glaciates only where its seasonal snow survives the summer or a sheet's surplus can feed it.
+   * (−14 °C: the interiors of large polar continents (−20 to −30 °C) and of Greenland and
+   * Antarctica start glaciated; continental Siberia (≈ −12 °C), dry and ice-free even in glacial
+   * times, does not.)
    */
-  glacierInitT: -12,
+  glacierInitT: -14,
   /**
    * The ice-covered branch needs room for an ice-sheet dome: only land at least this far (km) from
    * the ocean starts glaciated. Islands and coastal strips start bare (the interglacial branch) and
@@ -111,6 +120,26 @@ export const ebmTuning = {
    * glacier margins do not depend on how many coupled years a run gets (fast, full, warm starts).
    */
   glacierTopologyYears: 3,
+  /**
+   * The interior of a cold-start ice sheet farther than this (km) from its initial margin is never
+   * removed by the topology updates; only its outer band adjusts to the mass balance (energyIce.ts).
+   * A sheet that size is kilometres thick and responds over millennia, and its own climate is cold
+   * (bright, high, and decoupled from the warm air around it); the uncoupled pass 1 that settles the
+   * margins lacks the air advection that cools it, so without this its budget melted the ice sheets
+   * of large polar continents from the margin inwards. Only cells deeper than this inside the
+   * initial sheet are protected: narrow ice caps can still vanish entirely.
+   */
+  glacierCoreKm: 400,
+  /**
+   * Except the core of a sheet that is not sustained even on the ice-covered branch: when more than
+   * glacierCoreReleaseShare of its core area melted out in the first year of the run (the cold
+   * start's own ice-albedo summer) with more than glacierCoreReleaseMelt (kg/m² w.e.) of melt to
+   * spare on the bare ground, its core is not protected (energyIce.releaseMeltedCore; e.g. a polar
+   * continent under high-obliquity summers). On the QA supercontinent ~15 % of the core melts out in
+   * that year (its core stays protected); on a tilt-45° Antarctica all of it (no ice sheet is kept).
+   */
+  glacierCoreReleaseShare: 0.5,
+  glacierCoreReleaseMelt: 0,
   /**
    * A sheet advances only onto bare land whose melt left over once its seasonal snow is gone stays
    * below this (kg/m²/yr w.e.): ice flow extends the margin into cool ground next to it, but cannot
@@ -215,6 +244,11 @@ export const ebmTuning = {
    */
   inversionCloudClear: 0.6,
   inversionCloudOvercast: 0.9,
+  /**
+   * Reference air-mass temperature (K) of the inversion's radiative factor min(1, (T/ref)⁴); 0 = off.
+   * The surface's net longwave loss that builds the inversion scales roughly with σT⁴.
+   */
+  inversionRadiativeRefK: 225,
   /** Sea-water freezing point °C. */
   freezeT: -1.8,
   /**

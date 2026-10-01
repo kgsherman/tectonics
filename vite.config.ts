@@ -26,7 +26,7 @@ function devSnapshots(): Plugin {
           let body = Buffer.concat(chunks);
           const text = body.subarray(0, 32).toString('latin1');
           if (text.startsWith('data:')) body = Buffer.from(body.toString('latin1').split(',')[1] ?? '', 'base64');
-          const file = resolve(__dirname, 'scratch/snaps', name);
+          const file = resolve(server.config.root, 'scratch/snaps', name);
           mkdirSync(dirname(file), { recursive: true });
           writeFileSync(file, body);
           res.setHeader('content-type', 'text/plain');

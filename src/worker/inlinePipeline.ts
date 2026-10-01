@@ -8,7 +8,7 @@ import type { ClimateShelf } from './climateShelf';
 import type { KeyframeStore } from './keyframes';
 import { PaintHost, type PaintHostEnv, type PortLike } from './paintHost';
 import { requestTarget, type PostFn, type SimEvent, type SimRequest } from './protocol';
-import { SimHost } from './simHost';
+import { SimHost, type SimHostEnv } from './simHost';
 import type { PaintCache } from '../render/paint';
 
 export interface InlineEnv {
@@ -24,6 +24,8 @@ export interface InlineEnv {
   later?: PaintHostEnv['later'];
   /** Helper painters (playback only) besides the primary. Default 0. */
   helpers?: number;
+  /** Adaptive playback frames (see SimHostEnv). */
+  adaptiveFrames?: SimHostEnv['adaptiveFrames'];
 }
 
 /** Two connected in-process ports: postMessage structured-clones and delivers in a later task. */
@@ -50,7 +52,7 @@ export class InlinePipeline {
   readonly painters: PaintHost[];
 
   constructor(env: InlineEnv) {
-    this.sim = new SimHost({ post: env.post, schedule: env.schedule, now: env.now, keyframes: env.keyframes });
+    this.sim = new SimHost({ post: env.post, schedule: env.schedule, now: env.now, keyframes: env.keyframes, adaptiveFrames: env.adaptiveFrames });
     this.paint = new PaintHost({
       post: env.post, schedule: env.schedule, now: env.now, climates: env.climates, paintCache: env.paintCache,
       releaseScratch: env.releaseScratch, idleReleaseMs: env.idleReleaseMs, later: env.later,

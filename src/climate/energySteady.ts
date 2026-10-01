@@ -5,7 +5,7 @@
  *  2. analytic periodic local solution: T(t) = T̄ + Re Σ_h F̂_h e^{ihωt} / (λ + ihωC) for the annual
  *     and semi-annual harmonics of the absorbed insolation, used as the Jan 1 initial state.
  */
-import { iceSheetWeight, snowCoverFactor, snowWeight, syncOceanAirT, type EbmModel, type EbmState } from './energy';
+import { SECONDS_PER_YEAR, iceSheetWeight, snowCoverFactor, snowfallRate, snowWeight, syncOceanAirT, type EbmModel, type EbmState } from './energy';
 import { makeCyclicWork, nearestValidIndex, solveCyclic } from './numerics';
 import { ebmTuning, spinupTuning } from './tuning';
 
@@ -163,11 +163,15 @@ export function periodicInit(M: EbmModel, Tbar: Float64Array, S: EbmState): void
     }
   }
   const Tf = t.freezeT;
+  // Land that starts glaciated starts with its ice-sheet albedo and a surface no warmer than the
+  // melting point, so the first model year does not melt it with a bare-land summer.
+  initialGlaciers(M, Tbar, S);
   for (let j = 0; j < ny; j++) {
     for (let c = 0; c < nx; c++) {
       const i = j * nx + c;
       const tb = Tbar[i];
-      const alb = cellAlbedo(M, i, j, tb);
+      const sheet = land[i] === 1 && S.M[i] > 0;
+      const alb = sheet ? Math.max(cellAlbedo(M, i, j, tb), t.albedoIceSheet) : cellAlbedo(M, i, j, tb);
       const C = land[i] ? t.cLand : cOcean[j];
       // Forcing (1−α)(a cos + b sin) = Re(F̂ e^{iωt}) with F̂ = (1−α)(a − i b); response F̂/(λ + ihωC) at t = 0.
       let dT = 0;
@@ -182,10 +186,9 @@ export function periodicInit(M: EbmModel, Tbar: Float64Array, S: EbmState): void
       const T0 = tb + dT;
       S.Tann[i] = land[i] ? tb - M.lapse[i] : tb;
       if (land[i]) {
-        S.T[i] = T0;
+        S.T[i] = sheet ? Math.min(T0, M.lapse[i]) : T0;
         S.E[i] = 0;
         S.Ti[i] = 0;
-        S.M[i] = 0;
       } else if (T0 > Tf) {
         S.E[i] = cOcean[j] * (T0 - Tf);
         S.Ti[i] = Tf;
@@ -199,7 +202,6 @@ export function periodicInit(M: EbmModel, Tbar: Float64Array, S: EbmState): void
     }
   }
   syncOceanAirT(M, S);
-  initialGlaciers(M, Tbar, S);
 }
 
 /**
@@ -215,6 +217,8 @@ function initialGlaciers(M: EbmModel, Tbar: Float64Array, S: EbmState): void {
   const t = ebmTuning;
   const { g, land, lapse, coastKm } = M;
   const { nx, ny, n } = g;
+  S.M.fill(0);
+  S.Ms.fill(0);
   const cold = new Uint8Array(n);
   for (let i = 0; i < n; i++) cold[i] = land[i] && Tbar[i] - lapse[i] < t.glacierInitT ? 1 : 0;
   const seen = new Uint8Array(n);
@@ -256,6 +260,10 @@ function initialGlaciers(M: EbmModel, Tbar: Float64Array, S: EbmState): void {
     const j = (i / nx) | 0;
     const j2 = (k / nx) | 0;
     const cosD = g.sinLat[j] * g.sinLat[j2] + g.cosLat[j] * g.cosLat[j2] * Math.cos(g.lon[i - j * nx] - g.lon[k - j2 * nx]);
-    if (R * Math.acos(Math.max(-1, Math.min(1, cosD))) <= t.glacierInitReachKm) S.M[i] = t.glacierMassMax;
+    if (R * Math.acos(Math.max(-1, Math.min(1, cosD))) <= t.glacierInitReachKm) {
+      S.M[i] = t.glacierMassMax;
+      // Its surface carries a year's snowfall (the sheet starts as accumulation zone).
+      S.Ms[i] = Math.min(t.glacierMassMax, snowfallRate(Tbar[i] - lapse[i]) * SECONDS_PER_YEAR);
+    }
   }
 }

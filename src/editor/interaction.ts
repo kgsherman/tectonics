@@ -8,6 +8,7 @@ import { angleBetween, latLonToVec, vecToLatLon } from '../core/math3';
 import type { BrushCursor, RGB, Vec3, WorldPointerEvent, WorldView } from '../core/types';
 import { CRUST_CONTINENTAL } from '../core/types';
 import type { EditorCore, OpResult, StrokeTool } from './editorCore';
+import type { MotionHandles } from './handles';
 import type { ArrowHandle } from './motion';
 import {
   arrowHead, dragMotion, formatMotion, hitArrow, leverHead, motionAt, motionFromArrow, omegaFromMotion, rotateFromTo,
@@ -45,6 +46,8 @@ export interface InteractionHost {
   readonly core: EditorCore;
   readonly settings: ToolSettings;
   readonly seeds: Vec3[];
+  /** Where the motion arrows are drawn (hit tests use the drawn tails; default: the anchors). */
+  readonly handles?: MotionHandles;
   view(): WorldView | null;
   selectedIndex(): number;
   select(index: number): void;
@@ -74,15 +77,21 @@ type Action =
   | { kind: 'stroke' }
   | { kind: 'path'; tool: 'split' | 'lasso'; points: Array<Vec3 | null>; last: Vec3 | null }
   | {
+    /**
+     * `anchor` is the arrow's tail: the drawn arrow's tail when one was grabbed, else the press point
+     * (the new arrow starts where the user pressed and stays there). The plate's spin about it is kept.
+     */
     kind: 'motion'; plate: number; anchor: Vec3; spin: number; started: boolean;
     /**
      * 'head': the arrow head was grabbed (it follows the pointer, grab offset kept); 'shaft': the
-     * shaft was grabbed (the arrow pivots and stretches about its anchor like a lever); 'draw': a new
-     * arrow grows out of the anchor along the drag.
+     * shaft was grabbed (the arrow pivots and stretches about its tail like a lever); 'draw': a new
+     * arrow grows out of the press point along the drag.
      */
     mode: 'head' | 'shaft' | 'draw';
     /** Press point and the arrow head at press time. */
     grab: Vec3; head0: Vec3; x: number; y: number;
+    /** The plate's previous user-set arrow tail (restored when the drag is cancelled). */
+    prevPin: Vec3 | undefined;
   }
   | { kind: 'seed'; index: number }
   | { kind: 'click'; x: number; y: number; moved: number };
@@ -176,6 +185,8 @@ export class PointerInteraction {
     if (a.kind === 'motion') {
       this.host.motionDrag(null);
       this.host.motionReadout?.(null);
+      const id = this.host.core.plates[a.plate]?.id;
+      if (a.started && id !== undefined) this.host.handles?.restore(id, a.prevPin);
     }
     this.host.changed();
     this.refreshCursor();
@@ -311,6 +322,9 @@ export class PointerInteraction {
           if (Math.hypot(e.clientX - a.x, e.clientY - a.y) < DRAG_SLOP_PX) break;
           core.beginMotion(a.plate);
           a.started = true;
+          // The arrow stays where the user set it (not at a far-side anchor).
+          const id = core.plates[a.plate]?.id;
+          if (id !== undefined) this.host.handles?.pin(id, a.anchor);
           this.host.motionDrag(a.plate);
         }
         const snap = e.shiftKey;
@@ -373,9 +387,10 @@ export class PointerInteraction {
       case 'motion':
         this.host.motionDrag(null);
         this.host.motionReadout?.(null);
-        if (a.started) this.host.opDone(core.endMotion());
+        if (a.started) this.host.opDone(core.endMotion(a.anchor));
         else {
-          const m = core.plateMotion(a.plate);
+          const omega = core.plates[a.plate]?.omega;
+          const m = omega ? motionAt(omega, a.anchor) : null;
           const name = core.plates[a.plate]?.name ?? 'Plate';
           this.host.opDone({
             ok: true,
@@ -452,15 +467,25 @@ export class PointerInteraction {
     return 0.25 * DEG;
   }
 
+  /** The arrows as drawn (tails from the handle layout when it matches the plates, else the anchors). */
   private arrowHandles(): ArrowHandle[] {
     const core = this.host.core;
-    const anchors = core.anchors();
+    const laid = this.host.handles?.tails;
+    const tails = laid && laid.length === core.plates.length ? laid : core.anchors();
     const out: ArrowHandle[] = [];
     core.plates.forEach((pl, k) => {
-      const a = anchors[k];
+      const a = tails[k];
       if (a) out.push({ plate: k, anchor: a, head: arrowHead(a, pl.omega) });
     });
     return out;
+  }
+
+  /** Tail of plate k's drawn arrow (null: the plate has no cells). */
+  private arrowTail(k: number): Vec3 | null {
+    const core = this.host.core;
+    const laid = this.host.handles?.tails;
+    if (laid && laid.length === core.plates.length && laid[k]) return laid[k];
+    return core.anchors()[k] ?? null;
   }
 
   /** The arrow (plate index + part) under the pointer, or null. */
@@ -472,19 +497,20 @@ export class PointerInteraction {
   private beginMotion(e: WorldPointerEvent, p: Vec3 | null): void {
     const core = this.host.core;
     if (!p) return;
-    const anchors = core.anchors();
     const hit = this.arrowAt(e, p);
     const k = hit ? hit.plate : core.plateAt(p);
-    const anchor = anchors[k];
-    if (!anchor) return;
+    // A grabbed arrow keeps its tail; a new arrow starts at the press point (on plate k).
+    const anchor = hit ? this.arrowTail(k) : p;
+    if (!anchor || !core.anchors()[k]) return;
     this.host.select(k);
     const omega = core.plates[k].omega;
     const spin = motionAt(omega, anchor).spin;
+    const id = core.plates[k].id;
     // Grabbing an arrow's head moves it with the pointer (no jump: the grab offset is kept), its
-    // shaft levers it about the anchor; pressing anywhere else on the plate draws a new arrow.
+    // shaft levers it about its tail; pressing anywhere else on the plate draws a new arrow there.
     this.action = {
       kind: 'motion', plate: k, anchor, spin, started: false, mode: hit ? hit.part : 'draw', grab: p, head0: arrowHead(anchor, omega),
-      x: e.clientX, y: e.clientY,
+      x: e.clientX, y: e.clientY, prevPin: this.host.handles?.pinned(id),
     };
   }
 
@@ -506,9 +532,12 @@ export class PointerInteraction {
     let extra = '';
     const tool = this.host.settings.tool;
     if (tool === 'motion' && !this.action) {
+      // Over an arrow: the motion it shows (at its tail); over a plate: the velocity right there.
       const hk = this.hoveredArrow ?? k;
-      const m = core.plateMotion(hk);
-      if (m) extra = ` · ${core.plates[hk].name} ${formatMotion(m.speed, m.bearing)}`;
+      const at = this.hoveredArrow !== null ? this.arrowTail(hk) : p;
+      const omega = core.plates[hk]?.omega;
+      const m = at && omega && core.anchors()[hk] ? motionAt(omega, at) : null;
+      if (m) extra = ` · ${core.plates[hk].name} ${formatMotion(m.speed, m.bearing)}${this.hoveredArrow !== null ? '' : ' here'}`;
     }
     if (this.action?.kind === 'motion' && this.action.started) return; // the readout owns the status line
     this.host.hover(`${fmtLatLon(e.point.lat, e.point.lon)} · ${plate?.name ?? '—'} · ${crust} · ${elevText}${extra}`);

@@ -88,6 +88,11 @@ export interface PerfStats {
   lastPaintMs: number;
   /** Building the world snapshot after a step (sim worker), ms. */
   lastSnapshotMs?: number;
+  /**
+   * Steps in the last playback frame (sim worker). The speed setting is an upper bound: slow
+   * batches post intermediate frames when a painter is free (adaptive frames).
+   */
+  stepsPerFrame?: number;
 }
 
 /** Why a climate was computed (drives UI labels and scheduling). */
@@ -115,10 +120,11 @@ export type SimRequest =
   | (Req & { type: 'loadDraft'; draft: WorldDraft; tectonic: TectonicParams; display: DisplaySettings })
   | (Req & { type: 'generateDraft'; params: GenerateParams })
   | (Req & { type: 'getDraft' })
-  | (Req & { type: 'play'; stepsPerFrame: number; display: DisplaySettings })
+  /** `adaptiveFrames: false` plays full batches only ("Smooth fast playback" off; default: adaptive frames). */
+  | (Req & { type: 'play'; stepsPerFrame: number; display: DisplaySettings; adaptiveFrames?: boolean })
   | (Req & { type: 'pause'; display: DisplaySettings })
   | (Req & { type: 'step'; steps: number; display: DisplaySettings })
-  | (Req & { type: 'setSpeed'; stepsPerFrame: number })
+  | (Req & { type: 'setSpeed'; stepsPerFrame: number; adaptiveFrames?: boolean })
   /** A playback frame was received; routed to the painter slot that painted it (default 0). */
   | (Req & { type: 'frameAck'; frameId: number; painter?: number })
   | (Req & { type: 'setTectonicParams'; params: TectonicParams })

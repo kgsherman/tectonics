@@ -310,7 +310,8 @@ describe('pointer interaction (motion tool)', () => {
     ia.handle(ev('move', [start[0] + 6, start[1]], 1, 160, true));
     expect(readouts.at(-1)?.text).toMatch(/snapped/);
     ia.handle(ev('up', [start[0] + 6, start[1]], 0, 160));
-    const m = motionAt(core.plates[1].omega, a);
+    // The new arrow starts where the user pressed (polish 4): the motion is set there.
+    const m = motionAt(core.plates[1].omega, ll(start[0], start[1]));
     expect(m.speed).toBeCloseTo(20, 0);
     expect(Math.min(m.bearing, 360 - m.bearing)).toBeLessThan(1e-6);
     expect(readouts.at(-1)).toBeNull();

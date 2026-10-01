@@ -13,11 +13,11 @@
  */
 import type { CloudSpec } from '../core/types';
 import {
-  ALPHA_MAX, ANVIL_TAU, anvilAlpha, CELL_SCALE, cellFade, cellStage, cellularTexture, CIRRUS_ANISO, CIRRUS_SCALE, cirrusAlphaThr, cirrusFibre,
-  closedCells, combineNoise, coverageThreshold, cycloneEffect, detailOctaves, detailParams, detailSum, detailTexture, newDetailShaping,
-  octaveFade, OPEN_CELL_SCALE, openCells, opticalDepth, SHAPE_STAGE_SIZE, shapeStage,
+  ANVIL_TAU, anvilAlpha, BRIGHT_K, CELL_SCALE, cellFade, cellStage, cellularTexture, CIRRUS_ANISO, CIRRUS_SCALE, cirrusAlphaThr, cirrusFibre,
+  closedCells, cloudOpacity, combineNoise, coverageThreshold, cycloneEffect, detailOctaves, detailParams, detailSum, detailTexture, excessRef, newDetailShaping,
+  octaveFade, OPEN_CELL_SCALE, openCells, opticalDepth, SHAPE_STAGE_SIZE, shapeStage, TAU_DETAIL, tauExcess, THIN_BRIGHT, veilAlpha,
 } from './cloudsField';
-import { analyzeCloudClimate, buildCloudGrids, CYCLONE_COUNT, CYCLONE_STRIDE, cycloneStates } from './cloudsModel';
+import { analyzeCloudClimate, buildCloudGrids, CYCLONE_COUNT, CYCLONE_STRIDE, cycloneStates, THICK_MAX } from './cloudsModel';
 import {
   CLOUD_CELL_EDGE_RANGE, CLOUD_DETAIL_PERIOD, cloudCellVolume, cloudDetailVolume, cloudNoiseVolume, type CloudNoiseVolume,
 } from './cloudsNoise';
@@ -310,7 +310,7 @@ export function rasterizeClouds(
   // saves a log per pixel), then per raster row the vertically interpolated grid rows: the per-pixel
   // work is a 2-tap horizontal lerp.
   const n = gw * gh;
-  const CH = 7; // f, zthr, sc, cv, cu, cirrus, open
+  const CH = 8; // f, zthr, sc, cv, cu, cirrus, open, thickness
   const cells = new Float32Array(n * CH);
   for (let i = 0; i < n; i++) {
     const o = i * CH;
@@ -322,6 +322,7 @@ export function rasterizeClouds(
     cells[o + 4] = grid[4 * i + 3] / 255;
     cells[o + 5] = aux[4 * i] / 255;
     cells[o + 6] = aux[4 * i + 1] / 255;
+    cells[o + 7] = (aux[4 * i + 2] / 255) * THICK_MAX;
   }
   const rowG = new Float32Array(gw * CH);
   const rowB = new Float32Array(bw * 3);
@@ -334,8 +335,6 @@ export function rasterizeClouds(
   for (let k = 0; k < 1024; k++) thrLut[k] = coverageThreshold(k / 1023);
   const o2 = new Float64Array(oct.length);
   const invQ = 1 / Q;
-  // Edge step width (σ): about a pixel of the synoptic noise's typical gradient (~9 σ per radian).
-  const edgeW = Math.min(0.12, Math.max(0.02, 9 * raster.px));
   // Cirrus fibres fade to their mean veil below 2 px per lattice cell across them (as the shader's
   // fadeC: the world raster resolves them only partly, a coarse raster not at all: no aliased speckle).
   const fibrePx = 1 / (raster.px * CIRRUS_SCALE * CLOUD_DETAIL_PERIOD * CIRRUS_ANISO);
@@ -368,7 +367,8 @@ export function rasterizeClouds(
       if (f < 0.004) continue;
       const d0 = bx.i0[c] * 3, d1 = bx.i1[c] * 3, tbx = bx.t[c];
       const bias = rowB[d0] + tbx * (rowB[d1] - rowB[d0]);
-      const zthr = rowG[c0 + 1] + tc * (rowG[c1 + 1] - rowG[c0 + 1]) - bias;
+      const zthr0 = rowG[c0 + 1] + tc * (rowG[c1 + 1] - rowG[c0 + 1]);
+      const zthr = zthr0 - bias;
       const nbv = nb[i];
       hgt[i] = nbv + bias;
       const e0 = hx.i0[c] * 2, e1 = hx.i1[c] * 2, the = hx.t[c];
@@ -386,13 +386,17 @@ export function rasterizeClouds(
         const ndv = detailSum(o2, o2.length, sh, fade);
         const ndt = detailTexture(o2, o2.length, sh.gain, fade);
         let ex = combineNoise(nbv, ndv, zthr, sc, cv, cu, sh.amp, bias, sh.floor) - zthr;
+        // The detail's share beyond TAU_DETAIL (the optical depth follows the smoother excess).
+        const exD = ex - (combineNoise(nbv, TAU_DETAIL * ndv, zthr, sc, cv, cu, sh.amp, bias, sh.floor) - zthr);
         let cellsTau = 1;
         if (cf0 > 0 && sc > 0.02 && ex > -1.5) cellsTau = closedCells(cellEdge[i] * (CLOUD_CELL_EDGE_RANGE / 255), cellId[i] / 255, sc, cf0, cellF1[i] * (1.2 / 255));
         if (of0 > 0 && open > 0.02 && ex > -1.5) ex += openCells(openEdge[i] * (CLOUD_CELL_EDGE_RANGE / 255), open, of0, 0.3, ndv);
         exLow = ex;
-        const tau = opticalDepth(ex, sc, cv, cu, aLat, cellularTexture(ndt, ndv, sc, open), bias, cellsTau, edgeW);
+        const thick = rowG[c0 + 7] + tc * (rowG[c1 + 7] - rowG[c0 + 7]);
+        const tau = opticalDepth(tauExcess(ex, ex - exD), sc, cv, cu, aLat, cellularTexture(ndt, ndv, sc, open), bias, cellsTau, thick, excessRef(zthr0));
         tauA[i] = tau;
-        anvA[i] = anvilAlpha(nbv, zthr, cv, o2[0] * fade[0], ndt);
+        const anvil = anvilAlpha(nbv, zthr, cv, o2[0] * fade[0], ndt);
+        anvA[i] = anvil + veilAlpha(nbv, zthr, cu, o2[0] * fade[0], thick, ndt) * (1 - anvil);
         const depth = tau > 0 ? Math.min(1, tau / 1.5) * (0.15 + 0.9 * cv + 0.4 * cu) * (1 - 0.6 * sc) : 0;
         hgt[i] = nbv + bias + (RELIEF_DETAIL / RELIEF_SHAPE) * ndv * depth;
       }
@@ -422,7 +426,7 @@ export function rasterizeClouds(
         px32[i] = 0;
         continue;
       }
-      const core = ALPHA_MAX * (1 - Math.exp(-tau));
+      const core = cloudOpacity(tau);
       // Anvils under the cores' tops, cirrus over everything (as on the globe).
       const aA = aAnv * (1 - core);
       const al = core + aA;
@@ -438,10 +442,10 @@ export function rasterizeClouds(
         relief = Math.min(1.25, Math.max(0.7, 1 + (-dx + dy) * 0.6124));
       }
       // Reflectance saturates slowly with optical depth (as on the globe): thick decks stay mottled.
-      const anv = 0.84 + 0.13 * (aAnv / ANVIL_TAU);
+      const anv = 0.84 + 0.13 * Math.min(1, aAnv / ANVIL_TAU);
       // A core's thin edge inside an anvil is no darker than the anvil around it (as on the globe).
       const ta = Math.min(1, aAnv / 0.3), anvLift = anv * ta * ta * (3 - 2 * ta);
-      const bright = Math.max(0.55 + 0.45 * (1 - Math.exp(-0.22 * tau)), anvLift) * relief;
+      const bright = Math.max(THIN_BRIGHT + (1 - THIN_BRIGHT) * (1 - Math.exp(-BRIGHT_K * tau)), anvLift) * relief;
       const k = aTot > 0 ? 1 / aTot : 0;
       const lowW = (1 - aC) * k;
       const lr = 0.92 * aC * k + (0.93 * bright * core + 0.93 * anv * aA) * lowW;

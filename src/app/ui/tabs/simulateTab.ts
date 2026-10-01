@@ -3,6 +3,7 @@ import type { TectonicParams } from '../../../core/types';
 import type { UiContext } from '../../commands';
 import { fmtMs, fmtMyr, fmtNum, fmtPercent, fmtPlateSpeed } from '../../format';
 import { TECTONIC_SPECS } from '../../schema';
+import { shownLandFraction } from '../../state';
 import { shallowEqual } from '../../store';
 import { button, hint, section, sectionWithAction, slider, statGrid, switchRow, type Control } from '../controls';
 import { h, rgbCss, setChildren } from '../dom';
@@ -23,6 +24,12 @@ export function createSimulateTab(ctx: UiContext): SimulateTab {
   const patch = (p: Partial<TectonicParams>): void => store.dispatch({ type: 'patchTectonic', patch: p });
 
   const sliders = ORDER.map((k) => [k, slider({ spec: TECTONIC_SPECS[k], value: t0[k], onChange: (v) => patch({ [k]: v }) })] as [NumKey, Control<number>]);
+  const smooth = switchRow({
+    label: 'Smooth fast playback',
+    hint: 'At high speeds on big meshes, show ~8 frames/s instead of one per speed batch (the simulation runs a little slower while frames are painted). Off: full batches, maximum simulation rate.',
+    value: store.getState().settings.smoothPlayback, onChange: (v) => store.dispatch({ type: 'setSmoothPlayback', value: v }),
+  });
+  store.watch((s) => s.settings.smoothPlayback, (v) => smooth.set(v));
   const merge = switchRow({ label: 'Merge colliding plates', hint: 'Plates in sustained continental collision fuse', value: t0.mergePlates, onChange: (v) => patch({ mergePlates: v }) });
   store.watch((s) => s.settings.tectonic, (t) => {
     for (const [k, c] of sliders) c.set(t[k]);
@@ -52,12 +59,12 @@ export function createSimulateTab(ctx: UiContext): SimulateTab {
     { key: 'events', label: 'Rifts · merges' },
     { key: 'perf', label: 'Step time' },
   ]);
-  store.watch((s) => ({ st: s.runtime.stats, perf: s.runtime.perf, playing: s.runtime.playing }), ({ st, perf, playing }) => {
+  store.watch((s) => ({ st: s.runtime.stats, perf: s.runtime.perf, playing: s.runtime.playing, land: shownLandFraction(s.runtime) }), ({ st, perf, playing, land }) => {
     if (!st) return;
     stats.set('time', fmtMyr(st.time));
     stats.set('steps', fmtNum(st.steps));
     stats.set('plates', String(st.plateCount));
-    stats.set('land', fmtPercent(st.landFraction, 1));
+    stats.set('land', fmtPercent(land ?? st.landFraction, 1));
     stats.set('cont', fmtPercent(st.continentalFraction, 1));
     stats.set('elev', `${fmtNum(st.minElevation)} … ${fmtNum(st.maxElevation)} m`);
     stats.set('mean', `${fmtNum(st.meanElevation)} m`);
@@ -87,7 +94,7 @@ export function createSimulateTab(ctx: UiContext): SimulateTab {
   const el = h('div', null,
     h('div', { class: 'wg-panel-title', text: 'Simulation' }),
     h('div', { class: 'wg-panel-sub', text: 'Plate motion, subduction, collision, rifting and erosion.' }),
-    h('section', { class: 'wg-section' }, h('div', { class: 'wg-row' }, playBtn, stepBtn),
+    h('section', { class: 'wg-section' }, h('div', { class: 'wg-row' }, playBtn, stepBtn), smooth.el,
       hint('Speed (steps per frame) and history are in the timeline below.')),
     sectionWithAction('Tectonics', reset, ...sliders.map(([, c]) => c.el), merge.el),
     section('Statistics', stats.el),

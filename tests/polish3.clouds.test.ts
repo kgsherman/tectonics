@@ -8,8 +8,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { CloudSpec } from '../src/core/types';
 import {
   ANVIL_SPREAD, ANVIL_TAU, anvilAlpha, CIRRUS_TAU, CIRRUS_WARP, cirrusAlpha, coverageThreshold, cycloneEffect, DETAIL_GRAD_WARP,
-  DETAIL_SWIRL, DETAIL_WARP, detailOctaves, detailParams, detailSum, detailTexture, newDetailShaping, octaveFade, opticalDepth, ALPHA_MAX,
-  SHAPE_STAGE_SIZE, shapeStage,
+  DETAIL_SWIRL, DETAIL_WARP, detailOctaves, detailParams, detailSum, detailTexture, newDetailShaping, octaveFade, opticalDepth, cloudOpacity,
+  excessRef, SHAPE_STAGE_SIZE, shapeStage,
 } from '../src/render/cloudsField';
 import { COVER_REFERENCE_DENSITY, CYCLONE_COUNT, CYCLONE_STRIDE } from '../src/render/cloudsModel';
 import { cloudDetailVolume, cloudNoiseVolume } from '../src/render/cloudsNoise';
@@ -182,14 +182,17 @@ describe('regime spectra', () => {
   });
 });
 
-describe('crisp cloud bodies, anvils and cirrus', () => {
-  it('makes cloud opaque right behind its outline instead of fading in over a grey margin', () => {
-    const alpha = (ex: number, cu = 0): number => ALPHA_MAX * (1 - Math.exp(-opticalDepth(ex, 0, 0, cu, 0.5, 0)));
-    expect(alpha(0.12)).toBeGreaterThan(0.5); // crisp edge (past the ~1 px edge step)
-    expect(alpha(0.35)).toBeGreaterThan(0.75); // body within ~0.35σ
-    expect(alpha(1)).toBeGreaterThan(0.85);
+describe('cloud bodies, anvils and cirrus', () => {
+  it('fades cloud in from a soft, translucent outline; opaque only well inside (polish 4)', () => {
+    // (Polish 3 made cloud opaque right behind a crisp outline: QA found the globe hidden under
+    // opaque, hard-edged blobs.)
+    const alpha = (ex: number, cu = 0): number => cloudOpacity(opticalDepth(ex, 0, 0, cu, 0.5, 0, 0, 1, 1, excessRef(0)));
+    expect(alpha(0.12)).toBeLessThan(0.05); // soft edge
+    expect(alpha(0.5)).toBeLessThan(0.15); // translucent margin
+    expect(alpha(1.4)).toBeGreaterThan(0.35);
+    expect(alpha(2.5)).toBeGreaterThan(0.75); // bright cores
     // Shallow cumulus stays thin and translucent (grey speckle).
-    expect(alpha(0.35, 1)).toBeLessThan(0.55);
+    expect(alpha(1.4, 1)).toBeLessThan(0.3);
     // Monotone.
     let prev = 0;
     for (let ex = 0.01; ex < 3; ex += 0.05) {
@@ -199,13 +202,15 @@ describe('crisp cloud bodies, anvils and cirrus', () => {
     }
   });
 
-  it('spreads bright, soft-edged anvils around convective cores only', () => {
+  it('spreads soft-edged, translucent anvils around convective cores only, densest next to them', () => {
     const zthr = coverageThreshold(0.5);
     expect(anvilAlpha(zthr + 1, zthr, 0, 0)).toBe(0); // no convection, no anvil
     expect(anvilAlpha(zthr - ANVIL_SPREAD - 0.3, zthr, 1, 0)).toBe(0); // beyond the spread
-    expect(anvilAlpha(zthr - ANVIL_SPREAD + 0.3, zthr, 1, 0)).toBeGreaterThan(0.6); // inside
+    const outer = anvilAlpha(zthr - ANVIL_SPREAD + 0.3, zthr, 1, 0);
+    expect(outer).toBeGreaterThan(0.1); // inside: a translucent sheet
+    expect(outer).toBeLessThan(0.3);
     expect(anvilAlpha(zthr + 2, zthr, 1, 0)).toBeLessThanOrEqual(ANVIL_TAU + 1e-9);
-    expect(anvilAlpha(zthr + 2, zthr, 1, 0)).toBeGreaterThan(0.85);
+    expect(anvilAlpha(zthr + 2, zthr, 1, 0)).toBeGreaterThan(0.4);
   });
 
   it('keeps cirrus a thin, striated veil (streaks, not smoke loops)', () => {
@@ -285,14 +290,20 @@ describe('zoomed map window rasters', () => {
     const job = { kind: 'raster' as const, spec, w: 240, h: 120, opacity: 0.8, time: 0, win };
     const t0 = performance.now();
     const a = runCloudJob(job).result;
-    const t1 = performance.now();
-    const b = runCloudJob(job).result;
-    const t2 = performance.now();
+    const cold = performance.now() - t0;
+    // Best of several cached runs, so one scheduler hiccup under a loaded parallel suite cannot flip it.
+    let cached = Infinity;
+    let b = a;
+    for (let k = 0; k < 4; k++) {
+      const t = performance.now();
+      b = runCloudJob(job).result;
+      cached = Math.min(cached, performance.now() - t);
+    }
     expect(a.kind).toBe('raster');
     if (a.kind !== 'raster' || b.kind !== 'raster') return;
     expect(a.win).toEqual(win);
     expect(Buffer.from(a.rgba.buffer).equals(Buffer.from(b.rgba.buffer))).toBe(true);
-    expect(t2 - t1).toBeLessThan(t1 - t0); // noise raster reused
+    expect(cached).toBeLessThan(cold); // noise raster reused
   });
 });
 

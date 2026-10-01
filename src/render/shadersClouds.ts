@@ -24,15 +24,17 @@
  *    weight is zero; the phases are crossfaded with variance restoration. Detail is skipped where the
  *    shape noise leaves no chance of cloud;
  *  - the coverage fraction sets the threshold z_thr = Φ⁻¹(1 − f), the excess above it a continuous,
- *    log-normally textured optical depth → opacity (texture from the finest resolved octaves), with
- *    an edge antialiased from the analytic gradient (crisp, ~1 px);
+ *    log-normally textured optical depth → opacity (texture from the finest resolved octaves) that
+ *    grows from zero at the threshold (soft but detailed edges, thin translucent veils over most of
+ *    the cloudy area) to bright opaque cores only well inside (fronts, storm centres, convection),
+ *    scaled by the climate's cloud thickness (aux grid);
  *  - upper cloud over the low clouds: cirrus veils (patches striated into thin fibres along the
  *    zonal flow) and the smooth, soft-edged anvils around deep-convective cores;
  *  - lighting follows the surface's mode: sun (terminator, twilight tint, night), relief (camera
  *    light, taken 60° high for the cloud tops) or flat. Cloud tops are bump-lit gently from the
  *    synoptic height (screen-space derivatives) plus the analytic gradient of the fine detail (per
  *    pixel, no 2×2 blocks), deep only for convective towers and cumulus; decks and fronts stay flat;
- *    thin cloud is grey and translucent, the limb whiter (longer slant path) with a blue haze;
+ *    thin cloud is a pale translucent veil, the limb whiter (longer slant path) with a blue haze;
  *  - cloud shadows on the ground: the output is premultiplied (blend ONE, ONE_MINUS_SRC_ALPHA) and
  *    its alpha also darkens the ground seen through the gaps by the synoptic cloud field at the point
  *    that shades it (first order from its screen-space gradient: no extra fetches).
@@ -42,13 +44,14 @@ import {
   CLOUD_NOISE_STD,
 } from './cloudsNoise';
 import {
-  ALPHA_MAX, ANISO, ANVIL_SOFT, CYCLONE_BIAS_GAIN, ANVIL_SPREAD, ANVIL_TAU, BILLOW_EPS, BILLOW_INV_SD, BILLOW_MEAN, CELL_DETAIL_WARP, CELL_FADE_PX, CELL_SCALE, CELL_WARP,
-  CIRRUS_ANISO, CIRRUS_SCALE, CIRRUS_STRAND_MEAN, CIRRUS_TAU, CIRRUS_WARP, DETAIL_AMP, DETAIL_ANISO, DETAIL_CORR_LENGTH, DETAIL_EDGE_BOOST, DETAIL_FLOOR,
-  DETAIL_GRAD_WARP, DETAIL_SCALES, DETAIL_SWIRL, DETAIL_WARP, EDGE_TAU, FIELD_GLSL_CONSTANTS as K, NOISE_SWIRL, OCTAVE_FADE_PX,
-  OPEN_CELL_SCALE, REGIME_OFFSET_CU, TAU_BODY, TAU_BODY_EX, REGIME_OFFSET_CV, REGIME_OFFSET_SC, SHAPE_CORR_LENGTH, SHAPE_SCALE, TAU_PER_SIGMA, TAU_TEXTURE,
-  WARP_AMP, WARP_SCALE,
+  ALPHA_MAX, ANISO, ANVIL_SOFT, BIAS_REF, CYCLONE_BIAS_GAIN, ANVIL_SPREAD, ANVIL_TAU, BILLOW_EPS, BILLOW_INV_SD, BILLOW_MEAN, BRIGHT_K, CELL_DETAIL_WARP, CELL_FADE_PX,
+  CELL_SCALE, CELL_WARP, CIRRUS_ANISO, CIRRUS_SCALE, CIRRUS_STRAND_MEAN, CIRRUS_TAU, CIRRUS_WARP, DETAIL_AMP, DETAIL_ANISO, DETAIL_CORR_LENGTH,
+  DETAIL_EDGE_BOOST, DETAIL_FLOOR, DETAIL_GRAD_WARP, DETAIL_SCALES, DETAIL_SWIRL, DETAIL_WARP, EXCESS_REF, EXCESS_REF_K,
+  FIELD_GLSL_CONSTANTS as K, NOISE_SWIRL, OCTAVE_FADE_PX,
+  OPEN_CELL_SCALE, REGIME_OFFSET_CU, REGIME_OFFSET_CV, REGIME_OFFSET_SC, SHAPE_CORR_LENGTH, SHAPE_SCALE, TAU_CONVECTIVE, TAU_FRONT, TAU_POW, TAU_SCALE,
+  TAU_DETAIL, TAU_EDGE, TAU_TEXTURE, THIN_BRIGHT, VEIL_ALPHA, VEIL_SOFT, VEIL_SPREAD, WARP_AMP, WARP_SCALE,
 } from './cloudsField';
-import { CYCLONE_COUNT } from './cloudsModel';
+import { CYCLONE_COUNT, THICK_MAX } from './cloudsModel';
 import { GLSL_CONSTANTS } from './shadersCommon';
 
 const f = (x: number): string => (Number.isInteger(x) ? `${x}.0` : `${x}`);
@@ -117,11 +120,15 @@ const float DETAIL_UNSWIRL = ${f(1 - DETAIL_SWIRL)};
 const float BILLOW_EPS2 = ${f(BILLOW_EPS ** 2)};
 const float BILLOW_MEAN = ${f(BILLOW_MEAN)};
 const float BILLOW_INV_SD = ${f(BILLOW_INV_SD)};
-const float TAU_PER_SIGMA = ${f(TAU_PER_SIGMA)};
-const float TAU_BODY = ${f(TAU_BODY)};
-const float INV_TAU_BODY_EX = ${f(1 / TAU_BODY_EX)};
+const float TAU_SCALE = ${f(TAU_SCALE)};
+const float TAU_POW = ${f(TAU_POW)};
+const float BIAS_REF = ${f(BIAS_REF)};
+const float TAU_FRONT = ${f(TAU_FRONT)};
+const float TAU_CONVECTIVE = ${f(TAU_CONVECTIVE)};
+const float THICK_MAX = ${f(THICK_MAX)};
 const float ALPHA_MAX = ${f(ALPHA_MAX)};
-const float EDGE_TAU = ${f(EDGE_TAU)};
+const float THIN_BRIGHT = ${f(THIN_BRIGHT)};
+const float BRIGHT_K = ${f(BRIGHT_K)};
 const float TAU_TEXTURE = ${f(TAU_TEXTURE)};
 const float INV_SHAPE_CORR2 = ${f(1 / SHAPE_CORR_LENGTH ** 2)};
 const float INV_DETAIL_CORR = ${f(1 / DETAIL_CORR_LENGTH)};
@@ -210,12 +217,11 @@ vec2 shaping(float beta) {
 // rotated, 2.6× finer and warped slightly by the previous one's gradient, with amplitudes
 // [coarse, g, g², g³]. Returns d (≈ N(0,1), shaped: the cloud mask's detail); dt: the optical-depth
 // texture noise (mirror detailTexture(): mostly the finer octaves); n1: the coarse octave (faded);
-// g2: the second octave's gradient channels (− 0.5, the cell walls' wobble); gp: d's gradient per
-// unit of noise domain (analytic edge width); gl: the bump-lighting slope (σ per lattice cell,
-// weighted per octave). sh: shaping() of the coarse (xy) and fine (zw) octaves. Explicit LODs: this
-// runs in non-uniform control flow (skipped where no cloud is possible).
+// g2: the second octave's gradient channels (− 0.5, the cell walls' wobble); gl: the bump-lighting
+// slope (σ per lattice cell, weighted per octave). sh: shaping() of the coarse (xy) and fine (zw)
+// octaves. Explicit LODs: this runs in non-uniform control flow (skipped where no cloud is possible).
 void phaseDetail(vec3 qw, vec3 wv, vec4 sh, float coarse, float gain, vec4 fade, vec4 lod,
-    out float d, out float dt, out float n1o, out vec3 g2, out vec3 gp, out vec3 gl) {
+    out float d, out float dt, out float n1o, out vec3 g2, out vec3 gl) {
   vec3 a1 = ROT * (qw * DANISO3);
   vec4 t1 = textureLod(uDetail, a1 * DS.x + wv * (INV_STD * DETAIL_WARP) + OFF_D, lod.x);
   vec3 a2 = ROT * a1;
@@ -226,8 +232,8 @@ void phaseDetail(vec3 qw, vec3 wv, vec4 sh, float coarse, float gain, vec4 fade,
   d = amp1 * shapeOctave(n1, sh.xy, dt1) + amp2 * shapeOctave(n2, sh.xy, dt2);
   float fine = fade.y * n2;
   float c1 = amp1 * dt1, c2 = amp2 * dt2;
-  // Gradients accumulated from the finest octave outward (Horner in ROTᵀ: one product per octave).
-  vec3 accP = vec3(0.0), accL = vec3(0.0);
+  // Slope accumulated from the finest octave outward (Horner in ROTᵀ: one product per octave).
+  vec3 accL = vec3(0.0);
   if (fade.z > 0.02) {
     vec3 a3 = ROT * a2;
     vec4 t3 = textureLod(uDetail, a3 * DS.z + (t2.gba - 0.5) * GRAD_WARP + OFF_F, lod.z);
@@ -244,17 +250,12 @@ void phaseDetail(vec3 qw, vec3 wv, vec4 sh, float coarse, float gain, vec4 fade,
       float n4 = (t4.r - 0.5) * INV_STD;
       d += amp4 * shapeOctave(n4, sh.zw, dt4);
       fine += gain * gain * fade.w * n4;
-      vec3 g4 = t4.gba - 0.5;
-      accP = (g4 * (amp4 * dt4 * DS.w)) * ROT;
-      accL = (g4 * (amp4 * dt4 * DETAIL_SLOPE.w)) * ROT;
+      accL = ((t4.gba - 0.5) * (amp4 * dt4 * DETAIL_SLOPE.w)) * ROT;
     }
-    vec3 g3 = t3.gba - 0.5;
-    accP = (accP + g3 * (c3 * DS.z)) * ROT;
-    accL = (accL + g3 * (c3 * DETAIL_SLOPE.z)) * ROT;
+    accL = (accL + (t3.gba - 0.5) * (c3 * DETAIL_SLOPE.z)) * ROT;
   }
   g2 = t2.gba - 0.5;
   vec3 g1 = t1.gba - 0.5;
-  accP = ((accP + g2 * (c2 * DS.y)) * ROT + g1 * (c1 * DS.x)) * ROT;
   accL = ((accL + g2 * (c2 * DETAIL_SLOPE.y)) * ROT + g1 * (c1 * DETAIL_SLOPE.x)) * ROT;
   float g2n = gain * gain;
   float dn = inversesqrt(coarse * coarse + g2n * (1.0 + g2n * (1.0 + g2n)));
@@ -262,8 +263,7 @@ void phaseDetail(vec3 qw, vec3 wv, vec4 sh, float coarse, float gain, vec4 fade,
   n1o = fade.x * n1;
   dt = 0.35 * n1o + 0.94 * fine * inversesqrt(1.0 + g2n * (1.0 + g2n));
   // Back from the detail domain to the unit sphere (z was scaled by the detail anisotropy); the
-  // gradient channels decode to σ per lattice cell (GRAD_DEC), per unit of domain × period.
-  gp = accP * (dn * GRAD_DEC * ${f(CLOUD_DETAIL_PERIOD)}) * (ANISO3 * DANISO3);
+  // gradient channels decode to σ per lattice cell (GRAD_DEC).
   gl = accL * (dn * GRAD_DEC) * (ANISO3 * DANISO3);
 }
 
@@ -298,6 +298,8 @@ void main() {
   float bias = cyc.x;
   float cirrus = clamp(aux.r + 0.5 * cyc.y, 0.0, 1.0);
   float open = clamp(aux.g + cyc.z, 0.0, 1.0);
+  // Cloud thickness of the climate (mirror cloudThickness()).
+  float thickness = aux.b * THICK_MAX;
 
   vec3 flow = vec3(0.0);
   if (uHasWind > 0.5) {
@@ -354,7 +356,10 @@ void main() {
 
   // Threshold (mirror coverageThreshold).
   float fc = clamp(cov, 0.002, 0.998);
-  float zthr = log((1.0 - fc) / fc) * ${f(1 / 1.702)} - bias;
+  float zthr0 = log((1.0 - fc) / fc) * ${f(1 / 1.702)};
+  float zthr = zthr0 - bias;
+  // Excess for the reference optical depth (mirror excessRef()).
+  float exRef = ${f(EXCESS_REF)} - ${f(EXCESS_REF_K)} * min(zthr0, 0.0);
 
   // Texture regime (mirror detailParams): billow / ridge shaping of the coarse and fine octaves,
   // spectrum (coarse weight, gain) and amplitude (clumpy convection, speckled cumulus fields, finely
@@ -369,16 +374,15 @@ void main() {
 
   // Detail only where cloud (or an anvil) is possible at all.
   float nd = 0.0, ndt = 0.0, n1 = 0.0;
-  vec3 gp = vec3(0.0), gl = vec3(0.0), g20 = vec3(0.0), g21 = vec3(0.0);
+  vec3 gl = vec3(0.0), g20 = vec3(0.0), g21 = vec3(0.0);
   if (nb > zthr - 2.8) {
     float nd0, nd1, dt0, dt1, n10, n11;
-    vec3 gp0, gp1, gl0, gl1;
-    phaseDetail(qd0, wb0, sh, dq2p.x, gain, fade, lod, nd0, dt0, n10, g20, gp0, gl0);
-    phaseDetail(qd1, wb1, sh, dq2p.x, gain, fade, lod, nd1, dt1, n11, g21, gp1, gl1);
+    vec3 gl0, gl1;
+    phaseDetail(qd0, wb0, sh, dq2p.x, gain, fade, lod, nd0, dt0, n10, g20, gl0);
+    phaseDetail(qd1, wb1, sh, dq2p.x, gain, fade, lod, nd1, dt1, n11, g21, gl1);
     nd = (w0 * nd0 + w1 * nd1) * normD;
     ndt = (w0 * dt0 + w1 * dt1) * normD;
     n1 = (w0 * n10 + w1 * n11) * normD;
-    gp = (w0 * gp0 + w1 * gp1) * normD;
     gl = (w0 * gl0 + w1 * gl1) * normD;
   }
 
@@ -410,15 +414,18 @@ void main() {
     // Lumpy, broken rings (cumulus along the cell walls), not a continuous net.
     ex += fadeOpen * (1.3 * ring * (0.75 + 0.35 * clamp(nd, -1.5, 1.5)) - 0.85);
   }
-  // Edge width: under a pixel, from the analytic gradient (the shape part from the screen-space one).
-  vec3 gex = (fieldGrad + amp * gp) * ia;
-  float edgeW = max(0.9 * length(gex - dot(gex, p) * p) * px, 0.01);
-
   // Anvils (mirror anvilAlpha): a smooth sheet around the convective cores, under their tops.
   float alphaA = 0.0;
   if (cv > 0.02) {
     float xa = exb + ANVIL_SPREAD + 0.5 * n1 + 0.3 * ndt;
-    alphaA = ANVIL_TAU * cv * sstep(0.0, ANVIL_SOFT, xa) * (0.75 + 0.25 * sstep(ANVIL_SOFT, 4.0 * ANVIL_SOFT, xa));
+    alphaA = ANVIL_TAU * cv * sstep(0.0, ANVIL_SOFT, xa) * (0.45 + 0.55 * sstep(ANVIL_SOFT, 5.0 * ANVIL_SOFT, xa));
+  }
+  // Thin veil around and under the cloud masses (mirror veilAlpha): cloud systems fade out through a
+  // translucent margin; composited with the anvils as one sheet under the low cloud.
+  float xv = exb + ${f(VEIL_SPREAD)} + 0.35 * n1;
+  if (xv > 0.0) {
+    float wisps = 0.1 + 0.9 * sstep(-0.6, 1.0, 0.3 * n1 + ndt);
+    alphaA += ${f(VEIL_ALPHA)} * (1.0 - cu) * sstep(0.3, 0.9, thickness) * sstep(0.0, ${f(VEIL_SOFT)}, xv) * wisps * (1.0 - alphaA);
   }
   // Cirrus veils, not over optically thick low cloud (a thin white veil on a white deck is
   // invisible): patches (the shape fetches' independent B channel) striated into fibres by the
@@ -440,7 +447,7 @@ void main() {
       float nc = (w0 * (textureLod(uDetail, c0, lodC).r - 0.5) + w1 * (textureLod(uDetail, c1, lodC).r - 0.5)) * (INV_STD * normD);
       // Mirror cirrusAlphaThr(): elongated bright strands.
       float strand = sstep(0.2, 1.3, nc);
-      aCir = CIRRUS_TAU * sstep(0.0, 0.7, exP + 0.3 * nc * fadeC) * (0.15 + 0.85 * (CIRRUS_STRAND_MEAN + fadeC * (strand - CIRRUS_STRAND_MEAN)));
+      aCir = CIRRUS_TAU * sstep(0.0, 0.9, exP + 0.15 * nc * fadeC) * (0.3 + 0.7 * (CIRRUS_STRAND_MEAN + fadeC * (strand - CIRRUS_STRAND_MEAN)));
     }
     alphaC = aCir * (1.0 - sstep(1.1, 1.6, ex));
   }
@@ -478,7 +485,8 @@ void main() {
         // where shadows fade out anyway): no extra noise fetches.
         vec3 dS = normalize(G + L3 * ts) - n3;
         float zs = nb - zthr + clamp(dot(fieldGrad, dS), -1.5, 1.5);
-        shadow = sstep(-0.2, 1.4, zs) * uShadow * sstep(0.0, 0.15, gl3) * (uLightMode == 2 ? 1.0 : 0.6);
+        // Only optically thick cloud casts a visible shadow (thin veils hardly dim the ground).
+        shadow = sstep(0.3, 1.5, zs / exRef) * min(1.0, thickness) * uShadow * sstep(0.0, 0.15, gl3) * (uLightMode == 2 ? 1.0 : 0.6);
       }
     }
   }
@@ -492,19 +500,22 @@ void main() {
   vec3 col = vec3(0.0);
   float tau = 0.0;
   if (ex > 0.0) {
-    // Mirror opticalDepth().
-    float thick = (1.0 - 0.45 * sstep(1.05, 1.4, aLat)) * (1.0 - 0.25 * sc - 0.72 * cu + 0.35 * cv);
-    float k = 0.6 + 0.3 * cv;
+    // Mirror opticalDepth(): zero at the threshold, ∝ ex^TAU_POW (soft, translucent edges and thin
+    // veils; bright, opaque cloud only well inside: fronts, storm centres, convective cores), × the
+    // climate's thickness (aux grid) and the regime.
+    float regime = (1.0 - 0.45 * sstep(1.05, 1.4, aLat)) * (1.0 - 0.25 * sc - 0.6 * cu + TAU_CONVECTIVE * cv) * (1.0 + TAU_FRONT * organized);
     // Optical-depth variability (≈ log-normal, as observed) from the finer detail octaves (mirror
     // opticalDepth(), cellularTexture()): mottled cumulus, gentle in stratiform and frontal cloud.
     // Cellular regimes take the shaped detail (bright closed cells / open-cell rings).
     float ndx = mix(ndt, nd, clamp(0.8 * sc + 0.6 * open, 0.0, 1.0));
-    float tex = exp(TAU_TEXTURE * (0.3 + 0.7 * cu + 0.45 * sc + 0.25 * cv) * (1.0 - 0.5 * organized) * ndx);
-    float body = TAU_BODY * (1.0 - exp(-ex * INV_TAU_BODY_EX)) + TAU_PER_SIGMA * k * ex * ex;
-    tau = (body * tex * cellTau + EDGE_TAU * sstep(0.0, edgeW, ex)) * thick;
+    float tex = exp(TAU_TEXTURE * (0.35 + 0.6 * cu + 0.4 * sc + 0.2 * cv) * (1.0 - 0.3 * organized) * ndx);
+    // Excess for the optical depth (mirror tauExcess()): only TAU_DETAIL of the detail noise.
+    float exT = max(ex - ${f(1 - TAU_DETAIL)} * amp * ia * nd, ${f(TAU_EDGE)} * ex);
+    tau = TAU_SCALE * pow(exT / (exRef + BIAS_REF * max(bias, 0.0)), TAU_POW) * thickness * regime * tex * cellTau;
     // Longer slant path through the layer toward the limb.
-    float slant = tau * slantK;
-    alpha = ALPHA_MAX * (1.0 - exp(-slant));
+    // Opacity (mirror cloudOpacity()): saturates slowly, thick cores keep their texture.
+    float q = 1.0 + 0.5 * tau * slantK;
+    alpha = ALPHA_MAX * (1.0 - 1.0 / (q * q));
   }
   // Anvils under the cores' tops, cirrus over everything (thin: brightens and veils).
   float aA = alphaA * (1.0 - alpha);
@@ -524,12 +535,12 @@ void main() {
       float l0 = max(dot(n3, Lb), 0.0);
       relief = clamp((max(dot(nb3, Lb), 0.0) + 0.25) / (l0 + 0.25), 0.7, 1.25);
     }
-    // Reflectance rises with optical depth: thin cloud grey and translucent, thick cores white; it
+    // Reflectance rises with optical depth: thin cloud a pale translucent veil, thick cores white; it
     // saturates slowly (as real reflectance does), so the optical-depth texture still mottles thick
     // decks instead of leaving them a uniform, featureless white.
-    float bright = mix(0.55, 1.0, 1.0 - exp(-0.22 * tau * slantK));
+    float bright = mix(THIN_BRIGHT, 1.0, 1.0 - exp(-BRIGHT_K * tau * slantK));
     // A core's thin edge inside an anvil is no darker than the anvil around it (no grey outlines).
-    float anvBright = mix(0.84, 0.97, alphaA / ANVIL_TAU) * (1.0 + 0.05 * clamp(ndt, -2.0, 2.0));
+    float anvBright = mix(0.84, 0.97, min(1.0, alphaA / ANVIL_TAU)) * (1.0 + 0.05 * clamp(ndt, -2.0, 2.0));
     bright = max(bright, anvBright * sstep(0.0, 0.3, alphaA));
     vec3 low = vec3(0.93, 0.95, 0.98) * bright * relief;
     vec3 cir = vec3(0.92, 0.94, 0.98);

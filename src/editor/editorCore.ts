@@ -646,25 +646,26 @@ export class EditorCore {
     this.bumpRevision();
   }
 
-  endMotion(): OpResult {
+  /** Finish the motion drag; the message reports the motion at `at` (the arrow's tail; default the anchor). */
+  endMotion(at?: Vec3): OpResult {
     const k = this.motionEdit;
     if (k === null) throw new Error('EditorCore.endMotion without beginMotion');
     this.motionEdit = null;
     this.plateDirtyIdx[k] = 1;
     this.commit();
-    const m = this.plateMotion(k);
+    const m = at ? motionAt(this.plates[k].omega, at) : this.plateMotion(k);
     return ok(m ? `${this.plates[k].name}: ${formatMotion(m.speed, m.bearing)}` : 'Motion set');
   }
 
-  /** Set a plate's angular velocity (numeric edit) as one undo step. */
-  setMotion(k: number, omega: Vec3): OpResult {
+  /** Set a plate's angular velocity (numeric edit) as one undo step; the message reports the motion at `at` (default the anchor). */
+  setMotion(k: number, omega: Vec3, at?: Vec3): OpResult {
     return this.run('Set motion', () => {
       if (!(k >= 0 && k < this.plates.length)) return refuse('No such plate');
       if (!omega.every(Number.isFinite)) return refuse('Invalid motion');
       this.plates[k].omega = [omega[0], omega[1], omega[2]];
       this.plateDirtyIdx[k] = 1;
       this.motionDirty.add(k);
-      const a = this.anchors()[k];
+      const a = at ?? this.anchors()[k];
       const m = a ? motionAt(this.plates[k].omega, a) : null;
       return ok(m ? `${this.plates[k].name}: ${formatMotion(m.speed, m.bearing)}` : 'Motion set');
     });

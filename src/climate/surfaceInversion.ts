@@ -10,9 +10,11 @@
  *
  * with Q the month's daily-mean top-of-atmosphere insolation and, when the month's cloud cover is
  * given, clear = clamp((inversionCloudOvercast − cloud)/(inversionCloudOvercast − inversionCloudClear))
- * (the inversion is a clear-sky phenomenon: cloudy, windy maritime winters stay mixed). Diagnostic:
- * it does not feed back on the energy budget (the air mass above keeps its temperature and OLR)
- * nor on the moisture solver.
+ * (the inversion is a clear-sky phenomenon: cloudy, windy maritime winters stay mixed), times the
+ * radiative factor min(1, (T/inversionRadiativeRefK)⁴) of the air-mass temperature T (K): the
+ * inversion is driven by the surface's net longwave loss, which shrinks with σT⁴ in extremely cold
+ * air masses (the plateau of a huge polar ice sheet). Diagnostic: it does not feed back on the energy
+ * budget (the air mass above keeps its temperature and OLR) nor on the moisture solver.
  */
 import { SOLAR_CONSTANT } from '../core/constants';
 import type { ClimateParams } from '../core/types';
@@ -30,6 +32,7 @@ export function applySurfaceInversion(
   height?: ArrayLike<number>,
   cloud?: ArrayLike<number>,
   landIce?: ArrayLike<number>,
+  airMass?: ArrayLike<number>,
 ): void {
   const t = ebmTuning;
   if (!(t.inversionMax > 0)) return;
@@ -66,6 +69,7 @@ export function applySurfaceInversion(
     }
   }
   const S = SOLAR_CONSTANT * Math.max(0, params.solarMultiplier);
+  const refK = t.inversionRadiativeRefK;
   const tilt = (Math.max(0, Math.min(90, params.axialTilt)) * Math.PI) / 180;
   const samples = 6;
   for (let m = 0; m < 12; m++) {
@@ -89,7 +93,9 @@ export function applySurfaceInversion(
         if (!(sn > 0)) continue;
         const clear = useCloud ? Math.min(1, Math.max(0, (t.inversionCloudOvercast - cloud![off + c]) / cloudSpan)) : 1;
         const dT = k * slopeFactor[r * w + c] + (sheetFactor ? kSheet * sheetFactor[r * w + c] : 0);
-        temp[off + c] -= dT * Math.min(1, sn) * clear;
+        const x = refK > 0 ? Math.max(0, (airMass ? airMass[off + c] : temp[off + c]) + 273.15) / refK : 1;
+        const rad = x >= 1 ? 1 : x * x * x * x;
+        temp[off + c] -= dT * Math.min(1, sn) * clear * rad;
       }
     }
   }

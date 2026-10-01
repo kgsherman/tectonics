@@ -23,7 +23,7 @@ export interface EffectHost {
   enterEditor(): void;
   exitEditor(): void;
   sendTectonicParams(params: TectonicParams): void;
-  sendSpeed(stepsPerFrame: number): void;
+  sendSpeed(stepsPerFrame: number, smooth: boolean): void;
 }
 
 const SAVE_DEBOUNCE_MS = 400;
@@ -98,7 +98,7 @@ export function wireStoreEffects(store: Store<AppState, Action>, host: EffectHos
   st.watch((s) => s.settings.tectonic, (params) => debounce('tectonic', TECTONIC_DEBOUNCE_MS, () => {
     if (st.getState().runtime.worldLoaded) host.sendTectonicParams(params);
   }));
-  st.watch((s) => s.settings.speed, (speed) => host.sendSpeed(speed));
+  st.watch((s) => ({ speed: s.settings.speed, smooth: s.settings.smoothPlayback }), (v) => host.sendSpeed(v.speed, v.smooth), { equal: shallowEqual });
 
   // Climate parameters (incl. sea level): a quick fast climate, then the full one.
   st.watch((s) => {

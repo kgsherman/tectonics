@@ -10,6 +10,7 @@ import type { EditorCore } from './editorCore';
 import type { FullRenderFn, FullRenderResult } from './fullRender';
 import type { MotionReadout } from './interaction';
 import { PerfRing } from './perf';
+import { viewVisibility, type MotionHandles } from './handles';
 import { fibonacciPoints, plateArrow, velocityFieldArrows } from './motion';
 import type { PreviewSource, PreviewStyle } from './preview';
 import { PreviewRaster } from './preview';
@@ -22,6 +23,8 @@ const FULL_RENDER_DELAY = 350;
 const FIELD_SAMPLES = 170;
 /** Field arrows are drawn at this fraction of the plate-arrow scale. */
 const FIELD_SCALE = 0.45;
+/** How often the arrow layout is checked against the camera (hidden tails move to visible points), ms. */
+const HANDLE_CHECK_MS = 200;
 
 /** What the renderer reads from the editor shell. */
 export interface RendererContext {
@@ -37,6 +40,8 @@ export interface RendererContext {
   onDraftFrame(): void;
   /** The full-quality renderer failed; it is disabled afterwards. */
   onFullRenderError(err: unknown): void;
+  /** Where motion arrows are drawn (kept visible while the globe turns). */
+  readonly handles: MotionHandles;
 }
 
 export interface RendererSizes {
@@ -67,6 +72,7 @@ export class EditorRenderer {
   private hoverSeedIndex: number | null = null;
   private readout: MotionReadout | null = null;
   private cursorCss: string | null = null;
+  private handleTimer: ReturnType<typeof setInterval> | null = null;
   private readonly fieldSamples = fibonacciPoints(FIELD_SAMPLES);
   /** Wall-clock cost of each preview frame (drain + recolour + push), ms. */
   readonly frameTimes = new PerfRing(240);
@@ -118,11 +124,26 @@ export class EditorRenderer {
     }
     this.overlaysDirty = true;
     this.schedule();
+    // The camera moves without telling the editor: re-place arrows whose tails turned out of view.
+    if (this.handleTimer) clearInterval(this.handleTimer);
+    this.handleTimer = setInterval(() => this.checkHandles(), HANDLE_CHECK_MS);
+  }
+
+  private checkHandles(): void {
+    const v = this.viewRef;
+    if (!v || this.overlaysDirty) return;
+    try {
+      if (this.ctx.handles.stale(this.ctx.core, viewVisibility(v))) this.invalidateOverlays();
+    } catch {
+      // A view being torn down (globe ⇄ map switch) may not project; the next check retries.
+    }
   }
 
   /** Release the view (clear = also drop the overlay and return it to navigate mode). */
   unbind(clear: boolean): void {
     this.cancelFrame();
+    if (this.handleTimer) clearInterval(this.handleTimer);
+    this.handleTimer = null;
     if (this.fullTimer) clearTimeout(this.fullTimer);
     this.fullTimer = null;
     this.unsubscribe?.();
@@ -306,12 +327,19 @@ export class EditorRenderer {
 
   private pushArrowsAndMarkers(view: WorldView): void {
     const core = this.ctx.core;
-    const anchors = core.anchors();
+    // Arrow tails: where the user set the motion, else the anchor — or a visible interior point
+    // of the plate when that one is on the far side of the globe.
+    let tails: Array<Vec3 | null>;
+    try {
+      tails = this.ctx.handles.layout(core, viewVisibility(view));
+    } catch {
+      tails = this.ctx.handles.layout(core, null);
+    }
     const sel = this.ctx.selectedIndex();
     const arrows: ArrowSpec[] = [];
     const anchorsMarks: MarkerSpec[] = [];
     core.plates.forEach((p, k) => {
-      const a = anchors[k];
+      const a = tails[k];
       if (!a) return;
       // The selected plate's arrow is brighter; the view's heavy "highlighted" outline marks the
       // arrow being dragged.

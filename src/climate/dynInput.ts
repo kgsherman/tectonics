@@ -138,8 +138,15 @@ function reportedInversion(warm: WarmFields, raise: Float32Array | null): Float3
     const r = raise && raise[i] > 0 ? raise[i] : 0;
     surface[i] = Math.max(0, warm.elev[i] - warm.params.seaLevel) + r;
   }
+  // The inversion depends on the air-mass temperature above it (radiative factor): recover that
+  // temperature from the reported one by fixed-point iteration (it converges in a few steps).
   const d = new Float32Array(12 * N);
-  applySurfaceInversion(d, snow, warm.land, warm.w, warm.h, warm.params, surface, cloud, landIce);
+  const airMass = new Float32Array(12 * N);
+  for (let it = 0; it < 4; it++) {
+    for (let k = 0; k < 12 * N; k++) airMass[k] = warm.temp[k] - d[k];
+    d.fill(0);
+    applySurfaceInversion(d, snow, warm.land, warm.w, warm.h, warm.params, surface, cloud, landIce, airMass);
+  }
   return d;
 }
 

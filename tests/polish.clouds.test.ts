@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { CloudSpec } from '../src/core/types';
 import {
-  ALPHA_MAX, ANISO, cloudNoise, combineNoise, coverageThreshold, cycloneEffect, cycloneTemplate, DETAIL_CORR_LENGTH, detailStage,
-  noiseDrift, opticalDepth, SHAPE_CORR_LENGTH, SHAPE_STAGE_SIZE, shapeStage, swirlProfile,
+  ANISO, cloudNoise, cloudOpacity, combineNoise, coverageThreshold, cycloneEffect, cycloneTemplate, DETAIL_CORR_LENGTH, detailStage,
+  excessRef, noiseDrift, opticalDepth, SHAPE_CORR_LENGTH, SHAPE_STAGE_SIZE, shapeStage, swirlProfile,
 } from '../src/render/cloudsField';
 import {
   analyzeCloudClimate, buildCloudRegimeGrid, COVER_REFERENCE_DENSITY, coverageFraction, createCycloneMemo, CYCLONE_COUNT,
@@ -77,15 +77,18 @@ describe('coverage mapping', () => {
       prev = f;
     }
     const ref = COVER_REFERENCE_DENSITY;
-    // Typical model cover (0.63 global, 0.72 ocean, 0.45 land) at the realistic default density.
+    // Typical model cover (0.63 global, 0.72 ocean, 0.45 land) at the realistic default density: about
+    // half the area has some cloud (most of it thin, see opticalDepth), less over land.
     expect(coverageFraction(0.63 * ref)).toBeGreaterThan(0.4);
-    expect(coverageFraction(0.63 * ref)).toBeLessThan(0.65);
-    expect(coverageFraction(0.72 * ref)).toBeGreaterThan(0.6);
-    expect(coverageFraction(0.45 * ref)).toBeLessThan(0.25);
-    // Slider: 0.1 ≈ clear, 1 = stormy.
-    expect(coverageFraction(0.63 * 0.1)).toBeLessThan(0.02);
+    expect(coverageFraction(0.63 * ref)).toBeLessThan(0.6);
+    expect(coverageFraction(0.72 * ref)).toBeGreaterThan(0.5);
+    expect(coverageFraction(0.45 * ref)).toBeLessThan(0.4);
+    expect(coverageFraction(0.45 * ref)).toBeLessThan(coverageFraction(0.72 * ref) - 0.2);
+    // Slider (perceptually even, polish 4): 0.1 a few wisps, 1 = stormy.
+    expect(coverageFraction(0.63 * 0.1)).toBeGreaterThan(0.02);
+    expect(coverageFraction(0.63 * 0.1)).toBeLessThan(0.1);
     expect(coverageFraction(0.63 * 1)).toBeGreaterThan(0.9);
-    expect(coverageFraction(2.5)).toBeLessThan(0.97); // soft cap: stormy keeps some gaps
+    expect(coverageFraction(2.5)).toBeLessThan(0.985); // cap: stormy keeps some gaps
   });
 
   it('thresholds normalized noise at the requested area fraction', () => {
@@ -139,24 +142,28 @@ describe('flow-map crossfade', () => {
 });
 
 describe('optical depth', () => {
-  it('is zero outside cloud, steps up at the edge, grows with the excess, thinner in shallow regimes', () => {
-    expect(opticalDepth(0, 0, 0, 0, 0.5, 0)).toBe(0);
-    expect(opticalDepth(-1, 0, 0, 0, 0.5, 0)).toBe(0);
-    const edge = opticalDepth(0.15, 0, 0, 0, 0.5, 0);
-    expect(1 - Math.exp(-edge)).toBeGreaterThan(0.2); // crisp outline, not a fuzzy blob
+  it('is zero outside cloud, rises softly from the edge, grows with the excess, thinner in shallow regimes', () => {
+    const ref = excessRef(0);
+    const tau = (ex: number, sc = 0, cv = 0, cu = 0, lat = 0.5): number => opticalDepth(ex, sc, cv, cu, lat, 0, 0, 1, 1, ref);
+    expect(tau(0)).toBe(0);
+    expect(tau(-1)).toBe(0);
+    // Soft, translucent margin (polish 4: the crisp edge step made every cloud an opaque blob).
+    expect(cloudOpacity(tau(0.15))).toBeGreaterThan(0);
+    expect(cloudOpacity(tau(0.15))).toBeLessThan(0.05);
     let prev = 0;
     for (let ex = 0.05; ex < 3; ex += 0.05) {
-      const t = opticalDepth(ex, 0, 0, 0, 0.5, 0);
+      const t = tau(ex);
       expect(t).toBeGreaterThan(prev);
       prev = t;
     }
-    // Thin veils to bright cores: ~0.2–0.35 near the edge, ≥ 0.85 in cores.
-    expect(ALPHA_MAX * (1 - Math.exp(-opticalDepth(2.5, 0, 0, 0, 0.5, 0)))).toBeGreaterThan(0.85);
-    const mid = opticalDepth(1, 0, 0, 0, 0.5, 0);
-    expect(opticalDepth(1, 0, 0, 1, 0.5, 0)).toBeLessThan(0.5 * mid); // shallow cumulus
-    expect(opticalDepth(1, 1, 0, 0, 0.5, 0)).toBeLessThan(mid); // stratocumulus
-    expect(opticalDepth(1, 0, 0, 0, 1.45, 0)).toBeLessThan(mid); // polar
-    expect(opticalDepth(1.5, 0, 1, 0, 0.1, 0)).toBeGreaterThan(opticalDepth(1.5, 0, 0, 0, 0.1, 0)); // deep convection
+    // Thin veils to bright cores: opaque only well inside the cloud.
+    expect(cloudOpacity(tau(0.6))).toBeLessThan(0.2);
+    expect(cloudOpacity(tau(2.5))).toBeGreaterThan(0.75);
+    const mid = tau(1);
+    expect(tau(1, 0, 0, 1)).toBeLessThan(0.5 * mid); // shallow cumulus
+    expect(tau(1, 1, 0, 0)).toBeLessThan(mid); // stratocumulus
+    expect(tau(1, 0, 0, 0, 1.45)).toBeLessThan(mid); // polar
+    expect(tau(1.5, 0, 1, 0, 0.1)).toBeGreaterThan(tau(1.5, 0, 0, 0, 0.1)); // deep convection
   });
 });
 

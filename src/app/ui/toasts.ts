@@ -12,7 +12,8 @@ export class Toasts {
   readonly el = h('div', { class: 'wg-toasts', attrs: { role: 'status', 'aria-live': 'polite' } });
   private readonly live = new Map<string, { el: HTMLElement; timer: number; count: number; title: HTMLElement }>();
 
-  show(kind: ToastKind, title: string, detail?: string, timeoutMs?: number): void {
+  /** `action`: a button in the toast (clicking it runs the action and dismisses the toast). */
+  show(kind: ToastKind, title: string, detail?: string, timeoutMs?: number, action?: { label: string; onClick: () => void }): void {
     const key = `${kind}|${title}|${detail ?? ''}`;
     const existing = this.live.get(key);
     const ms = timeoutMs ?? (kind === 'error' ? 9000 : 4000);
@@ -26,7 +27,13 @@ export class Toasts {
     const titleEl = h('div', { class: 'wg-toast-title', text: title });
     const el = h('div', { class: `wg-toast wg-toast-${kind}`, attrs: { role: kind === 'error' ? 'alert' : 'status' } },
       icon(ICONS[kind], 16),
-      h('div', null, titleEl, detail ? h('div', { class: 'wg-toast-detail', text: detail }) : null),
+      h('div', null, titleEl, detail ? h('div', { class: 'wg-toast-detail', text: detail }) : null,
+        action ? h('div', { class: 'wg-toast-actions' }, button({
+          label: action.label, variant: 'secondary', onClick: () => {
+            this.dismiss(key);
+            action.onClick();
+          },
+        })) : null),
       button({ icon: 'close', variant: 'ghost', title: 'Dismiss', onClick: () => this.dismiss(key) }),
     );
     this.el.appendChild(el);

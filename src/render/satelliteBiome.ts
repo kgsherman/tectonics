@@ -114,17 +114,21 @@ const FALLBACK_CLASS = koppenIdFromCode('Cfb');
 export const EVERGREEN_SNOW_HIDE = 0.93;
 
 const L = (c: RGB) => toLinear(c);
-/** Vegetation palette (sRGB tuned against Blue Marble / Sentinel-2 mosaics), linear light. */
+/**
+ * Vegetation palette (sRGB tuned against Blue Marble / Sentinel-2 mosaics), linear light. Muted:
+ * grass and canopy differ mostly in brightness, only moderately in saturation (orbital imagery at
+ * ~1 km/px mixes every pixel; pure saturated greens read as a painted map).
+ */
 export const PAL = {
-  grassLush: L([74, 110, 42]),
-  grassSteppe: L([124, 132, 70]),
-  grassDryWarm: L([178, 158, 108]),
-  grassDormantCold: L([128, 114, 90]),
-  leafOn: L([50, 82, 36]),
+  grassLush: L([86, 106, 56]),
+  grassSteppe: L([128, 128, 84]),
+  grassDryWarm: L([174, 156, 112]),
+  grassDormantCold: L([126, 114, 92]),
+  leafOn: L([52, 78, 40]),
   leafOff: L([94, 86, 74]),
-  tropical: L([30, 60, 26]),
-  boreal: L([26, 44, 32]),
-  sclerophyll: L([72, 82, 50]),
+  tropical: L([32, 60, 30]),
+  boreal: L([28, 45, 33]),
+  sclerophyll: L([74, 82, 54]),
 };
 
 function smoothstep(a: number, b: number, x: number): number {
@@ -204,9 +208,13 @@ function greenness(T: Float64Array, avail: Float64Array, k: number): number {
   return smoothstep(1, 10, T[k]) * smoothstep(0.3, 0.8, avail[k]);
 }
 
-/** Deciduous leaf-on fraction: thermal (temperate) and drought (tropical) deciduousness. */
-function leafOn(T: Float64Array, avail: Float64Array, k: number): number {
-  return Math.min(smoothstep(2, 9, T[k]), smoothstep(0.2, 0.55, avail[k]));
+/**
+ * Deciduous leaf-on fraction: thermal (temperate) and drought (tropical) deciduousness. Drought
+ * sheds leaves only where there is no cold dormancy (frost-free winters, `droughtK` → 1): deep-rooted
+ * temperate and boreal trees stay green through a dry summer month while the grass browns.
+ */
+function leafOn(T: Float64Array, avail: Float64Array, k: number, droughtK: number): number {
+  return Math.min(smoothstep(2, 9, T[k]), 1 - droughtK * (1 - smoothstep(0.2, 0.55, avail[k])));
 }
 
 // Scratch colours for cellAttributes (no per-cell allocation).
@@ -241,14 +249,15 @@ function cellAttributes(
 
   let g: number, lo: number, tMonth: number;
   moistureAvailability(T, P, AVAIL);
+  const droughtK = smoothstep(0, 12, st.tCold);
   if (m >= 0) {
     g = greenness(T, AVAIL, m);
-    lo = leafOn(T, AVAIL, m);
+    lo = leafOn(T, AVAIL, m, droughtK);
     tMonth = T[m];
   } else {
     let gs = 0, gm = 0, ls = 0, lm = 0;
     for (let k = 0; k < 12; k++) {
-      const gk = greenness(T, AVAIL, k), lk = leafOn(T, AVAIL, k);
+      const gk = greenness(T, AVAIL, k), lk = leafOn(T, AVAIL, k, droughtK);
       gs += gk;
       ls += lk;
       if (gk > gm) gm = gk;

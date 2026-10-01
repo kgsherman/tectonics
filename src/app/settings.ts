@@ -96,6 +96,7 @@ export function sanitizeSettings(raw: unknown): Settings {
     view,
     seaLevel: clampTo(SEA_LEVEL_SPEC, num(r.seaLevel, D.seaLevel)),
     speed: normalizeSpeed(oneOf(r.speed, SPEEDS, D.speed)),
+    smoothPlayback: bool(r.smoothPlayback, D.smoothPlayback),
     seasonSeconds: clampTo(SEASON_SECONDS_SPEC, num(r.seasonSeconds, D.seasonSeconds)),
   };
 }

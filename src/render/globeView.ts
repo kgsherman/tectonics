@@ -8,7 +8,7 @@ import { DEFAULT_DISTANCE, GlobeControls } from './globeControls';
 import { GlobeInput } from './globeInput';
 import { GlobeMarkers } from './globeMarkers';
 import { GlobeSky } from './globeSky';
-import { GlobeSurface, LIGHT_FLAT, LIGHT_RELIEF, LIGHT_SUN, type SharedUniforms } from './globeSurface';
+import { createSharedUniforms, GlobeSurface, LIGHT_FLAT, LIGHT_RELIEF, LIGHT_SUN, type SharedUniforms } from './globeSurface';
 import { copyVectorField, DEFAULT_PARTICLE_COUNT, ParticleSystem } from './particles';
 import { GlobeParticles } from './particlesGlobe';
 import { DetailFader, heightSignature } from './viewDetail';
@@ -98,11 +98,7 @@ export class GlobeView implements WorldView {
     this.camera = new PerspectiveCamera(FOV, 1, 0.005, 200);
     this.setView({ lat: (20 * Math.PI) / 180, lon: 0 }, DEFAULT_DISTANCE);
 
-    this.shared = {
-      uLightMode: { value: LIGHT_RELIEF },
-      uSunDir: { value: new Vector3(1, 0, 0) },
-      uAtmoColor: { value: ATMOSPHERE_COLOR.clone() },
-    };
+    this.shared = createSharedUniforms(ATMOSPHERE_COLOR);
     const aniso = this.renderer.capabilities.getMaxAnisotropy();
     // R16F is color-renderable with EXT_color_buffer_float: height mips are then built on the GPU.
     this.surface = new GlobeSurface(this.shared, aniso, this.renderer.extensions.has('EXT_color_buffer_float'));

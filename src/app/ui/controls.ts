@@ -4,7 +4,9 @@
  * fights an active drag.
  */
 import { fmtNum } from '../format';
-import { stepDigits, type NumSpec } from '../schema';
+import {
+  fineDigits, fineValue, parseNumberInput, snapSliderValue, stepDigits, stepSliderValue, type NumSpec,
+} from '../schema';
 import { h, setText, toggleClass, type Child } from './dom';
 import { icon, type IconName } from './icons';
 
@@ -33,46 +35,147 @@ export interface SliderOptions {
 export function slider(o: SliderOptions): Control<number> {
   const { spec } = o;
   const scale = o.displayScale ?? 1;
-  const digits = Math.max(0, stepDigits(spec) - Math.round(Math.log10(scale)));
-  const unit = !spec.unit ? '' : ['×', '%', '°'].includes(spec.unit) ? spec.unit : ` ${spec.unit}`;
-  const fmt = o.format ?? ((v: number) => `${fmtNum(v * scale, digits)}${unit}`);
+  const shift = Math.round(Math.log10(scale));
+  const digits = Math.max(0, stepDigits(spec) - shift);
+  const typedDigits = Math.max(digits, fineDigits(spec) - shift);
+  const unit = !spec.unit ? '' : ['×', '%', '°'].includes(spec.unit) ? spec.unit : ` ${spec.unit}`;
+  // The readout shows `digits` decimals, more only for a typed off-grid value (23.44°, not 23.4°).
+  const num = (v: number): string => {
+    let t = fmtNum(v * scale, typedDigits);
+    if (typedDigits > digits && t.includes('.')) {
+      const keep = t.indexOf('.') + (digits > 0 ? digits + 1 : 0);
+      t = t.replace(/0+$/, '');
+      if (t.length < keep) t = t.padEnd(keep, '0');
+      if (t.endsWith('.')) t = t.slice(0, -1);
+    }
+    return t;
+  };
+  const fmt = o.format ?? ((v: number) => `${num(v)}${unit}`);
+  // Sliders with snap values (Earth's tilt) run on the fine grid so the thumb can sit exactly on
+  // them; dragging is quantized to `step` (snapSliderValue) and arrow keys step to the next grid or
+  // snap value. Plain sliders use the native `step`.
+  const snapping = !!spec.snaps?.length;
   const input = h('input', {
     class: 'wg-range',
-    attrs: { type: 'range', min: spec.min, max: spec.max, step: spec.step, 'aria-label': spec.label },
+    attrs: { type: 'range', min: spec.min, max: spec.max, step: snapping ? (spec.fine ?? spec.step) : spec.step, 'aria-label': spec.label },
   });
   input.value = String(o.value);
-  const readout = h('span', { class: 'wg-readout' });
-  const el = h('label', { class: 'wg-field wg-slider', title: spec.hint ?? '' },
-    h('span', { class: 'wg-field-head' }, h('span', { class: 'wg-label', text: spec.label }), readout),
+  // Editable readout: click and type an exact value (Enter / blur applies, Esc reverts).
+  const readout = h('input', {
+    class: 'wg-readout wg-readout-input',
+    attrs: { type: 'text', inputmode: 'decimal', spellcheck: 'false', autocomplete: 'off', 'aria-label': `${spec.label} value`, title: 'Type an exact value' },
+  });
+  const unitEl = o.format || !unit ? null : h('span', { class: `wg-readout wg-readout-unit${unit.startsWith(' ') ? ' is-word' : ''}`, text: unit.trim() });
+  const el = h('div', { class: 'wg-field wg-slider', title: spec.hint ?? '' },
+    h('span', { class: 'wg-field-head' }, h('span', { class: 'wg-label', text: spec.label }), h('span', { class: 'wg-readout-box' }, readout, unitEl)),
     input,
   );
   let dragging = false;
+  let editing = false;
+  let value = o.value;
+  // Border-box input: the text width plus padding and border.
+  const fitReadout = (): void => {
+    readout.style.width = `calc(${Math.max(1, readout.value.length) + 0.4}ch + 6px)`;
+  };
   const paint = (v: number): void => {
-    setText(readout, fmt(v));
+    value = v;
+    if (!editing) {
+      readout.value = o.format ? fmt(v) : num(v);
+      fitReadout();
+    }
     const pct = spec.max > spec.min ? ((v - spec.min) / (spec.max - spec.min)) * 100 : 0;
     input.style.setProperty('--pct', `${Math.max(0, Math.min(100, pct))}%`);
   };
   paint(o.value);
+  const commit = (v: number): void => {
+    input.value = String(v);
+    paint(v);
+    o.onInput?.(v);
+    o.onChange?.(v);
+  };
   input.addEventListener('pointerdown', () => (dragging = true));
   input.addEventListener('pointerup', () => (dragging = false));
   input.addEventListener('input', () => {
-    const v = Number(input.value);
+    let v = Number(input.value);
+    if (snapping) {
+      v = snapSliderValue(spec, v);
+      if (Number(input.value) !== v) input.value = String(v);
+    }
     paint(v);
     o.onInput?.(v);
   });
   input.addEventListener('change', () => {
     dragging = false;
-    o.onChange?.(Number(input.value));
+    const v = snapping ? snapSliderValue(spec, Number(input.value)) : Number(input.value);
+    o.onChange?.(v);
+  });
+  if (snapping) {
+    input.addEventListener('keydown', (e) => {
+      const keys: Record<string, [1 | -1, number]> = {
+        ArrowRight: [1, 1], ArrowUp: [1, 1], ArrowLeft: [-1, 1], ArrowDown: [-1, 1], PageUp: [1, 10], PageDown: [-1, 10],
+      };
+      const k = keys[e.key];
+      if (!k) return;
+      e.preventDefault();
+      const next = stepSliderValue(spec, value, k[0], k[1]);
+      if (next !== value) commit(next);
+    });
+  }
+  const applyTyped = (): void => {
+    const parsed = parseNumberInput(readout.value);
+    editing = false;
+    if (parsed === null) {
+      paint(value);
+      return;
+    }
+    const v = fineValue(spec, parsed / scale);
+    if (v !== value) commit(v);
+    else paint(v);
+  };
+  readout.addEventListener('focus', () => {
+    editing = true;
+    readout.select();
+  });
+  // 'change' commits a typed value on blur (also without a focus event, e.g. a background window).
+  readout.addEventListener('change', () => applyTyped());
+  readout.addEventListener('blur', () => {
+    if (editing) applyTyped();
+  });
+  readout.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      applyTyped();
+      readout.select();
+      editing = true;
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      editing = false;
+      paint(value);
+      readout.blur();
+    } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      const cur = parseNumberInput(readout.value);
+      const next = stepSliderValue(spec, cur === null ? value : fineValue(spec, cur / scale), e.key === 'ArrowUp' ? 1 : -1, e.shiftKey ? 10 : 1);
+      editing = false;
+      commit(next);
+      editing = true;
+      readout.value = num(next);
+      readout.select();
+    }
+  });
+  readout.addEventListener('input', () => {
+    fitReadout();
   });
   return {
     el,
     set(v: number) {
-      if (dragging || Number(input.value) === v) return;
+      if (dragging || v === value) return;
       input.value = String(v);
       paint(v);
     },
     setDisabled(d: boolean) {
       input.disabled = d;
+      readout.disabled = d;
       toggleClass(el, 'is-disabled', d);
     },
   };

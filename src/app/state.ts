@@ -55,8 +55,13 @@ export interface Settings {
   view: ViewSettings;
   /** The one display + climate sea level (m). */
   seaLevel: number;
-  /** Simulation steps per playback frame. */
+  /** Simulation steps per playback frame (an upper bound with smooth playback). */
   speed: number;
+  /**
+   * Smooth fast playback: when a frame's steps take long (20× on 160k cells), show intermediate
+   * frames (~8/s) at a small cost in simulation rate; off = full batches, maximum simulation rate.
+   */
+  smoothPlayback: boolean;
   /** Seconds per month when playing seasons. */
   seasonSeconds: number;
 }
@@ -101,6 +106,11 @@ export interface RuntimeState {
   steps: number;
   snapshotId: number;
   stats: TectonicStats | null;
+  /**
+   * Land share of the displayed state at the CURRENT sea level (cells with elevation > sea level;
+   * TectonicStats.landFraction counts elevation > 0). Null until a snapshot arrived.
+   */
+  landFraction: number | null;
   perf: PerfStats;
   /** -1 = annual view, else 0..11. */
   month: number;
@@ -148,6 +158,7 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   seaLevel: 0,
   speed: 1,
+  smoothPlayback: true,
   seasonSeconds: 0.8,
 };
 
@@ -159,7 +170,7 @@ export const EMPTY_CLIMATE: ClimateStatus = {
 export function initialRuntime(): RuntimeState {
   return {
     worldLoaded: false, meshN: 0, worldSeed: 0, playing: false, time: 0, shownTime: null, steps: 0, snapshotId: 0, stats: null,
-    perf: { stepsPerSec: 0, framesPerSec: 0, lastStepMs: 0, lastPaintMs: 0 }, month: -1, seasonsPlaying: false,
+    landFraction: null, perf: { stepsPerSec: 0, framesPerSec: 0, lastStepMs: 0, lastPaintMs: 0 }, month: -1, seasonsPlaying: false,
     climate: { ...EMPTY_CLIMATE }, keyframes: [], keyframeInterval: 0, viewingKeyframe: null, tasks: [], editorActive: false,
     worldParams: '',
   };
@@ -184,6 +195,7 @@ export type Action =
   | { type: 'patchView'; patch: Partial<Omit<ViewSettings, 'overlays'>> }
   | { type: 'setOverlay'; key: keyof OverlayFlags; value: boolean }
   | { type: 'setSpeed'; speed: number }
+  | { type: 'setSmoothPlayback'; value: boolean }
   | { type: 'setSeasonSeconds'; value: number }
   | { type: 'setMonth'; month: number }
   | { type: 'stepMonth'; delta: number }
@@ -192,7 +204,9 @@ export type Action =
   | { type: 'status'; playing: boolean; time: number; steps: number; perf: PerfStats }
   /** A frame of the live state (not a history keyframe) is on screen. */
   | { type: 'frameShown'; time: number }
-  | { type: 'snapshot'; snapshotId: number; stats: TectonicStats }
+  | { type: 'snapshot'; snapshotId: number; stats: TectonicStats; landFraction?: number }
+  /** Land share of the displayed state at the current sea level (recomputed when the sea level moves). */
+  | { type: 'landFraction'; value: number | null }
   | { type: 'history'; keyframes: KeyframeInfo[]; intervalMyr: number; viewing: number | null }
   | { type: 'climateStarted'; purpose: ClimatePurpose }
   | { type: 'climateProgress'; stage: string; fraction: number }
@@ -317,6 +331,8 @@ export function reduce(s: AppState, a: Action): AppState {
         : withSettings(s, { view: { ...st.view, overlays: { ...st.view.overlays, [a.key]: a.value } } });
     case 'setSpeed':
       return withSettings(s, { speed: normalizeSpeed(a.speed) });
+    case 'setSmoothPlayback':
+      return st.smoothPlayback === a.value ? s : withSettings(s, { smoothPlayback: a.value });
     case 'setSeasonSeconds':
       return withSettings(s, { seasonSeconds: clampTo(SEASON_SECONDS_SPEC, a.value) });
     case 'setMonth':
@@ -335,7 +351,9 @@ export function reduce(s: AppState, a: Action): AppState {
     case 'frameShown':
       return rt.shownTime === a.time ? s : withRuntime(s, { shownTime: a.time });
     case 'snapshot':
-      return withRuntime(s, { snapshotId: a.snapshotId, stats: a.stats });
+      return withRuntime(s, { snapshotId: a.snapshotId, stats: a.stats, landFraction: a.landFraction ?? rt.landFraction });
+    case 'landFraction':
+      return rt.landFraction === a.value ? s : withRuntime(s, { landFraction: a.value });
     case 'history':
       return withRuntime(s, { keyframes: a.keyframes, keyframeInterval: a.intervalMyr, viewingKeyframe: a.viewing });
     case 'climateStarted':
@@ -387,6 +405,14 @@ export function worldParamsKey(w: WorldSettings): string {
 export function displayedTime(rt: RuntimeState): number {
   const k = rt.viewingKeyframe;
   return k !== null && rt.keyframes[k] ? rt.keyframes[k].time : rt.shownTime ?? rt.time;
+}
+
+/**
+ * Land share shown in the UI: at the current sea level when known (runtime.landFraction), else the
+ * simulation's own elevation > 0 share. Null without a world.
+ */
+export function shownLandFraction(rt: RuntimeState): number | null {
+  return rt.landFraction ?? rt.stats?.landFraction ?? null;
 }
 
 /** The world displayed is newer than the climate (climate computed for another state). */

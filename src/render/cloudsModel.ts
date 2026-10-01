@@ -25,27 +25,43 @@ import type { CloudSpec } from '../core/types';
  * this recovers the model's cover at the default, and larger densities push toward overcast.
  */
 export const COVER_REFERENCE_DENSITY = 0.4;
-/** Logistic coverage curve of the effective model cover x: midpoint and steepness. */
-const COVER_X0 = 0.61;
-const COVER_K = 8.5;
-const COVER_L0 = 1 / (1 + Math.exp(COVER_K * COVER_X0));
-const COVER_KNEE = 0.75;
-const COVER_ROOM = 0.2;
+/**
+ * Coverage curve of the effective model cover x (Weibull: CAP·(1 − exp(−(x/S)^P))): scale, shape and
+ * cap. Gentle at both ends so the density slider reads roughly linearly (see coverageFraction).
+ */
+const COVER_S = 0.74;
+const COVER_P = 1.5;
+const COVER_CAP = 0.98;
 
 /**
- * Coverage fraction (0..1) for a received cover value (model cover × density): 0 → 0, monotone,
- * saturating (a logistic contrast curve). At the default density the model's typical cover (≈ 0.63
- * globally, 0.72 over oceans) maps to ≈ 0.5–0.6 cloud fraction with more contrast than the smooth
- * monthly field (dry subtropics clear out, storm tracks and the ITCZ close up); density 0.1 is nearly
- * clear, 0.2 sparse and 1 stormy (≈ 85–90 % cloud, softly capped).
+ * Coverage fraction (0..1) for a received cover value (model cover × density): the fraction of the
+ * area with any cloud at all (most of it thin, see cloudThickness / opticalDepth). 0 → 0, monotone,
+ * saturating. At the default density the model's typical cover (≈ 0.63 globally, 0.72 over oceans,
+ * 0.45 over land, 0.9 in storm tracks) maps to ≈ 0.54 (0.64 / 0.33 / 0.8) cloud fraction; density 0.1
+ * leaves a few wisps over the wettest regions, 0.25 is light, 0.7 overcast-ish and 1 stormy (≈ 90 %,
+ * capped: organized weather keeps some gaps, not a white ball).
  */
 export function coverageFraction(cover: number): number {
   if (!(cover > 0)) return 0;
-  let x = cover / COVER_REFERENCE_DENSITY;
-  // Soft cap: even the stormiest setting keeps ~10 % gaps (organized weather, not a white ball).
-  if (x > COVER_KNEE) x = COVER_KNEE + COVER_ROOM * (1 - Math.exp(-(x - COVER_KNEE) / COVER_ROOM));
-  const l = 1 / (1 + Math.exp(-COVER_K * (x - COVER_X0)));
-  return Math.max(0, (l - COVER_L0) / (1 - COVER_L0));
+  const x = cover / COVER_REFERENCE_DENSITY;
+  return COVER_CAP * (1 - Math.exp(-Math.pow(x / COVER_S, COVER_P)));
+}
+
+/** Effective model cover at which clouds have their reference thickness (the global mean at the default density). */
+export const THICK_REF = 0.63;
+/** Growth exponent and range of the thickness (the aux grid's B channel stores thickness / THICK_MAX). */
+export const THICK_EXP = 1.5;
+export const THICK_MIN = 0.5;
+export const THICK_MAX = 6;
+
+/**
+ * Optical-thickness factor of the clouds for an effective model cover x (cover / reference density):
+ * (x / THICK_REF)^THICK_EXP, clamped. Cloudier climates (and higher densities) bring thicker, brighter
+ * cloud, not only more of it (the density slider keeps adding visible cloud once the coverage
+ * saturates); dry regions keep thin, translucent wisps. The shader reads it from the aux grid.
+ */
+export function cloudThickness(x: number): number {
+  return x > 0 ? Math.min(THICK_MAX, Math.max(THICK_MIN, Math.pow(x / THICK_REF, THICK_EXP))) : THICK_MIN;
 }
 
 /** Table of coverageFraction over [0, 2.5] (cover values are clamped there), 1/1024 steps. */
@@ -283,7 +299,7 @@ export interface CloudGrids {
   /**
    * RGBA8 auxiliary regimes: R = cirrus (anvil outflow around deep convection, jet-stream cirrus in
    * the storm tracks, a thin background), G = open-cell cumulus (cold-air outbreaks: equatorward flow
-   * in the mid-latitudes), B, A = 0 (reserved).
+   * in the mid-latitudes), B = cloud thickness (cloudThickness / THICK_MAX), A = 0 (reserved).
    */
   aux: Uint8Array;
   /** Advection wind (m/s): the monthly wind smoothed to synoptic scales (little flow-map strain). */
@@ -327,6 +343,7 @@ export function buildCloudGrids(spec: CloudSpec): CloudGrids {
       const open = midLat * smoothstep(0.5, 3, eq) * smoothstep(0.15, 0.4, f) * (1 - smoothstep(0.75, 0.95, f)) * smoothstep(-0.5, 1.5, div[i] + 1);
       aux[4 * i] = Math.round(255 * ci);
       aux[4 * i + 1] = Math.round(255 * Math.min(1, open));
+      aux[4 * i + 2] = Math.round((255 * cloudThickness(x)) / THICK_MAX);
     }
   }
   const flowU = new Float32Array(n), flowV = new Float32Array(n);

@@ -30,11 +30,49 @@ export interface SimHostEnv {
   now: () => number;
   /** Optional overrides (tests use small budgets). */
   keyframes?: KeyframeStore;
+  /** Adaptive playback frames (default: TARGET_FRAME_MS / MAX_SNAPSHOT_SHARE); false = full batches only. */
+  adaptiveFrames?: false | AdaptiveFrames;
+}
+
+export interface AdaptiveFrames {
+  targetMs: number;
+  maxSnapshotShare: number;
 }
 
 /** Throttle for snapshot/status/history pushes during playback (SPEC: hover data ≤ every 250 ms). */
 const PUSH_INTERVAL_MS = 250;
 const MAX_STEPS_PER_FRAME = 100;
+/**
+ * Adaptive playback frames: a speed of k steps per frame is an upper bound. When k steps take
+ * longer than this (20× on 160k cells ≈ 1 s), a frame goes out as soon as a painter is free after
+ * fewer steps — ≥ ~8 display updates/s while the sim keeps stepping flat out.
+ */
+export const TARGET_FRAME_MS = 125;
+/**
+ * …but never post frames so often that their sim-side cost (snapshot build + hand-over) exceeds
+ * this share of the stepping time. Painting the extra frames also competes for CPU cores: at 20×
+ * on 160k cells the measured simulation rate is ~10–25 % lower than with full batches (~1 frame/s);
+ * "Smooth fast playback" off (adaptiveFrames: false) plays full batches.
+ */
+export const MAX_SNAPSHOT_SHARE = 0.15;
+
+/**
+ * Steps per playback frame when frames should come every TARGET_FRAME_MS: as many steps as fit
+ * the frame budget, at least enough to keep the per-frame cost (`frameMs`: snapshot + hand-over)
+ * ≤ MAX_SNAPSHOT_SHARE of the stepping time, never more than the speed setting (`maxSteps`).
+ * stepMs ≤ 0 (unknown yet) → maxSteps.
+ */
+export function adaptiveStepsPerFrame(
+  maxSteps: number, stepMs: number, frameMs: number,
+  cfg: AdaptiveFrames = { targetMs: TARGET_FRAME_MS, maxSnapshotShare: MAX_SNAPSHOT_SHARE },
+): number {
+  const cap = Math.max(1, Math.floor(maxSteps));
+  if (!(stepMs > 0)) return cap;
+  const snap = Math.max(0, frameMs || 0);
+  const fit = Math.floor((cfg.targetMs - snap) / stepMs);
+  const overhead = Math.ceil(snap / (Math.max(1e-3, cfg.maxSnapshotShare) * stepMs));
+  return Math.max(1, Math.min(cap, Math.max(fit, overhead)));
+}
 /** Painter slots accepted (primary + helpers). */
 export const MAX_PAINTERS = 8;
 
@@ -80,11 +118,30 @@ export class SimHost {
   private tickScheduled = false;
 
   private lastPush = -Infinity;
-  private perf: PerfStats = { stepsPerSec: 0, framesPerSec: 0, lastStepMs: 0, lastPaintMs: 0, lastSnapshotMs: 0 };
+  private perf: PerfStats = { stepsPerSec: 0, framesPerSec: 0, lastStepMs: 0, lastPaintMs: 0, lastSnapshotMs: 0, stepsPerFrame: 1 };
   private win = { start: 0, steps: 0, frames: 0 };
+  /** Steps taken since the last playback frame was posted. */
+  private pendingSteps = 0;
+  /**
+   * Smoothed per-step and per-frame (snapshot + hand-over to the painter) sim-side cost, ms, for
+   * adaptive frames (0 = not measured yet). The first step of a world (lazy allocations, JIT
+   * warm-up) is not counted.
+   */
+  private stepMsAvg = 0;
+  private frameMsAvg = 0;
+  private stepSamples = 0;
+  /** Full batches only ('play' / 'setSpeed' with adaptiveFrames: false — "Smooth fast playback" off). */
+  private fullBatches = false;
 
   constructor(private readonly env: SimHostEnv) {
     this.keyframes = env.keyframes ?? new KeyframeStore();
+  }
+
+  /** Steps per playback frame for the current speed and measured costs (the speed when adaptive frames are off). */
+  private frameSteps(): number {
+    const cfg = this.env.adaptiveFrames;
+    if (cfg === false || this.fullBatches) return this.stepsPerFrame;
+    return adaptiveStepsPerFrame(this.stepsPerFrame, this.stepMsAvg, this.frameMsAvg, cfg);
   }
 
   /* ------------------------------------------------------------------ */
@@ -230,6 +287,7 @@ export class SimHost {
       case 'play':
         this.setDisplay(msg.display);
         this.setStepsPerFrame(msg.stepsPerFrame);
+        this.fullBatches = msg.adaptiveFrames === false;
         this.startPlaying();
         // Playback resumes the live state: tell the main thread now (a keyframe may have been on
         // screen), not after the ≤ 250 ms push throttle.
@@ -255,6 +313,7 @@ export class SimHost {
       }
       case 'setSpeed':
         this.setStepsPerFrame(msg.stepsPerFrame);
+        if (msg.adaptiveFrames !== undefined) this.fullBatches = !msg.adaptiveFrames;
         return this.reply(msg.reqId, 'setSpeed', null);
       case 'setTectonicParams':
         // The sim validates; invalid parameters must not be kept for later sims either.
@@ -343,6 +402,9 @@ export class SimHost {
     this.keyframes.clear();
     this.viewing = null;
     this.resetPerf();
+    this.stepMsAvg = 0;
+    this.frameMsAvg = 0;
+    this.stepSamples = 0;
     this.climateSources = [];
     this.postWorld();
     this.recordKeyframe();
@@ -379,6 +441,7 @@ export class SimHost {
     if (!this.playing) {
       this.toPaint({ type: 'start', epoch: this.epoch });
       this.playFrom = this.showSeq + 1;
+      this.pendingSteps = 0;
     }
     this.playing = true;
     for (const link of this.painters) link.awaiting = 0;
@@ -389,6 +452,8 @@ export class SimHost {
   private stopPlaying(): void {
     if (this.playing) this.toPaint({ type: 'stop', epoch: this.epoch });
     this.playing = false;
+    // Steps taken after the last frame are shown by the pause still (it paints the live state).
+    this.pendingSteps = 0;
     for (const link of this.painters) link.awaiting = 0;
   }
 
@@ -398,34 +463,67 @@ export class SimHost {
     this.env.schedule(this.tick);
   }
 
+  /**
+   * One playback tick: one simulation step per macrotask (credits and pause requests are handled in
+   * between), then maybe a frame.
+   *  - Quick batches (the speed's steps fit TARGET_FRAME_MS): as before, a batch starts only when a
+   *    painter is free and is posted when complete (the sim runs one snapshot ahead of the painters).
+   *  - Slow batches (adaptive): the sim steps on regardless and posts a frame as soon as a painter is
+   *    free after `adaptiveStepsPerFrame` steps; only a complete batch waits for a painter.
+   */
   private readonly tick = (): void => {
     this.tickScheduled = false;
     if (!this.playing || !this.sim) return;
-    const slot = this.freePainter();
-    if (slot < 0) return; // resumed by a painter's credit
     try {
-      const t0 = this.env.now();
-      this.sim.step(this.stepsPerFrame);
-      const t1 = this.env.now();
-      this.perf.lastStepMs = (t1 - t0) / this.stepsPerFrame;
-      this.sim.snapshot();
-      this.perf.lastSnapshotMs = this.env.now() - t1;
-      // Hand the frame to the painter first; bookkeeping overlaps with its painting.
-      this.show('play', 0, 'preview', false, slot);
-      this.nextPainter = (slot + 1) % this.painters.length;
-      this.recordKeyframe();
-      this.win.steps += this.stepsPerFrame;
-      this.win.frames++;
-      this.updateRates();
-      this.pushState(false);
-      // Another painter is free (helpers): keep it fed instead of waiting for the next credit.
-      if (this.freePainter() >= 0) this.scheduleTick();
+      const max = this.stepsPerFrame;
+      const k = this.frameSteps();
+      // Resumed by a painter's credit.
+      if (k >= max && this.pendingSteps === 0 && this.freePainter() < 0) return;
+      if (this.pendingSteps < max) {
+        const t0 = this.env.now();
+        this.sim.step(1);
+        const ms = this.env.now() - t0;
+        this.perf.lastStepMs = ms;
+        if (this.stepSamples++ > 0) this.stepMsAvg = this.stepMsAvg > 0 ? 0.8 * this.stepMsAvg + 0.2 * ms : ms;
+        this.pendingSteps++;
+        this.win.steps++;
+      }
+      const slot = this.freePainter();
+      if (slot >= 0 && this.pendingSteps >= Math.min(max, this.frameSteps())) {
+        this.postFrame(slot);
+        // Hover snapshot / status / history (throttled) right after a frame, while the snapshot is
+        // memoized — between steps it would cost a snapshot build of its own.
+        this.updateRates();
+        this.pushState(false);
+      }
+      // A complete batch (or a quick one about to start) waits for a painter's credit, which
+      // schedules the next tick.
+      const waiting = this.freePainter() < 0 &&
+        (this.pendingSteps >= max || (this.pendingSteps === 0 && this.frameSteps() >= max));
+      if (!waiting) this.scheduleTick();
     } catch (e) {
       this.stopPlaying();
       this.env.post({ type: 'error', reqId: 0, message: `playback stopped: ${errorMessage(e)}` });
       this.pushState(true);
     }
   };
+
+  /** Snapshot the live state and hand it to painter `slot` as the next playback frame. */
+  private postFrame(slot: number): void {
+    const sim = this.requireSim();
+    const t1 = this.env.now();
+    sim.snapshot();
+    this.perf.lastSnapshotMs = this.env.now() - t1;
+    this.show('play', 0, 'preview', false, slot);
+    this.nextPainter = (slot + 1) % this.painters.length;
+    const frameMs = this.env.now() - t1;
+    this.frameMsAvg = this.frameMsAvg > 0 ? 0.8 * this.frameMsAvg + 0.2 * frameMs : frameMs;
+    // History keyframes at frame boundaries (the snapshot is memoized: no second build).
+    this.recordKeyframe();
+    this.perf.stepsPerFrame = this.pendingSteps;
+    this.pendingSteps = 0;
+    this.win.frames++;
+  }
 
   private resetPerf(): void {
     this.win = { start: this.env.now(), steps: 0, frames: 0 };

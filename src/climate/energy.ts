@@ -71,7 +71,15 @@ export interface EbmModel {
   coastKm: Float64Array;
   /** Smallest land snow/ice mass of the current year (kg/m²). */
   minY: Float64Array;
+  /** Distance (km) of each cell of the initial glacier mask from its margin (energyIce.ts; 0 elsewhere). */
+  iceCoreKm: Float64Array;
   iceYears: number;
+  /**
+   * Glacier topology updates still allowed at the coming year boundaries (energyIce.applyIceFlow;
+   * ebmTuning.glacierTopologyYears at the start of a run, all of them inside the cold pass 1);
+   * 0 = hold the mask.
+   */
+  iceUpdates: number;
   /**
    * Coupling (W/m²/K) of high-terrain land to the free troposphere: the air over high plateaus and
    * ranges is part of the jet-mixed free atmosphere, so its sea-level-reduced temperature is pulled
@@ -80,6 +88,8 @@ export interface EbmModel {
   freeTrop: Float64Array;
   stepsPerMonth: number;
   stepsPerYear: number;
+  /** Axial tilt (deg) the diffusivities were built for (airDiffusionCouplings). */
+  tilt: number;
   /** Step length, s. */
   dt: number;
   /** Daily-mean TOA insolation per step and row (W/m²). */
@@ -127,6 +137,13 @@ export interface EbmState {
    * ebmTuning.glacierMassLow, glacier / ice sheet above (see glacierWeight).
    */
   M: Float64Array;
+  /**
+   * Seasonal snow on top of the land mass, kg/m² w.e. (≤ M): the whole pack on bare land; on a
+   * glacier the snow fallen since its surface last melted down to bare ice. A glacier keeps its snow
+   * albedo while this layer lasts (accumulation zone) and darkens to bare ice once it has melted
+   * (ablation zone).
+   */
+  Ms: Float64Array;
 }
 
 /** Pass-2 couplings. Stencils are per month; velocities are already scaled. */
@@ -215,6 +232,46 @@ export function diffusivity(sinPhi: number, meridional = false, tiltDeg = 23.44)
   return d;
 }
 
+/**
+ * FV air-diffusion couplings per cell (W/m²/K per unit area of that cell) across its east, north and
+ * south faces, for land surface heights `height` (m above sea level). Face factor: mean of the two
+ * cells' factors (1 over ocean, landDiffusionFactor over land, iceSheetDiffusionFactor over high
+ * polar plateaus whose surface inversions decouple them from the transient eddies).
+ */
+export function airDiffusionCouplings(
+  g: LatLonGrid, land: Uint8Array, height: ArrayLike<number>, tiltDeg: number, kE: Float64Array, kN: Float64Array, kS: Float64Array,
+): void {
+  const t = ebmTuning;
+  const { nx, ny } = g;
+  const polarSin = Math.sin((t.iceSheetLat * Math.PI) / 180);
+  const fc = (i: number): number => {
+    if (!land[i]) return 1;
+    const polarPlateau = Math.abs(g.sinLat[(i / nx) | 0]) > polarSin && height[i] > t.iceSheetHeight;
+    return polarPlateau ? t.iceSheetDiffusionFactor : t.landDiffusionFactor;
+  };
+  for (let j = 0; j < ny; j++) {
+    // Zonal faces: length dφ, center distance cosφ·dλ; per unit cell area.
+    const kx = (diffusivity(g.sinLat[j], false, tiltDeg) * g.dLat) / (g.cosLat[j] * g.dLon * g.area[j]);
+    for (let c = 0; c < nx; c++) {
+      const i = j * nx + c;
+      const e = j * nx + (c === nx - 1 ? 0 : c + 1);
+      kE[i] = kx * 0.5 * (fc(i) + fc(e));
+    }
+  }
+  kN.fill(0);
+  kS.fill(0);
+  for (let j = 0; j + 1 < ny; j++) {
+    // Face between rows j and j+1 at faceSin[j+1]: length dλ·cosφ_f, center distance dφ.
+    const flux = (diffusivity(g.faceSin[j + 1], true, tiltDeg) * g.dLon * g.faceCos[j + 1]) / g.dLat;
+    for (let c = 0; c < nx; c++) {
+      const i = j * nx + c;
+      const f = flux * 0.5 * (fc(i) + fc(i + nx));
+      kS[i] = f / g.area[j];
+      kN[i + nx] = f / g.area[j + 1];
+    }
+  }
+}
+
 export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Array, params: ClimateParams, stepsPerMonth: number): EbmModel {
   const t = ebmTuning;
   const { nx, ny, n } = g;
@@ -234,38 +291,14 @@ export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Arr
   const kE = new Float64Array(n);
   const kN = new Float64Array(n);
   const kS = new Float64Array(n);
-  // Face factor: mean of the two cells' factors (1 over ocean, landDiffusionFactor over land,
-  // iceSheetDiffusionFactor over high polar plateaus whose surface inversions decouple them).
-  const polarSin = Math.sin((t.iceSheetLat * Math.PI) / 180);
-  const fc = (i: number): number => {
-    if (!land[i]) return 1;
-    const polarPlateau = Math.abs(g.sinLat[(i / nx) | 0]) > polarSin && height[i] > t.iceSheetHeight;
-    return polarPlateau ? t.iceSheetDiffusionFactor : t.landDiffusionFactor;
-  };
   for (let j = 0; j < ny; j++) {
     const s = g.sinLat[j];
     const p2 = 0.5 * (3 * s * s - 1);
     albLand[j] = t.albedoBase + t.albedoP2 * p2;
     albWater[j] = albLand[j] + t.albedoOceanOffset;
     cOcean[j] = t.rhoCpWater * (t.mixedLayerMin + (t.mixedLayerMax - t.mixedLayerMin) * s * s);
-    // Zonal faces: length dφ, center distance cosφ·dλ; per unit cell area.
-    const kx = (diffusivity(s, false, params.axialTilt) * g.dLat) / (g.cosLat[j] * g.dLon * g.area[j]);
-    for (let c = 0; c < nx; c++) {
-      const i = j * nx + c;
-      const e = j * nx + (c === nx - 1 ? 0 : c + 1);
-      kE[i] = kx * 0.5 * (fc(i) + fc(e));
-    }
   }
-  for (let j = 0; j + 1 < ny; j++) {
-    // Face between rows j and j+1 at faceSin[j+1]: length dλ·cosφ_f, center distance dφ.
-    const flux = (diffusivity(g.faceSin[j + 1], true, params.axialTilt) * g.dLon * g.faceCos[j + 1]) / g.dLat;
-    for (let c = 0; c < nx; c++) {
-      const i = j * nx + c;
-      const f = flux * 0.5 * (fc(i) + fc(i + nx));
-      kS[i] = f / g.area[j];
-      kN[i + nx] = f / g.area[j + 1];
-    }
-  }
+  airDiffusionCouplings(g, land, height, params.axialTilt, kE, kN, kS);
   // Ocean heat diffusion (eddies/overturning) between ocean cells only.
   const oE = new Float64Array(n);
   const oN = new Float64Array(n);
@@ -343,7 +376,7 @@ export function makeEbmModel(g: LatLonGrid, land: Uint8Array, height: Float64Arr
     cp: new Float64Array(m), cyc: makeCyclicWork(nx),
   };
   return {
-    g, land, lapse, bedHeight, iceRaise: new Float64Array(n), iceMask: new Uint8Array(n), accY: new Float64Array(n), ablY: new Float64Array(n), potY: new Float64Array(n), coastKm, minY: new Float64Array(n), iceYears: 0, freeTrop, stepsPerMonth, stepsPerYear, dt: SECONDS_PER_YEAR / stepsPerYear,
+    g, land, lapse, bedHeight, iceRaise: new Float64Array(n), iceMask: new Uint8Array(n), accY: new Float64Array(n), ablY: new Float64Array(n), potY: new Float64Array(n), coastKm, minY: new Float64Array(n), iceCoreKm: new Float64Array(n), iceYears: 0, iceUpdates: Math.max(0, Math.round(t.glacierTopologyYears)), freeTrop, stepsPerMonth, stepsPerYear, tilt: params.axialTilt, dt: SECONDS_PER_YEAR / stepsPerYear,
     insol: insolationTable(g, stepsPerYear, params.axialTilt, params.solarMultiplier),
     albLand, albWater, cOcean, kE, kN, kS, oE, oN, oS, overturning: scaleOverturning(overturningHeating(g, land), params.oceanCurrents), eFull, eMax, work,
   };
@@ -356,11 +389,11 @@ function scaleOverturning(q: Float64Array | null, scale: number): Float64Array |
 }
 
 export function makeState(n: number): EbmState {
-  return { T: new Float64Array(n), E: new Float64Array(n), Es: new Float64Array(n), Ti: new Float64Array(n), Tann: new Float64Array(n), Ai: new Float64Array(n), M: new Float64Array(n) };
+  return { T: new Float64Array(n), E: new Float64Array(n), Es: new Float64Array(n), Ti: new Float64Array(n), Tann: new Float64Array(n), Ai: new Float64Array(n), M: new Float64Array(n), Ms: new Float64Array(n) };
 }
 
 export function cloneState(s: EbmState): EbmState {
-  return { T: s.T.slice(), E: s.E.slice(), Es: s.Es.slice(), Ti: s.Ti.slice(), Tann: s.Tann.slice(), Ai: s.Ai.slice(), M: s.M.slice() };
+  return { T: s.T.slice(), E: s.E.slice(), Es: s.Es.slice(), Ti: s.Ti.slice(), Tann: s.Tann.slice(), Ai: s.Ai.slice(), M: s.M.slice(), Ms: s.Ms.slice() };
 }
 
 export function makeMonthly(n: number): EbmMonthly {

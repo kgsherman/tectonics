@@ -137,7 +137,9 @@ describe('winter forests, tundra and ice sheets', () => {
     // Mostly forest (dark canopy over snow) with crisp open-snow patches; little in-between grey.
     expect(dark / n).toBeGreaterThan(0.45);
     expect(bright / n).toBeGreaterThan(0.04);
-    expect(mid / n).toBeLessThan(0.3);
+    // (polish2: 0.18; polish4 with openings along the valleys of the cold-margin taiga too: 0.26 —
+    // its trees gather in the sheltered valleys again: 0.20.)
+    expect(mid / n).toBeLessThan(0.24);
   });
 
   it('bare larch taiga (Dfd-like, deciduous) is lighter in winter than evergreen taiga', () => {

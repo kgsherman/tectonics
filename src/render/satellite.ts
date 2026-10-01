@@ -17,6 +17,17 @@
  * Patches are ordered by terrain — vegetation in dryland valleys, forests on humid hills, snow
  * first on high ground and pole-facing slopes — and anchored to the plates (sea ice to the
  * world), so textures follow the relief and never crawl.
+ *
+ * Forests read as orbital imagery, not camouflage: the patch score is fractal (multi-scale patch
+ * noise plus broad substrate tracts from the lithology noise: patches at every size, rough outlines)
+ * and its soft threshold is mean-preserving (the wooded area follows the climate's tree fraction).
+ * Contrast and edges depend on the tree fraction t: intermediate cover (savanna, forest-steppe) has
+ * the strongest mosaic with the softest edges (tree-density gradients); toward a closed humid
+ * canopy the openings fade into shrubby secondary growth (continuous dark canopy with gentle tone
+ * variation and fine texture), while snow still reveals the stand structure crisply in winter.
+ * Openings in humid forest sit in the hollows and along the valleys; in drylands and at the cold
+ * margin (northern taiga, forest-tundra) the trees gather there instead (gallery forests), and drawn
+ * rivers through dry land get riparian strips.
  */
 import * as _constants from '../core/constants';
 import type { ClimateResult, PaintOptions, SphereMesh, WorldSnapshot } from '../core/types';
@@ -108,12 +119,60 @@ const ASPECT_K = 7;
 /** Relief-coupled albedo: dryland valleys (alluvium) brighter, crests darker; humid valleys darker. */
 const REL_DRY = 0.13;
 const REL_WET = 0.07;
-/** How far the vegetation / forest fractions become patches (0 = linear mix, 1 = full mosaic). */
+/**
+ * How far the vegetation / forest fractions become patches (0 = linear mix, 1 = full mosaic); the
+ * forest mosaic's strength is MOS_TREE (humid) … MOS_TREE_DRY × t4·(1.6 − 0.6·t4), t4 = 4·t·(1 − t) of
+ * the tree fraction t: full at intermediate fractions, ≈ ¼ at t = 0.95, none in a closed canopy.
+ */
 const MOS_VEG = 0.3;
-const MOS_TREE = 0.72;
-const MOS_TREE_DRY = 0.45;
-/** Weight of the fine noise (≈ ±0.45) in the forest patch score: irregular patch outlines. */
-const PATCH_IRREG = 0.55;
+const MOS_TREE = 0.85;
+/** … in drylands (scattered trees and woodland islands mostly mix within a pixel). */
+const MOS_TREE_DRY = 0.5;
+/**
+ * Forest patch-score weights: fractal patch noise, the lithology noise (substrate: broad, hundreds of
+ * km, more- and less-wooded tracts — std ≈ 0.27, so ≈ 0.45 of score), fine noise (rough outlines).
+ */
+const TREE_VG = 0.85;
+const TREE_LITH = 1.65;
+const PATCH_IRREG = 0.3;
+/** Relief (+ hills) and valley-ness weights in the forest score, dry → humid (− = more trees). */
+const TREE_REL_DRY = 0.5;
+const TREE_REL_HUMID = -0.35;
+const TREE_VLY_DRY = -2.2;
+const TREE_VLY_HUMID = 0.9;
+/** Standard deviation of the forest score, dry → humid (quantile scale). */
+const TREE_SIG_DRY = 1.33;
+const TREE_SIG_HUMID = 1.11;
+/** Warmest-month temperatures (°C, at the pixel) over which the cold margin's valley preference fades. */
+const TREE_COLD_T0 = 11;
+const TREE_COLD_T1 = 16;
+/** Extra edge width of the forest mosaic at intermediate tree fractions (× t4²). */
+const TREE_SOFT = 1.6;
+/**
+ * Per quantised tree fraction t (the QN index): 1 / edge-width factor (1 + TREE_SOFT·t4²), the
+ * smoothstep spread 0.05·W² per unit base width², and the mosaic-contrast shape t4·(1.6 − 0.6·t4)
+ * (t4 = 4·t·(1 − t)): no divisions in the hot loop.
+ */
+const { inv: TREE_INV, w2: TREE_W2, amp: TREE_AMP } = (() => {
+  const inv = new Float64Array(QN_N + 1), w2 = new Float64Array(QN_N + 1), amp = new Float64Array(QN_N + 1);
+  for (let i = 0; i <= QN_N; i++) {
+    const t = i / QN_N, t4 = 4 * t * (1 - t), soft = 1 + TREE_SOFT * t4 * t4;
+    inv[i] = 1 / soft;
+    w2[i] = 0.05 * soft * soft;
+    amp[i] = t4 * (1.6 - 0.6 * t4);
+  }
+  return { inv, w2, amp };
+})();
+/**
+ * Openings in well-wooded humid land (shrubs, secondary growth): share of the herbaceous colour
+ * replaced at full tree fraction and humidity, and their tone relative to the canopy.
+ */
+const GAP_SHRUB = 0.65;
+const SHRUB_TONE = 1.45;
+/** Canopy tone variation per unit of the lithology noise (std ≈ 0.27). */
+const CANOPY_TONE = 0.3;
+/** Riparian strips along drawn rivers: humidity share that suppresses them (humid land is wooded anyway). */
+const RIP_HUMID = 0.75;
 /** Downslope gully / spur texture: derivative gain, weight in the forest mosaic, slope of full effect. */
 const GULLY_K = 2;
 const GULLY_W = 0.6;
@@ -312,12 +371,15 @@ export function paintSatellite(
   // Full quality: the dendritic valley network of the actual terrain (drainage routing) structures
   // vegetation and snow; the preview uses the plate-frame drainage-line texture alone.
   const lines = withRivers ? drainageLines(heightFieldKey(mesh, snapshot, opts), hf, climate, opts, cache) : null;
-  const surf = withRivers ? { snow: new Uint8Array(w * h), desert: new Uint8Array(w * h), trees: new Uint8Array(w * h), ice: new Uint8Array(w * h) } : null;
+  const surf = withRivers
+    ? { snow: new Uint8Array(w * h), desert: new Uint8Array(w * h), trees: new Uint8Array(w * h), ice: new Uint8Array(w * h), rip: new Uint8Array(w * h) }
+    : null;
   const iW_ICE = 1 / W_ICE;
   // Temperature change across THERMAL_AA_PX pixels per unit of metric slope (°C).
   const lapsePx = LAPSE_RATE * gs.pixelKm * 1000 * THERMAL_AA_PX;
   const edgeK = Math.pow(2048 / w, EDGE_EXP);
   const iwVeg = 1 / (EDGE_VEG * edgeK), iwTree = 1 / (EDGE_TREE * edgeK), iwSnow = 1 / (EDGE_SNOW * edgeK), iwIce = 1 / (EDGE_ICE * edgeK);
+  const wTree2 = (EDGE_TREE * edgeK) * (EDGE_TREE * edgeK);
   const cosLat = rasterGeometry(w, h, cache).cosLat;
   for (let r = 0; r < h; r++) {
     const invDx = gs.invDx[r], invDy = gs.invDy;
@@ -406,7 +468,7 @@ export function paintSatellite(
         const hp = hC + BELT_OWN * dH - sea;
         const tw = aTwarm - LAPSE_RATE * hp;
         const ts = aTsnow - LAPSE_RATE * hp;
-        const pn = patch[p] * HF_NOISE_SCALE;
+        const pn = patch[p] * HF_NOISE_SCALE, lk = lith[p] * HF_NOISE_SCALE;
         // Texture noises anchored to the plates (world-frame ones would stay put while the land
         // moves under them: crawling mosaics during playback): fine texture, fine grain, patch
         // noise, and the drainage-line network below the mesh scale.
@@ -530,7 +592,7 @@ export function paintSatellite(
           shed = shed * shed * (3 - 2 * shed);
           snow *= 1 - 0.6 * shed;
         }
-        let mT = 0, des01 = 0, snowVis = 0;
+        let mT = 0, mTs = 0, des01 = 0, snowVis = 0, ripV = 0;
         if (iceCov < ICE_CLOSED) {
           // Temperature-limited vegetation: continuous re-classification by the pixel's own
           // warmest month (treeline ≈ 10 °C, vegetation limit ≈ 0 °C).
@@ -579,7 +641,7 @@ export function paintSatellite(
           // Forests: along valleys and drainage lines first where trees are marginal (cold or dry:
           // gallery forests, forest-tundra), on the drained hills in humid lowlands; gullies and
           // spurs on slopes.
-          let gully = 0;
+          let gully = 0, gapK = 0;
           if (trees > 1e-4) {
             if (slope > 0.2 * GULLY_SLOPE) {
               // Downslope gully / spur pattern (derivative across the local slope: stripes run downhill).
@@ -592,23 +654,60 @@ export function paintSatellite(
               if (sw < 1) gully *= sw;
             }
             const tRel = trees / cover;
-            // Humid forests: patches of the patch noise, on the drained hills; drylands: scattered
-            // trees (a sub-pixel mix) gathering into gallery forests along the valleys.
-            const sig = 0.75 + 0.25 * humid;
-            // (A little of the rougher fine noise breaks the patches into irregular clusters rather
-            // than single round noise peaks.)
-            const sT = (0.45 + 0.45 * humid) * vg + PATCH_IRREG * lf + (0.6 - 1.1 * humid) * relC - 2.2 * vc + GULLY_W * gully;
-            let iw = iwTree;
+            // Patch score: the fractal (multi-scale) patch noise, a little fine noise for rough
+            // outlines, and the terrain — drylands: trees in the hollows and gallery forests along
+            // the valleys and drainage lines; humid lands: forest on the drained hills, the openings
+            // (floodplain meadows, wetlands, clearings) in the hollows and along the valleys.
+            // The cold margin (northern taiga, forest-tundra) is marginal for trees like the drylands:
+            // they gather in the sheltered, drained valleys there too (the aridity ratio calls every
+            // cold climate humid).
+            let cold = (TREE_COLD_T1 - twm) * (1 / (TREE_COLD_T1 - TREE_COLD_T0));
+            cold = 0.5 * (Math.abs(cold) - Math.abs(cold - 1) + 1);
+            const hT = humid * (1 - cold * cold * (3 - 2 * cold));
+            const sig = TREE_SIG_DRY + (TREE_SIG_HUMID - TREE_SIG_DRY) * hT;
+            const sT = TREE_VG * vg + TREE_LITH * lk + PATCH_IRREG * lf + (TREE_REL_DRY + (TREE_REL_HUMID - TREE_REL_DRY) * hT) * relC
+              + (TREE_VLY_DRY + (TREE_VLY_HUMID - TREE_VLY_DRY) * hT) * vc + GULLY_W * gully;
+            // Cover-dependent structure: t4 = 4·t·(1 − t) peaks at intermediate tree fractions.
+            // Edges soften there (tree-density gradients of savannas and forest-steppe rather than
+            // crisp stands), and the mosaic contrast fades toward closed canopy (rare, faint
+            // openings) and toward open land (scattered trees: a sub-pixel mix).
+            const ti = (tRel * QN_N + 0.5) | 0;
+            const qn = QN[ti];
+            // Edge widths (score units): soft (colour) and crisp (stand structure under snow).
+            let iw = iwTree * TREE_INV[ti], w2 = wTree2 * TREE_W2[ti];
+            let iwS = iwTree, w2S = 0.05 * wTree2;
             const du = dTpx * iv25 * (1 / THERMAL_AA_PX);
             if (treeT < 1 && du > RAMP_AA_DU) {
-              // Treeline on steep ground: widen the edge with the thermal sweep.
+              // Treeline on steep ground: widen the edges with the thermal sweep.
               const g = MOSAIC_AA_PX * sig * rampShift(uTree, du, tRel / treeT > 1 ? 1 : tRel / treeT);
-              if (g * iw > 1) iw = 1 / g;
+              if (g * iwS > 1) {
+                iwS = 1 / g;
+                w2S = 0.05 * g * g;
+                if (iwS < iw) {
+                  iw = iwS;
+                  w2 = w2S;
+                }
+              }
             }
-            let m = (QN[(tRel * QN_N + 0.5) | 0] * sig - sT) * iw + 0.5;
+            // Mean-preserving soft threshold: a smoothstep edge W = 1/iw wide spreads the score by
+            // ≈ 0.224·W (σ), so the quantile is taken of the widened distribution.
+            let m = (qn * Math.sqrt(sig * sig + w2) - sT) * iw + 0.5;
             m = 0.5 * (Math.abs(m) - Math.abs(m - 1) + 1);
             m = m * m * (3 - 2 * m);
-            mT = (tRel + (m - tRel) * (MOS_TREE_DRY + (MOS_TREE - MOS_TREE_DRY) * humid)) * mC;
+            // Summer colour: the mosaic contrast falls toward a closed canopy (shrubby openings).
+            const mos = MOS_TREE_DRY + (MOS_TREE - MOS_TREE_DRY) * humid;
+            mT = (tRel + (m - tRel) * mos * TREE_AMP[ti]) * mC;
+            if (snow > 0) {
+              // Under snow the stand structure itself shows: crisp edges, full contrast (open bogs
+              // and clearings white in the dark winter taiga).
+              let ms = (qn * Math.sqrt(sig * sig + w2S) - sT) * iwS + 0.5;
+              ms = 0.5 * (Math.abs(ms) - Math.abs(ms - 1) + 1);
+              ms = ms * ms * (3 - 2 * ms);
+              mTs = (tRel + (ms - tRel) * mos) * mC;
+            } else mTs = mT;
+            // Openings within well-wooded humid land are shrubby secondary growth, close to the
+            // canopy in tone (not the open grassland of the drier mosaics).
+            gapK = GAP_SHRUB * tRel * tRel * humid;
           }
           // Ground: humid soils ↔ desert surfaces, then rock.
           let gR = soilR, gG = soilG, gB = soilB;
@@ -616,7 +715,6 @@ export function paintSatellite(
             // Deserts: sand seas (ergs) collect in basins and lowlands with crisp edges; elsewhere
             // gravel plains (reg) darkening onto the crests (desert varnish on the outcrops) and
             // brighter alluvium in the wadis.
-            const lk = lith[p] * HF_NOISE_SCALE;
             let erg = (lk + 0.3 * pn - 0.35 * relC + 0.08 * lf - ERG_T) * (1 / ERG_W);
             erg = 0.5 * (Math.abs(erg) - Math.abs(erg - 1) + 1);
             erg = erg * erg * (3 - 2 * erg);
@@ -687,9 +785,15 @@ export function paintSatellite(
           // Fine texture (band-limited plate-frame noises, strongest at a few pixels: it survives
           // magnification on the globe): canopy (crowns, gaps, shaded valleys) varies most, grass less.
           const tx = TX_PN * pn + TX_LF * lf + TX_GR * gr;
-          // Vegetation: sunlit crests brighter, shaded wet hollows darker.
+          if (gapK > 0) {
+            hR += (SHRUB_TONE * treeR - hR) * gapK;
+            hG += (SHRUB_TONE * treeG - hG) * gapK;
+            hB += (SHRUB_TONE * treeB - hB) * gapK;
+          }
+          // Vegetation: sunlit crests brighter, shaded wet hollows darker; the canopy also varies
+          // gently in tone over tens of pixels (stand composition, soils: the lithology noise).
           const vf = 1 + REL_WET * rel + CURV_VEG * curv - VALLEY_DARK * humid * vly;
-          const cf = vf * (1 + CANOPY_TEX * tx), hf = vf * (1 + HERB_TEX * tx);
+          const cf = vf * (1 + CANOPY_TEX * tx + CANOPY_TONE * lk), hf = vf * (1 + HERB_TEX * tx);
           const mH = (mC - mT) * hf, mTc = mT * cf, mG = (1 - mC) * gf * (1 + GROUND_TEX * tx);
           R = gR * mG + hR * mH + treeR * mTc;
           G = gG * mG + hG * mH + treeG * mTc;
@@ -698,7 +802,7 @@ export function paintSatellite(
             // Forest canopies hide most of the ground snow (dark winter taiga) — bare deciduous
             // crowns much less (light-grey larch taiga); canopy gaps give it a fine grain.
             let vis = snow;
-            if (mT > 0) {
+            if (mTs > 0) {
               // Evergreen vs deciduous stands form a mosaic too (dark spruce / fir in the valleys,
               // larch on the uplands), rather than a blur of the class blend.
               const ever = px !== null ? px[pb + PX_EVER] * PX_U : w00 * LG[q00 + A_EVER] + w01 * LG[q01 + A_EVER] + w10 * LG[q10 + A_EVER] + w11 * LG[q11 + A_EVER];
@@ -709,7 +813,7 @@ export function paintSatellite(
               mE = mE * mE * (3 - 2 * mE);
               let hide = (hideD + (EVERGREEN_SNOW_HIDE - hideD) * mE) * (1 - 0.06 * gr - 0.04 * lf - 0.08 * relC + 0.1 * gully);
               hide = hide > 0.97 ? 0.97 : hide < 0 ? 0 : hide;
-              vis *= 1 - hide * mT;
+              vis *= 1 - hide * mTs;
             }
             // Open snowfields: tall shrubs along the drainage lines and wind-scoured crests show
             // through a little (structure that follows the terrain, not noise).
@@ -719,7 +823,7 @@ export function paintSatellite(
             let scour = (rel - 0.35) * (1 / 0.9);
             scour = 0.5 * (Math.abs(scour) - Math.abs(scour - 1) + 1);
             scour = scour * scour * (3 - 2 * scour);
-            vis *= 1 - (1 - mT) * (SHRUB_SNOW * shrub * dl + SCOUR_SNOW * scour);
+            vis *= 1 - (1 - mTs) * (SHRUB_SNOW * shrub * dl + SCOUR_SNOW * scour);
             // Shaded snow (valleys, pole-facing) is slightly bluer.
             let sh = -0.6 * rel + 0.3 * asp;
             sh = 0.5 * (Math.abs(sh) - Math.abs(sh - 1) + 1);
@@ -734,6 +838,8 @@ export function paintSatellite(
             snowVis = vis;
           }
           des01 = des;
+          // Riparian-forest potential: dry, sparsely wooded land.
+          if (surf !== null) ripV = (1 - RIP_HUMID * humid) * (1 - mT);
         } else {
           // Closed ice cover: nothing of the ground shows.
           R = G = B = 0;
@@ -789,8 +895,9 @@ export function paintSatellite(
           if (frz > sv) sv = frz;
           surf.snow[p] = (sv * 255 + 0.5) | 0;
           surf.desert[p] = (smooth(0.2, 0.8, des01) * 255 + 0.5) | 0;
-          surf.trees[p] = (mT * 255 + 0.5) | 0;
+          surf.trees[p] = (mTs * 255 + 0.5) | 0;
           surf.ice[p] = (iceCov * 255 + 0.5) | 0;
+          surf.rip[p] = (ripV * 255 + 0.5) | 0;
         }
         if (shadeF !== null) {
           // Ice sheets smooth the bedrock relief: their shading is softened.

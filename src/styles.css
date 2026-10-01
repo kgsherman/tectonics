@@ -137,6 +137,17 @@ button.wg-chip:hover { border-color: var(--wg-border); color: var(--wg-text); }
 .wg-field-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
 .wg-label { color: var(--wg-text); font-size: 12.5px; }
 .wg-readout { color: var(--wg-text-dim); font-variant-numeric: tabular-nums; font-size: 12px; white-space: nowrap; }
+/* Slider readouts are editable: type an exact value (e.g. 23.44° tilt). */
+.wg-readout-box { display: inline-flex; align-items: baseline; gap: 1px; }
+.wg-readout-input {
+  font: inherit; font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; max-width: calc(10ch + 6px);
+  padding: 0 2px; margin: -2px 0; height: 18px; border: 1px solid transparent; border-radius: 4px; background: transparent;
+  color: var(--wg-text-dim); cursor: text; transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.wg-readout-input:hover { border-color: var(--wg-border); color: var(--wg-text); }
+.wg-readout-input:focus { outline: none; border-color: var(--wg-accent); background: var(--wg-bg); color: var(--wg-text); box-shadow: 0 0 0 2px var(--wg-accent-soft); }
+.wg-readout-input:disabled { cursor: default; }
+.wg-readout-unit.is-word { padding-left: 2px; }
 
 .wg-range {
   -webkit-appearance: none; appearance: none; width: 100%; height: 18px; margin: 0; background: transparent; cursor: pointer; --pct: 50%;
@@ -315,6 +326,8 @@ button.wg-chip:hover { border-color: var(--wg-border); color: var(--wg-text); }
 .wg-toast-title { font-weight: 600; }
 .wg-toast-detail { color: var(--wg-text-dim); margin-top: 2px; word-break: break-word; line-height: 1.45; }
 .wg-toast .wg-btn { height: 22px; width: 22px; }
+.wg-toast-actions { margin-top: 7px; display: flex; gap: 6px; }
+.wg-toast .wg-toast-actions .wg-btn { width: auto; height: 26px; padding: 0 10px; font-size: 12px; }
 .wg-toast-error { border-color: rgba(255, 107, 107, 0.4); }
 .wg-toast-error > .wg-icon { color: var(--wg-danger); }
 .wg-toast-warn > .wg-icon { color: var(--wg-warn); }

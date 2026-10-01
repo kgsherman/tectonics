@@ -12,11 +12,12 @@
  * elevations (the Earth input already includes Greenland's and Antarctica's ice) are kept. The raise
  * is what makes a large polar continent glaciate robustly (its interior climbs out of the melt zone)
  * while small or low-latitude ice caps, which cannot build a dome before the surrounding warm air
- * melts them, stay small. Recomputed once per model year from the glacier mask; the land lapse and
- * free-troposphere coupling of the energy balance follow the new surface.
+ * melts them, stay small. Recomputed once per model year from the glacier mask; the land lapse,
+ * free-troposphere coupling and air-diffusion couplings of the energy balance follow the new surface
+ * (a grown sheet is a high polar plateau, decoupled from the eddies by its surface inversion).
  */
 import { LAPSE_RATE } from '../core/constants';
-import { glacierWeight, type EbmModel, type EbmState } from './energy';
+import { airDiffusionCouplings, glacierWeight, type EbmModel, type EbmState } from './energy';
 import { nearestValidIndex } from './numerics';
 import { ebmTuning } from './tuning';
 
@@ -66,7 +67,12 @@ export function iceSurfaceRaise(M: EbmModel, S: EbmState, out: Float64Array): Fl
   return out;
 }
 
-/** Update the land lapse and free-troposphere coupling of `M` for the current ice surface of `S`. */
+/**
+ * Update the land lapse, free-troposphere coupling and air-diffusion couplings of `M` for the current
+ * ice surface of `S`. A grown ice sheet is a high polar plateau like any other: its strong surface
+ * inversion decouples it from the transient eddies (ebmTuning.iceSheetDiffusionFactor), so warm air
+ * from bare land around it does not mix into its interior.
+ */
 export function applyIceSurface(M: EbmModel, S: EbmState): void {
   const raise = iceSurfaceRaise(M, S, M.work.dep);
   const { land, bedHeight, lapse, freeTrop } = M;
@@ -79,6 +85,9 @@ export function applyIceSurface(M: EbmModel, S: EbmState): void {
     const x = h / t.freeTropHeight;
     freeTrop[i] = t.freeTropCoupling * Math.min(1, x * x);
   }
+  const h = M.work.F;
+  for (let i = 0; i < M.g.n; i++) h[i] = land[i] ? bedHeight[i] + M.iceRaise[i] : 0;
+  airDiffusionCouplings(M.g, land, h, M.tilt, M.kE, M.kN, M.kS);
 }
 
 /**
@@ -94,13 +103,15 @@ export function applyIceSurface(M: EbmModel, S: EbmState): void {
  *    melt left over once their seasonal snow is gone, `potY`), as far as the surplus can feed their
  *    ablation;
  *  - the ablation zone of a sheet in balance gets its annual loss back (flow from upstream).
- * Cells whose ice melted out during the year have left their sheet. Bare land nucleates new ice
- * where its snow survived the year with a positive balance. Conversions are immediate (a whole
- * ice cap forms or disappears), so the margins converge within a few years; topology changes only
- * at the first ebmTuning.glacierTopologyYears year boundaries of a run (inside the cold pass 1,
- * identical for every schedule) and is held afterwards (mask kept, sheets nourished, bare land
- * kept below glacier mass), which makes the glacier state independent of the run length and of
- * warm starts.
+ * Cells whose ice melted out during the year have left their sheet. The core of a cold-start sheet
+ * (deeper than ebmTuning.glacierCoreKm inside its initial margin) is never removed, unless the sheet
+ * did not sustain itself in the first year of the run (releaseMeltedCore). Bare land
+ * nucleates new ice where its snow survived the year with a positive balance. Conversions are
+ * immediate (a whole ice cap forms or disappears), so the margins converge within a few years;
+ * topology changes only at the first ebmTuning.glacierTopologyYears year boundaries of a run
+ * (M.iceUpdates; inside the cold pass 1, identical for every schedule) and is held afterwards (mask
+ * kept, sheets nourished, bare land kept below glacier mass), which makes the glacier state
+ * independent of the run length and of warm starts.
  * Resets the yearly accumulators.
  */
 export function applyIceFlow(M: EbmModel, S: EbmState): void {
@@ -110,9 +121,14 @@ export function applyIceFlow(M: EbmModel, S: EbmState): void {
   // The mask is read from the mass only for the initial state; afterwards the topology update sets
   // it from the sheets' budgets (a bare cell's deep winter snow at the year boundary is not glacier)
   // and the held topology keeps it.
-  if (M.iceYears === 0) for (let i = 0; i < n; i++) iceMask[i] = land[i] === 1 && glacierWeight(S.M[i]) >= 0.5 ? 1 : 0;
-  else if (M.iceYears <= t.glacierTopologyYears) updateIceTopology(M, S);
-  else holdIceTopology(M, S);
+  if (M.iceYears === 0) {
+    for (let i = 0; i < n; i++) iceMask[i] = land[i] === 1 && glacierWeight(S.M[i]) >= 0.5 ? 1 : 0;
+    marginDistanceKm(M, iceMask, M.iceCoreKm);
+  } else if (M.iceUpdates > 0) {
+    if (M.iceYears === 1) releaseMeltedCore(M);
+    updateIceTopology(M, S);
+    M.iceUpdates--;
+  } else holdIceTopology(M, S);
   for (let i = 0; i < n; i++) {
     accY[i] = 0;
     ablY[i] = 0;
@@ -133,7 +149,10 @@ function holdIceTopology(M: EbmModel, S: EbmState): void {
     if (!land[i]) continue;
     if (iceMask[i]) {
       if (S.M[i] < t.glacierMassMax) S.M[i] = t.glacierMassMax;
-    } else if (S.M[i] > t.glacierMassLow) S.M[i] = t.glacierMassLow;
+    } else if (S.M[i] > t.glacierMassLow) {
+      S.M[i] = t.glacierMassLow;
+      if (S.Ms[i] > S.M[i]) S.Ms[i] = S.M[i];
+    }
   }
 }
 
@@ -149,6 +168,84 @@ function neighbours4(nx: number, ny: number, i: number, out: Int32Array): number
   return k;
 }
 
+/**
+ * Great-circle distance (km) of every glacier cell of `mask` from the nearest non-glacier cell
+ * (centre to centre); 0 elsewhere. With no non-glacier cell at all, half the circumference.
+ */
+function marginDistanceKm(M: EbmModel, mask: Uint8Array, out: Float64Array): void {
+  const { g } = M;
+  const { nx, ny, n } = g;
+  out.fill(0);
+  const open = new Uint8Array(n);
+  let any = false;
+  for (let i = 0; i < n; i++) {
+    open[i] = mask[i] ? 0 : 1;
+    if (open[i]) any = true;
+  }
+  const near = any ? nearestValidIndex(nx, ny, open) : null;
+  const R = 6371;
+  for (let j = 0; j < ny; j++) {
+    for (let c = 0; c < nx; c++) {
+      const i = j * nx + c;
+      if (!mask[i]) continue;
+      if (!near || near[i] < 0) {
+        out[i] = Math.PI * R;
+        continue;
+      }
+      const k = near[i];
+      const j2 = (k / nx) | 0;
+      const c2 = k - j2 * nx;
+      const cosD = g.sinLat[j] * g.sinLat[j2] + g.cosLat[j] * g.cosLat[j2] * Math.cos(g.lon[c] - g.lon[c2]);
+      out[i] = R * Math.acos(Math.max(-1, Math.min(1, cosD)));
+    }
+  }
+}
+
+/**
+ * First topology update of a run: the year just integrated is the cold start's own climate on the
+ * ice-covered branch (ice albedo, surfaces starting at ≤ 0 °C). A sheet whose core mostly melted out
+ * in that summer, with melt to spare on the bare ground (more than ebmTuning.glacierCoreReleaseShare
+ * of its core area; e.g. a polar continent under high-obliquity summers), is not sustained by its
+ * own climate: its core loses its protection and the mass balance decides, as for any other ice.
+ * Otherwise the held mask would report an ice sheet under +15…+25 °C summers that melt it out every
+ * year (Köppen C/D under white ice). Per sheet, not per cell: releasing the low outer ring of a
+ * large sheet that does sustain itself would lower its dome and warm the next ring in turn.
+ */
+function releaseMeltedCore(M: EbmModel): void {
+  const { g, iceMask, iceCoreKm, minY, potY } = M;
+  const { nx, ny, n } = g;
+  const t = ebmTuning;
+  const region = new Int32Array(n).fill(-1);
+  const queue = new Int32Array(n);
+  const nb = new Int32Array(4);
+  for (let s0 = 0; s0 < n; s0++) {
+    if (!iceMask[s0] || region[s0] >= 0) continue;
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = s0;
+    region[s0] = s0;
+    let coreArea = 0;
+    let meltedArea = 0;
+    while (head < tail) {
+      const i = queue[head++];
+      if (iceCoreKm[i] > t.glacierCoreKm) {
+        const a = g.area[(i / nx) | 0];
+        coreArea += a;
+        if (minY[i] <= 0 && potY[i] > t.glacierCoreReleaseMelt) meltedArea += a;
+      }
+      const k = neighbours4(nx, ny, i, nb);
+      for (let q = 0; q < k; q++) {
+        const m = nb[q];
+        if (iceMask[m] && region[m] < 0) {
+          region[m] = s0;
+          queue[tail++] = m;
+        }
+      }
+    }
+    if (coreArea > 0 && meltedArea > t.glacierCoreReleaseShare * coreArea) for (let q = 0; q < tail; q++) iceCoreKm[queue[q]] = 0;
+  }
+}
+
 function updateIceTopology(M: EbmModel, S: EbmState): void {
   const { g, land, iceMask, accY, ablY, potY, minY } = M;
   const { nx, ny, n } = g;
@@ -161,12 +258,18 @@ function updateIceTopology(M: EbmModel, S: EbmState): void {
   for (let i = 0; i < n; i++) if (land[i]) bal[i] = accY[i] - ablY[i] - potY[i];
   // 1 = ice, 0 = bare, −1 = melted out / removed this year (not re-added).
   const state = new Int8Array(n);
+  // The interior of an initial ice sheet (farther than glacierCoreKm from its initial margin) is
+  // never removed: a sheet that size is kilometres thick, its cold, high surface sustains it, and
+  // its response time far exceeds the climate's; only its margins adjust to the mass balance.
+  const core = M.iceCoreKm;
+  const coreKm = t.glacierCoreKm;
   for (let i = 0; i < n; i++) {
     if (!iceMask[i]) continue;
-    if (minY[i] > 0) state[i] = 1;
+    if (minY[i] > 0 || core[i] > coreKm) state[i] = 1;
     else {
       state[i] = -1;
       if (S.M[i] > mLow) S.M[i] = mLow;
+      if (S.Ms[i] > S.M[i]) S.Ms[i] = S.M[i];
     }
   }
   const region = new Int32Array(n).fill(-1);
@@ -229,9 +332,11 @@ function updateIceTopology(M: EbmModel, S: EbmState): void {
       cells.sort((a, b) => bal[a] - bal[b] || a - b);
       for (const i of cells) {
         if (!(deficit > surplus) || bal[i] >= 0) break;
+        if (core[i] > coreKm) continue;
         deficit -= -bal[i] * area(i);
         state[i] = -1;
         if (S.M[i] > mLow) S.M[i] = mLow;
+        if (S.Ms[i] > S.M[i]) S.Ms[i] = S.M[i];
       }
     } else {
       // Advance onto adjacent bare land while the surplus can feed the new ablation.

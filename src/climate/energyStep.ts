@@ -52,7 +52,7 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
   const month = Math.floor(k / M.stepsPerMonth) % 12;
   const A = t.olrA, B = t.olrB, Tf = t.freezeT, aIce = t.albedoIce;
   const cL = t.cLand, cA = t.cAir, cI = t.cIceSurface, gam = t.airSeaExchange;
-  const Tc = S.T, E = S.E, Ti = S.Ti, Es = S.Es, Mass = S.M;
+  const Tc = S.T, E = S.E, Ti = S.Ti, Es = S.Es, Mass = S.M, Ms = S.Ms;
   // Seasonal stratified layer (energy.ts EbmState.Es): capacity and per-step mixing into the deep layer.
   const Cs = t.stratDepth > 0 ? t.rhoCpWater * t.stratDepth : 0;
   const invCs = Cs > 0 ? 1 / Cs : 0;
@@ -90,6 +90,9 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
         let m = Mass[i] + sf;
         if (m > mMax) m = mMax;
         Mass[i] = m;
+        let ms = Ms[i] + sf;
+        if (ms > m) ms = m;
+        Ms[i] = ms;
         const G = glacierWeight(m);
         const cover = snowMassCover(m);
         let w = snowWeight(ts0);
@@ -98,7 +101,10 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
         if (G > w) w = G;
         const a0 = albOff ? aL + albOff[aOff + i] : aL;
         const wCold = (t.seaIceRampWarm - ts0) * rampLand;
-        const aSheet = t.albedoIceSheetMelt + (t.albedoIceSheet - t.albedoIceSheetMelt) * (wCold < 0 ? 0 : wCold > 1 ? 1 : wCold);
+        // A melting glacier keeps the albedo of wet snow while its seasonal snow lasts (accumulation
+        // zone) and darkens to bare ice as that layer melts away (ablation zone).
+        const aWarm = t.albedoIceSheetWet + (t.albedoIceSheetMelt - t.albedoIceSheetWet) * (1 - snowMassCover(ms));
+        const aSheet = aWarm + (t.albedoIceSheet - aWarm) * (wCold < 0 ? 0 : wCold > 1 ? 1 : wCold);
         const aSnow = aIce + (aSheet - aIce) * G;
         const alb = a0 + (aSnow - a0) * w * snowCoverFactor(G, lapse[i]);
         melt[i] = t.meltCoupling * cover;
@@ -145,9 +151,11 @@ function step(M: EbmModel, S: EbmState, cp: EbmCoupling, k: number): void {
             // The pack is gone within the sub-step: only its latent heat is taken up.
             tn = (rhs - (m * LfSnow) / dts) / den;
             Mass[i] = 0;
+            Ms[i] = 0;
             ablY[i] += m;
           } else {
             Mass[i] = m - dm;
+            Ms[i] = Ms[i] > dm ? Ms[i] - dm : 0;
             ablY[i] += dm;
           }
         }

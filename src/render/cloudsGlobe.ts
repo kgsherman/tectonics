@@ -167,8 +167,10 @@ export class GlobeClouds {
   private disposed = false;
   /** Worker compute time of the last grid job (ms, diagnostics). */
   lastJobMs = 0;
+  private readonly shared: SharedUniforms;
 
   constructor(shared: SharedUniforms) {
+    this.shared = shared;
     const material = new ShaderMaterial({
       uniforms: {
         uShellRadius: { value: 1.008 },
@@ -317,6 +319,7 @@ export class GlobeClouds {
     cloudWorker().cancel(this.channel);
     disposeSlots(this.cur);
     disposeSlots(this.prev);
+    this.bindTextures();
     if (this.volumesState === 'ready') releaseVolumes();
     this.volumesState = 'none';
     this.mesh.geometry.dispose();
@@ -355,6 +358,11 @@ export class GlobeClouds {
 
   private bindTextures(): void {
     const u = this.mesh.material.uniforms;
+    // The surface's sun glint fades under the cloud cover and roughens with the wind.
+    const s = this.shared;
+    if (s.uCloudGrid) s.uCloudGrid.value = this.cur.grid.texture;
+    if (s.uCloudWind) s.uCloudWind.value = this.cur.wind.texture;
+    if (s.uCloudOn) s.uCloudOn.value = !this.cur.grid.texture ? 0 : this.cur.wind.texture && u.uHasWind.value > 0.5 ? 2 : 1;
     u.uGrid.value = this.cur.grid.texture;
     u.uAux.value = this.cur.aux.texture;
     u.uWind.value = this.cur.wind.texture;

@@ -1,7 +1,7 @@
 /** Header: brand, tab bar, world/climate status chips and the running-task indicator. */
 import type { UiContext } from '../commands';
 import { fmtMyr, fmtPercent } from '../format';
-import { climateIsStale, displayedTime, TABS, type AppState } from '../state';
+import { climateIsStale, displayedTime, shownLandFraction, TABS, type AppState } from '../state';
 import { shallowEqual } from '../store';
 import { h, setText, toggleClass } from './dom';
 
@@ -37,7 +37,10 @@ export function createHeader(ctx: UiContext): HTMLElement {
     class: 'wg-chip', title: 'Simulation time · plates · land (open Simulate)', attrs: { type: 'button' },
     onClick: () => store.dispatch({ type: 'setTab', tab: 'simulate' }),
   }, worldDot, worldText);
-  store.watch((s) => ({ loaded: s.runtime.worldLoaded, time: displayedTime(s.runtime), playing: s.runtime.playing, stats: s.runtime.stats, kf: s.runtime.viewingKeyframe }), (v) => {
+  store.watch((s) => ({
+    loaded: s.runtime.worldLoaded, time: displayedTime(s.runtime), playing: s.runtime.playing, stats: s.runtime.stats, kf: s.runtime.viewingKeyframe,
+    land: shownLandFraction(s.runtime), sea: s.settings.seaLevel,
+  }), (v) => {
     toggleClass(worldDot, 'is-live', v.playing);
     if (!v.loaded || !v.stats) {
       setText(worldText, 'No world');
@@ -46,7 +49,8 @@ export function createHeader(ctx: UiContext): HTMLElement {
     // Stats describe the live simulation; while scrubbing only the viewed time is shown.
     setText(worldText, v.kf !== null
       ? `Viewing ${fmtMyr(v.time)} · history`
-      : `${fmtMyr(v.time)} · ${v.stats.plateCount} plates · ${fmtPercent(v.stats.landFraction)} land`);
+      : `${fmtMyr(v.time)} · ${v.stats.plateCount} plates · ${fmtPercent(v.land ?? v.stats.landFraction)} land`);
+    worldChip.title = `Simulation time · plates · land above the sea level (${v.sea === 0 ? '0 m' : `${v.sea > 0 ? '+' : '−'}${Math.abs(v.sea)} m`}) — open Simulate`;
   }, { immediate: true, equal: shallowEqual });
 
   // Climate chip.

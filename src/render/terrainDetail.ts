@@ -93,13 +93,15 @@ const RIDGE_FINE_WARP = 0.45;
  * CH_VEG patch noise: amplitudes of the fine hill octaves (from the first above SPLIT_F), band
  * limited at VEG_FMAX × the texel limit (≥ ~3 texels: patch edges stay smooth), and of the coarse
  * octaves between VEG_COARSE_F0 and SPLIT_F, evaluated on the coarse cube with the full domain warp
- * (swirled density modulation). Fine-heavy: at 2048 px most patches are 2–10 px across, clustered
- * by the coarse octaves — a mottle at the native scale, organic blobs when magnified.
+ * (swirled density modulation). Fractal (amplitude falling slowly, ≈ 0.72 per octave, from the
+ * second coarse octave down to the band limit): thresholded, it gives patches at every scale with a
+ * heavy-tailed size distribution — a few large stands, many small ones, rough fractal outlines —
+ * rather than blobs of one characteristic size (the camouflage look of a band-pass noise).
  */
-const VEG_FINE_AMPS = [0.75, 0.85, 0.6, 0.35];
-const VEG_FMAX = 0.75;
+const VEG_FINE_AMPS = [0.55, 0.4, 0.3, 0.22];
+const VEG_FMAX = 0.9;
 const VEG_COARSE_F0 = 5;
-const VEG_COARSE_AMPS = [0.3, 0.45];
+const VEG_COARSE_AMPS = [0.6, 0.8];
 /** CH_VEG relief proxy: gain per fine octave (redder than FINE_GAIN) and band limit. */
 const VREL_GAIN = 0.55;
 const VREL_FMAX = 0.62;
