@@ -3,6 +3,7 @@
  * the WorldView once per animation frame, swaps in a debounced full-quality render when the user
  * pauses, and keeps motion arrows / seed markers / brush cursor in sync.
  */
+import { FrameTask } from '../app/frameTask';
 import { vecToLatLon } from '../core/math3';
 import type { ArrowSpec, BrushCursor, MarkerSpec, RGB, SphereMesh, Vec3, WorldPointerEvent, WorldView } from '../core/types';
 import { plateColor } from '../tectonics/draft';
@@ -57,7 +58,8 @@ export class EditorRenderer {
   private raster: PreviewRaster | null = null;
   private viewRef: WorldView | null = null;
   private unsubscribe: (() => void) | null = null;
-  private frameHandle: number | null = null;
+  /** Next preview flush: animation frame, or a macrotask while the page is hidden (rAF paused). */
+  private readonly frame = new FrameTask(() => this.flush());
   private repaintAll = true;
   private pendingCells: number[] = [];
   private readonly highlightMask: Uint8Array;
@@ -249,16 +251,12 @@ export class EditorRenderer {
   }
 
   schedule(): void {
-    if (!this.viewRef || this.frameHandle !== null) return;
-    this.frameHandle = requestAnimationFrame(() => {
-      this.frameHandle = null;
-      this.flush();
-    });
+    if (!this.viewRef) return;
+    this.frame.schedule();
   }
 
   cancelFrame(): void {
-    if (this.frameHandle !== null) cancelAnimationFrame(this.frameHandle);
-    this.frameHandle = null;
+    this.frame.cancel();
   }
 
   dispose(): void {
