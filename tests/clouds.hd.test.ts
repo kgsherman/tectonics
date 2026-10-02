@@ -1,6 +1,6 @@
 /**
- * Cloud quality tiers: standard clouds (cheap, recomputed automatically on every climate / month /
- * density change) and high-definition clouds (the full model, made on demand from the View tab).
+ * Cloud quality tiers: full-quality clouds (the default, following every climate / month / density
+ * change) and standard clouds (cheaper: used while the seasons play on the map).
  */
 import { Color } from 'three';
 import type { Vector4 } from 'three';
@@ -144,7 +144,7 @@ describe('MapClouds quality', () => {
   });
 });
 
-describe('ViewSync: HD clouds on demand', () => {
+describe('ViewSync: automatic full-quality clouds', () => {
   function setup() {
     const store = createStore<AppState, Action>(initialState(), reduce);
     store.dispatch({ type: 'patchView', patch: { layer: 'satellite', clouds: true } });
@@ -152,78 +152,52 @@ describe('ViewSync: HD clouds on demand', () => {
     const field = (): Float32Array => new Float32Array(12 * n).fill(0.5);
     let climate = { id: 7, w, h, cloud: field(), windU: field(), windV: field() } as unknown as ClimateResult;
     const sent: (CloudSpec | null)[] = [];
-    let shownHandler: ((c: CloudSpec) => void) | null = null;
     const viewport = {
       setClouds: (c: CloudSpec | null) => sent.push(c),
-      onCloudsShown: (fn: (c: CloudSpec) => void) => { shownHandler = fn; return () => {}; },
       setParticleCount: () => {},
       setVectorField: () => {},
     } as unknown as Viewport;
     const sync = new ViewSync(store, viewport, {} as RightPanel, { mesh: () => null, snapshot: () => null, climate: () => climate });
-    return {
-      store, sync, sent,
-      show: (c: CloudSpec | null) => shownHandler!(c!),
-      setClimate: (id: number) => { climate = { ...climate, id } as ClimateResult; },
-      hd: () => store.getState().runtime.cloudsHd,
-    };
+    return { store, sync, sent, setClimate: (id: number) => { climate = { ...climate, id } as ClimateResult; } };
   }
 
-  it('shows standard clouds automatically and HD clouds only when asked, for that month only', () => {
+  it('sends full-quality clouds on every climate, month and density change', () => {
     const t = setup();
     t.store.dispatch({ type: 'setMonth', month: 3 });
     t.sync.weather();
-    expect(t.sent.at(-1)?.quality).toBe('standard');
-    expect(t.hd()).toBe('off');
-
-    expect(t.sync.requestHdClouds()).toBe(true);
-    const hd = t.sent.at(-1)!;
-    expect(hd.quality).toBe('high');
-    expect(t.hd()).toBe('generating');
-    // Asking again for the same clouds does nothing.
-    t.sync.requestHdClouds();
-    expect(t.sent.at(-1)).toBe(hd);
-    // A late standard result does not count; the HD one does.
-    t.show(t.sent[0]!);
-    expect(t.hd()).toBe('generating');
-    t.show(hd);
-    expect(t.hd()).toBe('shown');
-    // Unrelated refreshes keep the HD clouds.
+    expect(t.sent.at(-1)?.quality).toBe('high');
+    // Unrelated refreshes send nothing.
     const count = t.sent.length;
     t.sync.weather();
     expect(t.sent.length).toBe(count);
-    expect(t.hd()).toBe('shown');
-
-    // The month changes: standard clouds, and the request is forgotten (coming back stays standard).
     t.store.dispatch({ type: 'setMonth', month: 4 });
     t.sync.weather();
-    expect(t.sent.at(-1)?.quality).toBe('standard');
-    expect(t.hd()).toBe('off');
-    t.store.dispatch({ type: 'setMonth', month: 3 });
-    t.sync.weather();
-    expect(t.sent.at(-1)?.quality).toBe('standard');
-    expect(t.hd()).toBe('off');
-  });
-
-  it('drops HD clouds when the climate or the density changes, and offers none without clouds', () => {
-    const t = setup();
-    t.sync.weather();
-    t.sync.requestHdClouds();
+    expect(t.sent.length).toBe(count + 1);
+    expect(t.sent.at(-1)?.quality).toBe('high');
     t.setClimate(8);
     t.sync.weather();
-    expect(t.sent.at(-1)?.quality).toBe('standard');
-    expect(t.hd()).toBe('off');
-
-    t.sync.requestHdClouds();
+    expect(t.sent.at(-1)?.quality).toBe('high');
     t.store.dispatch({ type: 'patchView', patch: { cloudDensity: 0.7 } });
     t.sync.weather();
-    expect(t.sent.at(-1)?.quality).toBe('standard');
-    expect(t.hd()).toBe('off');
-
+    expect(t.sent.at(-1)?.quality).toBe('high');
+    expect(t.sent.length).toBe(count + 3);
     t.store.dispatch({ type: 'patchView', patch: { layer: 'elevation' } });
     t.sync.weather();
     expect(t.sent.at(-1)).toBeNull();
-    expect(t.sync.requestHdClouds()).toBe(false);
-    expect(t.hd()).toBe('off');
+  });
+
+  it('uses standard clouds only while the seasons play on the map', () => {
+    const t = setup();
+    t.store.dispatch({ type: 'patchView', patch: { view: 'globe' } });
+    t.store.dispatch({ type: 'setSeasonsPlaying', playing: true });
+    t.sync.weather();
+    expect(t.sent.at(-1)?.quality).toBe('high'); // the globe keeps full quality
+    t.store.dispatch({ type: 'patchView', patch: { view: 'map' } });
+    t.sync.weather();
+    expect(t.sent.at(-1)?.quality).toBe('standard');
+    t.store.dispatch({ type: 'setSeasonsPlaying', playing: false });
+    t.sync.weather();
+    expect(t.sent.at(-1)?.quality).toBe('high'); // back to full quality when the playback stops
   });
 });
 

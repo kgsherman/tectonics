@@ -81,7 +81,7 @@ export function wireStoreEffects(store: Store<AppState, Action>, host: EffectHos
   }), () => host.viewSync.viewProps(), { equal: shallowEqual });
   st.watch((s) => ({
     p: s.settings.view.particles, n: s.settings.view.particleCount, c: s.settings.view.clouds, d: s.settings.view.cloudDensity,
-    layer: s.settings.view.layer,
+    layer: s.settings.view.layer, seasons: s.runtime.seasonsPlaying, view: s.settings.view.view,
   }), () => host.viewSync.weather(), { equal: shallowEqual });
   st.watch((s) => s.settings.view.layer, (layer) => {
     // Flow particles follow a flow layer: wind streaks over the currents map (or the reverse) read as noise.

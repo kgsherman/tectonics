@@ -512,7 +512,7 @@ export class MapView implements WorldView {
       layers.push(this.shaded ? this.shadedImage.canvas : this.baseImage.canvas);
     }
     if (this.cloudLayer.active) {
-      // HD clouds: the cloud worker rasterizes the visible tiles at screen resolution once the view rests.
+      // Full-quality clouds: the cloud worker rasterizes the visible tiles at screen resolution once the view rests.
       this.cloudLayer.setView(t, dpr);
       layers.push(this.cloudLayer.canvas);
     }

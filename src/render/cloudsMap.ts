@@ -12,7 +12,7 @@
  * Quality (CloudSpec.quality): 'high' as described here; 'standard' rasterizes a half-size world
  * raster and no tiles (cheap enough to follow every month / climate change).
  *
- * Tiles (HD clouds): the world raster is ~1536 px wide, so at 8× it would be stretched ~8 px per
+ * Tiles ('high' quality): the world raster is ~1536 px wide, so at 8× it would be stretched ~8 px per
  * texel (blurry), and it resolves only two detail octaves. A host that reports its view (setView)
  * and draws the layer through drawCopy() gets tiles over it: a quadtree pyramid of MAP_CLOUD_TILE_PX²
  * equirect tiles (level L: π/2^L radians a side) with every detail octave their resolution resolves.

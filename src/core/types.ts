@@ -482,9 +482,9 @@ export interface MarkerSpec {
 
 /** Cloud cover for the globe's cloud shell (weather visualization). */
 /**
- * Cloud rendering quality. 'standard': cheap enough to follow every change automatically (coarser
- * regime grids, fewer detail octaves on the globe, a smaller map raster, no zoomed-map window
- * rasters). 'high': the full model (high-definition clouds, made on demand).
+ * Cloud rendering quality. 'high': the full model (the default). 'standard': cheaper (coarser regime
+ * grids, fewer detail octaves on the globe, a smaller map raster, no map tiles), for rapid updates
+ * such as season playback on the map.
  */
 export type CloudQuality = 'standard' | 'high';
 

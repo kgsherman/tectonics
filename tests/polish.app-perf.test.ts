@@ -268,7 +268,6 @@ describe('ViewSync weather', () => {
       setParticleCount: () => {},
       setVectorField: (f: unknown) => calls.push(f ? 'field' : 'field:null'),
       setClouds: (c: unknown) => calls.push(c ? 'clouds' : 'clouds:null'),
-      onCloudsShown: () => () => {},
     } as unknown as Viewport;
     const store = createStore(initialState(), reduce);
     const climate = { ...zonalClimate(24, 12), id: 7 };

@@ -450,10 +450,6 @@ export class App implements Commands {
     }
   }
 
-  generateHdClouds(): void {
-    this.viewSync.requestHdClouds();
-  }
-
   exportMap(): void {
     const s = this.store.getState();
     if (!s.runtime.worldLoaded) return;

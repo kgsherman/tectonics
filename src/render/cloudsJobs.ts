@@ -72,7 +72,7 @@ export type ResultOf<J extends CloudJob> = J extends { kind: 'volumes' } ? Cloud
 const rasters = new Map<string, CloudNoiseRaster>();
 /**
  * Window noise rasters (zoomed map tiles), most recent last: those of a view kept (~1.4 MB per 258²
- * tile), so new clouds for the same view (HD clouds for another month) skip the noise.
+ * tile), so new clouds for the same view (the next month's clouds) skip the noise.
  */
 const windowRasters = new Map<string, CloudNoiseRaster>();
 const WINDOW_CACHE = 24;

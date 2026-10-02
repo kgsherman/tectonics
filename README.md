@@ -22,7 +22,7 @@ Open the URL Vite prints (port 5188 by default). A world is generated on load. P
 | **Plates** | Draw your own world. Tools: plate brush, continent brush, raise/lower, fill, split, lasso, seeds (Voronoi), motion arrows, smooth. Edit each plate's speed, heading and spin. Start from blank, random or the current simulation, then press **Simulate this world**. |
 | **Simulate** | Tectonic parameters: time step, rifting rate, plate merging, subduction and collision uplift, erosion, hotspot activity, speed scale. |
 | **Climate** | Planet parameters: axial tilt, solar output, temperature offset, moisture, ocean heat transport, sea level, retrograde rotation. Compute the climate, or enable *auto climate* to refresh it periodically during playback. |
-| **View** | Lighting (flat / relief / sun), relief exaggeration, terrain detail, clouds and cloudiness (standard clouds follow every change; *Generate HD clouds* renders the current month at full detail on demand), wind/current particles, overlays (plate boundaries, coastlines, graticule), PNG export. |
+| **View** | Lighting (flat / relief / sun), relief exaggeration, terrain detail, clouds and cloudiness (full detail, following every month / climate / density change; sharp tiles on a zoomed map), wind/current particles, overlays (plate boundaries, coastlines, graticule), PNG export. |
 
 **Layers:** satellite, elevation, plates, crust type, crust age, temperature, precipitation, pressure, sea surface temperature, wind, ocean currents, Köppen climate.
 
